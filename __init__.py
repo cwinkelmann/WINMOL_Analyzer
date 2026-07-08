@@ -24,11 +24,8 @@
  This script initializes the plugin, making it known to QGIS.
 """
 import os
-import sys
 import site
-
-from .plugin_utils.installer import WINMOL_VENV_NAME, \
-    ensure_venv, ensure_dependencies
+import sys
 
 
 def _add_venv_site_packages(venv_path: str) -> None:
@@ -69,6 +66,11 @@ def classFactory(iface):  # pylint: disable=invalid-name
     :param iface: A QGIS interface instance.
     :type iface: QgsInterface
     """
+    # Imported here (not at module top) so the package stays importable outside
+    # QGIS -- e.g. under pytest -- where these QGIS-only deps are unavailable.
+    from .plugin_utils.installer import WINMOL_VENV_NAME, \
+        ensure_venv, ensure_dependencies
+
     project_path = os.path.dirname(__file__)
 
     venv_path = ensure_venv(
