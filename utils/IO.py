@@ -184,6 +184,13 @@ def load_raster_window_with_profile(path: str, window):
 
 
 def load_model_from_path(model_path):
+    # ONNX models (e.g. DeepLabV3+ / HRNet exported from winmol_unet) are
+    # architecture-agnostic: they are served by an OnnxSegmenter adapter that
+    # duck-types the Keras model's predict_on_batch(NHWC) interface, so no
+    # architecture code is needed here. See docs/winmol_unet-pytorch-bridge.md.
+    if str(model_path).lower().endswith(".onnx"):
+        return _load_onnx_model(model_path)
+
     from tensorflow import keras
     from tensorflow.keras import layers
     from tensorflow.keras.utils import get_custom_objects
@@ -218,6 +225,27 @@ def load_model_from_path(model_path):
         print("Loading with custom layers also failed:", e)
 
     raise RuntimeError("Failed to load model with all methods.")
+
+
+def _load_onnx_model(model_path):
+    """Load a .onnx segmenter via the winmol_unet runtime adapter.
+
+    OnnxSegmenter exposes predict_on_batch(NHWC) and normalizes runtime OOM to a
+    retryable exception, so it is a drop-in for the Keras model everywhere the
+    analyzer runs inference. Requires the winmol_unet package (which pulls in
+    onnxruntime) to be installed in this environment.
+    """
+    try:
+        from winmol_unet.runtime import OnnxSegmenter
+    except Exception as e:
+        raise RuntimeError(
+            "Loading a .onnx model requires the 'winmol_unet' package "
+            "(and onnxruntime) in this environment. Install it, e.g. "
+            "`pip install -e /path/to/WINMOL_segmentor_pt`. "
+            f"Original import error: {e}"
+        ) from e
+    print(f"Loading ONNX model via OnnxSegmenter: {model_path}")
+    return OnnxSegmenter(model_path)
 
 
 def load_orthomosaic(path, config):

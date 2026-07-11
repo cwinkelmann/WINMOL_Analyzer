@@ -25,6 +25,14 @@ class HardwareInfo:
             gpu_names, gpu_memory_gb
         )
 
+        # Fallback: on Apple Silicon there is no nvidia-smi, but TensorFlow
+        # can still run on the integrated GPU via the tensorflow-metal plugin.
+        # Only probe Metal when no NVIDIA GPU was found and the user has not
+        # explicitly forced CPU-only via CUDA_VISIBLE_DEVICES.
+        if not gpu_names and not cls._cpu_forced_via_env():
+            metal_names, metal_mem = cls._detect_metal_gpu(total_ram_gb)
+            gpu_names, gpu_memory_gb = metal_names, metal_mem
+
         gpu_count = len(gpu_names)
 
         if gpu_memory_gb and gpu_count != len(gpu_memory_gb):
@@ -91,6 +99,33 @@ class HardwareInfo:
             return values
         except Exception:
             return []
+
+    @staticmethod
+    def _cpu_forced_via_env() -> bool:
+        raw = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+        if raw is not None and raw.strip() in ("", "-1"):
+            return True
+        disable = str(os.environ.get("WINMOL_DISABLE_METAL", "")).strip()
+        return disable.lower() in ("1", "true", "yes")
+
+    @staticmethod
+    def _detect_metal_gpu(
+        total_ram_gb: float,
+    ) -> tuple[List[str], List[float]]:
+        import platform
+        if platform.system() != "Darwin" or platform.machine() != "arm64":
+            return [], []
+        # Confirm the tensorflow-metal plugin is installed, so TensorFlow will
+        # actually place ops on the GPU. Cheap metadata lookup; no TF import.
+        try:
+            import importlib.metadata as md
+            md.version("tensorflow-metal")
+        except Exception:
+            return [], []
+        # Apple Silicon uses unified memory; report it as the GPU budget so the
+        # planner's memory tiers behave sensibly.
+        mem = round(total_ram_gb, 2) if total_ram_gb else 0.0
+        return ["Apple Silicon GPU (Metal)"], [mem]
 
     @staticmethod
     def _apply_cuda_visible_devices(
