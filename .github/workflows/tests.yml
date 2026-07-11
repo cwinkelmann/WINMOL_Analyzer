@@ -1,0 +1,69 @@
+name: Tests
+
+# Golden-master suite (tests/README.md) inside the CI image built by
+# ci-image.yml — the image carries the pinned environment and the Zenodo
+# GenDS model at /opt/winmol/model/, so no model file lives in git.
+#
+# fast-tests: per-stage golden tests from committed fixtures, no model
+#             needed (~2 min).
+# full-tests: model inference vs the golden stem map, tiled merge, e2e,
+#             and single-model conformance (manifest entries for local-only
+#             models skip on missing files).
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  # Fixtures are only reproducible under a fixed hash seed (review A-4).
+  # Also baked into the image ENV; set here so the conftest re-exec guard
+  # never fires (its output is swallowed without a tty).
+  PYTHONHASHSEED: "0"
+
+jobs:
+  fast-tests:
+    name: Stage tests (fixtures only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container:
+      image: ghcr.io/${{ github.repository_owner }}/winmol-analyzer-ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Run fast golden tests
+        run: >
+          python -m pytest tests/ -m "not slow" -q
+          --ignore=tests/test_standalone_pipeline.py
+
+  full-tests:
+    name: Inference + tiled + e2e (model in image)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    container:
+      image: ghcr.io/${{ github.repository_owner }}/winmol-analyzer-ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Link baked-in model into the expected path
+        run: |
+          mkdir -p standalone/model
+          ln -sf /opt/winmol/model/model_UNet_GenDS_512_2023-02-27_211141.hdf5 \
+            standalone/model/
+
+      - name: Run model-dependent tests
+        run: >
+          python -m pytest tests/ -m slow -q
+          --ignore=tests/test_standalone_pipeline.py

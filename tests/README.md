@@ -40,6 +40,27 @@ Only the [slow] tests need TensorFlow and the 374 MB model
 (`standalone/model/model_UNet_GenDS_512_2023-02-27_211141.hdf5`); they skip
 cleanly when it is absent. Everything else runs from the committed fixtures.
 
+## CI
+
+`.github/workflows/tests.yml` runs the suite on every PR and on pushes to
+main, inside the container built by `.github/workflows/ci-image.yml`
+(`ghcr.io/<owner>/winmol-analyzer-ci`). The image
+(`docker/ci/Dockerfile`) carries the pinned test environment
+(`requirements/ci.txt`) **and the Zenodo GenDS model** (sha256-verified at
+build) at `/opt/winmol/model/` — no model file in git. Two jobs:
+
+- **fast-tests** — fixture-based stage tests, no model (~2 min);
+- **full-tests** — inference vs the golden stem map, tiled merge, e2e, and
+  conformance for the one model present in the image (local-only manifest
+  entries skip).
+
+**Bootstrap:** the image workflow triggers on changes to
+`docker/ci/**` / `requirements/{base,ci}.txt`, or manually via
+*Actions → CI test image → Run workflow*. On the very first push the tests
+job may race the image build — run the image workflow first (or re-run the
+failed tests job once the image exists). Rebuilding the image is only needed
+when dependencies or the baked model change.
+
 ## Model conformance (verifying NEW models against the same pipeline)
 
 `test_model_conformance.py` proves that different models "work the same

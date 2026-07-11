@@ -1,0 +1,19 @@
+# CI test environment — exact pins matching tests/fixtures/manifest.json.
+# The golden fixtures are only bit-reproducible under these versions
+# (skeletonize/GEOS/scipy implementations).
+# fiona 1.10 breaks geopandas-0.14's fiona READ path (docs/CODE_REVIEW_2.md
+# A-8) but ships wheels for both x86_64 and aarch64; the test suite reads
+# GeoPackages exclusively via pyogrio and only WRITES through fiona, which
+# works — matches the local dev environment (fiona 1.10.1).
+-r base.txt
+numpy==1.26.4
+pandas==2.2.3
+fiona==1.10.1
+pyproj==3.6.1
+# plain tensorflow (not tensorflow-cpu): CPU-only without the [and-cuda]
+# extra, and it ships both x86_64 (CI runners) and aarch64 wheels (local
+# Apple-Silicon docker validation).
+tensorflow==2.16.2
+tf-keras==2.16.0
+h5py>=3.10
+pytest==8.*
