@@ -1,0 +1,30 @@
+{
+ "counts": {
+  "stage_build_stem_parts": 258,
+  "stage_connect_stems": 62,
+  "stage_find_segments": 258,
+  "stage_quantified_contour": 62,
+  "stage_quantified_edt": 62,
+  "stage_restore_geo": 258
+ },
+ "crossings_in_window": -1,
+ "model": {
+  "file": "model_UNet_GenDS_512_2023-02-27_211141.hdf5",
+  "sha256_16": "7314266214015f69"
+ },
+ "pythonhashseed": "0",
+ "source": "standalone/pred/notebook_crop_input.tif",
+ "versions": {
+  "numpy": "1.26.4",
+  "python": "3.11.15",
+  "rasterio": "1.4.4",
+  "scikit-image": "0.22.0",
+  "scipy": "1.11.3",
+  "shapely": "2.0.2"
+ },
+ "window": {
+  "col": 1024,
+  "row": 512,
+  "size": 1024
+ }
+}

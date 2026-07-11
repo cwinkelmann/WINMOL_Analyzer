@@ -1,0 +1,41 @@
+{
+  "_comment": [
+    "Models checked by tests/test_model_conformance.py. Edit 'path' entries",
+    "to point at the models you want to verify; entries whose file is",
+    "missing are skipped with a notice. Override this file entirely with",
+    "WINMOL_MODELS_MANIFEST=<path>.",
+    "",
+    "Current set (2026-07-11): the Zenodo production reference plus the",
+    "self-trained twostage_lrfix generation retrieved from",
+    "/Volumes/storage/hnee/WINMOL/models (copied to standalone/model/,",
+    "sha256/16: hdf5 5f426a88fa9ee779, unet.onnx e12653e519914dd4,",
+    "deeplab.onnx 6e37d38208d46b12)."
+  ],
+  "models": [
+    {
+      "name": "zenodo-unet-gends",
+      "path": "standalone/model/model_UNet_GenDS_512_2023-02-27_211141.hdf5",
+      "notes": "Zenodo production reference (R-trained, Keras 2). Also the golden-fixture model."
+    },
+    {
+      "name": "twostage-baseline-hdf5",
+      "path": "standalone/model/twostage_lrfix_GenDS10.hdf5",
+      "notes": "Self-trained baseline (R Keras 2.15, twostage_lrfix GenDS10). KNOWN NON-CONFORMANT (2026-07-11): saved with 256x256 input, violates the 512 contract — as do twostage_lrcarry and singlestage_SpecDS on the volume. Runs only with config.img_width/height=256 override. Kept in the manifest so the failure stays visible until a 512 export exists."
+    },
+    {
+      "name": "twostage-baseline-512transfer",
+      "path": "standalone/model/twostage_lrfix_GenDS10_512.hdf5",
+      "notes": "twostage_lrfix_GenDS10 rebuilt at 512x512 via architecture patch + weight transfer (2026-07-11). VERDICT: mechanically conformant but scale-shift degrades it badly (IoU 0.351 vs its own native-256 output; 542 fragmented parts -> 97 stems; volume 19.5 vs 34.7 m3). EXPERIMENT ONLY — do not use for production; retrain at 512 instead."
+    },
+    {
+      "name": "twostage-unet-onnx",
+      "path": "standalone/model/twostage_lrfix/unet.onnx",
+      "notes": "PyTorch twostage_lrfix UNet, ONNX export. Hypothesis: same behavior as twostage-baseline-hdf5."
+    },
+    {
+      "name": "twostage-deeplab-onnx",
+      "path": "standalone/model/twostage_lrfix/deeplabv3plus.onnx",
+      "notes": "PyTorch twostage_lrfix DeepLabV3+, ONNX export."
+    }
+  ]
+}
