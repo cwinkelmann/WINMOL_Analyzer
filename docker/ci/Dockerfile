@@ -5,22 +5,22 @@
 # model never enters git and test jobs need no download step. Built and
 # pushed to ghcr.io by .github/workflows/ci-image.yml; consumed by
 # .github/workflows/tests.yml as the job container.
-#
-# Layer order: model first (changes ~never), then pip deps (change rarely) —
-# a requirements bump does not re-download the model.
 
 FROM python:3.11-slim
 
 # --- model layer (sha256-pinned; matches tests/fixtures/manifest.json) -----
-ARG MODEL_NAME=model_UNet_GenDS_512_2023-02-27_211141.hdf5
-ARG MODEL_URL="https://zenodo.org/records/10491124/files/model_UNet_GenDS_512_2023-02-27_211141.hdf5?download=1"
-ARG MODEL_SHA256=7314266214015f692f687f5f209e46ebbc9e94fce6d7c9ff0c3db49e4437e4fa
+# ADD --checksum verifies at build time and caches by digest, keeping this
+# layer independent of the apt/pip layers below.
+ADD --checksum=sha256:7314266214015f692f687f5f209e46ebbc9e94fce6d7c9ff0c3db49e4437e4fa \
+    "https://zenodo.org/records/10491124/files/model_UNet_GenDS_512_2023-02-27_211141.hdf5?download=1" \
+    /opt/winmol/model/model_UNet_GenDS_512_2023-02-27_211141.hdf5
+
+# --- system libraries -------------------------------------------------------
+# rasterio/fiona/pyogrio manylinux wheels vendor GDAL but dynamically load
+# libexpat from the system, which python:*-slim strips.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends curl \
- && rm -rf /var/lib/apt/lists/* \
- && mkdir -p /opt/winmol/model \
- && curl -fL --retry 3 "$MODEL_URL" -o "/opt/winmol/model/$MODEL_NAME" \
- && echo "$MODEL_SHA256  /opt/winmol/model/$MODEL_NAME" | sha256sum -c -
+ && apt-get install -y --no-install-recommends libexpat1 \
+ && rm -rf /var/lib/apt/lists/*
 
 # --- python environment -----------------------------------------------------
 COPY requirements/base.txt requirements/ci.txt /tmp/req/
