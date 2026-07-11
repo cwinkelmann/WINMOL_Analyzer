@@ -248,8 +248,11 @@ class ImageProcessing:
                 shutil.rmtree(work_dir, ignore_errors=True)
             return merged
         except Exception:
-            if not plan.keep_temp:
-                shutil.rmtree(work_dir, ignore_errors=True)
+            # Never delete completed tile results on failure: they may
+            # represent hours of work and allow inspection/resume
+            # (docs/CODE_REVIEW_2.md A-15).
+            print(f"Vector phase failed; keeping tile work directory "
+                  f"for inspection: {work_dir}")
             raise
 
     def run_merge_phase(self, plan, work_dir):
