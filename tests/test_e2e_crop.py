@@ -20,15 +20,16 @@ import helpers
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL_PATH = os.path.join(
-    REPO_ROOT, "standalone", "model",
-    "model_UNet_GenDS_512_2023-02-27_211141.hdf5")
+    REPO_ROOT, "standalone", "model_onnx", "General.onnx")
+
+os.environ.setdefault("WINMOL_ONNX_FORCE_CPU", "1")   # match the fixtures
 
 pytestmark = pytest.mark.slow
 
 
 @pytest.fixture(scope="module")
 def standalone_mod():
-    pytest.importorskip("tensorflow")
+    pytest.importorskip("onnxruntime")
     path = os.path.join(REPO_ROOT, "standalone", "WINMOL_Analyzer.py")
     spec = importlib.util.spec_from_file_location(
         "winmol_standalone_e2e", path)

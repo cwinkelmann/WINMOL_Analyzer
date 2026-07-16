@@ -13,9 +13,9 @@
   ],
   "models": [
     {
-      "name": "zenodo-unet-gends",
-      "path": "standalone/model/model_UNet_GenDS_512_2023-02-27_211141.hdf5",
-      "notes": "Zenodo production reference (R-trained, Keras 2). Also the golden-fixture model."
+      "name": "zenodo-unet-gends-onnx",
+      "path": "standalone/model_onnx/General.onnx",
+      "notes": "Zenodo GenDS reference, converted to ONNX (scripts/convert_models_to_onnx.py). The golden-fixture model; runs TF-free via onnxruntime."
     },
     {
       "name": "twostage-baseline-hdf5",

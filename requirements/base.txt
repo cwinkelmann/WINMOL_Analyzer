@@ -7,3 +7,6 @@ scikit-image==0.22.0
 scipy==1.11.3
 pyogrio>=0.9
 matplotlib
+# Inference runtime: models are ONNX, loaded via utils/onnx_runtime.py.
+# No TensorFlow — it is only needed to CONVERT models (requirements/convert.txt).
+onnxruntime>=1.17
