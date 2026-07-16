@@ -22,13 +22,23 @@ VALID_PROCESS_TYPES = {'Stems', 'Trees', 'Nodes'}
 
 
 def _import_tensorflow():
-    import tensorflow as tf
-    return tf
+    """Return the tensorflow module, or None when it isn't installed.
+
+    Models are ONNX (onnxruntime manages its own devices); TensorFlow is only
+    present in dev environments that still load legacy .hdf5 models. All TF
+    configuration below is therefore best-effort and skipped when TF is absent.
+    """
+    try:
+        import tensorflow as tf
+        return tf
+    except Exception:
+        return None
 
 
 def _configure_tensorflow_runtime():
     tf = _import_tensorflow()
-    print("imports finished")
+    if tf is None:
+        return None
     gpus = tf.config.list_physical_devices('GPU')
     if gpus:
         try:
@@ -44,6 +54,8 @@ def _configure_tensorflow_runtime():
 
 def _force_tensorflow_cpu_only():
     tf = _import_tensorflow()
+    if tf is None:
+        return None
     try:
         tf.config.set_visible_devices([], 'GPU')
         print('Configured TensorFlow for CPU-only prediction.')

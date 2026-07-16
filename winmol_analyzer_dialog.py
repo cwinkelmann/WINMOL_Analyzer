@@ -24,22 +24,22 @@ Dialog
 """
 
 import os
-import psutil
 import glob
 import json
 from pathlib import Path
 
-from PyQt5.QtWidgets import QFileDialog
+try:
+    import psutil          # optional: used only to report available RAM
+except Exception:
+    psutil = None
 
-
-from PyQt5.QtCore import QThread
-
-
+# qgis.PyQt shims to the active Qt binding (PyQt5 on QGIS 3, PyQt6 on QGIS 4).
+from qgis.PyQt.QtWidgets import QFileDialog
+from qgis.PyQt.QtCore import QThread
 from qgis.core import QgsProject, QgsVectorLayer, QgsRasterLayer
 from qgis.PyQt import QtWidgets, uic
 
 from .classes.Config import Config
-from .plugin_utils.installer import get_venv_python_path
 from .tasks_threads import Worker
 
 current_path = os.path.dirname(__file__)
@@ -53,8 +53,9 @@ FORM_CLASS, _ = uic.loadUiType(
 
 class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
 
-    def __init__(self, parent=None, venv_path=None):
-        """Constructor."""
+    def __init__(self, parent=None, env=None):
+        """Constructor. `env` is the dict from installer.resolve_environment
+        ({'python': <exe>, 'venv_path': <path>, ...})."""
         super(WINMOLAnalyzerDialog, self).__init__(parent)
         self.setupUi(self)
         # Derived outputs are auto-generated from the stem map output path.
@@ -89,8 +90,13 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
 
         self.set_connections()
         self.output_log.setReadOnly(True)
-        self.venv_path = venv_path
-        self.models_dir = os.path.join(os.path.dirname(self.venv_path), "models")
+        self.env = env or {}
+        self.python_exe = self.env.get("python")
+        # models live next to the plugin (works for both venv and BYO-env)
+        plugin_dir = os.path.dirname(
+            self.env.get("venv_path")
+            or os.path.join(os.path.dirname(__file__), "winmol_venv"))
+        self.models_dir = os.path.join(plugin_dir, "models")
         self.populate_model_combo_box()
         self.process_type = None
 
@@ -136,10 +142,11 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
     def populate_model_combo_box(self) -> None:
         """Fill the model dropdown from config.json.
 
-        config.json is expected to be a mapping: {"ModelName": "https://.../model.hdf5"}
-        The installer downloads these into <plugin>/models/<ModelName>.hdf5.
+        config.json is a mapping {"ModelName": "https://.../ModelName.onnx"}.
+        The installer downloads these into <plugin>/models/<ModelName>.onnx.
 
-        We always append a "Custom" entry that lets users pick their own *.hdf5.
+        We always append a "Custom" entry that lets users pick their own
+        .onnx (or legacy .hdf5/.keras) file.
         """
         config_path = os.path.join(os.path.dirname(__file__), "config.json")
         model_names = []
@@ -210,7 +217,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self,
             "Select Model File",
             "",
-            "Model File (*.hdf5);;All Files (*)",
+            "Model File (*.onnx *.hdf5 *.keras);;All Files (*)",
             options=options,
         )
         if file_path:
@@ -476,7 +483,8 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             return
 
         if selected_text:
-            self.model_path = os.path.join(self.models_dir, f"{selected_text}.hdf5")
+            self.model_path = os.path.join(
+                self.models_dir, f"{selected_text}.onnx")
         else:
             self.model_path = ""
 
@@ -560,10 +568,10 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             )
 
     def cancel_process(self):
-        # If the process is running, cancel it
+        # Actually terminate the child process, not just the thread signal.
         if self.worker:
-            self.worker.finished.emit()
-            self.thread.quit()
+            self.update_output_log("Cancelling…")
+            self.worker.cancel()
 
     def close_application(self):
         print("Closing application")
@@ -604,9 +612,17 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             alt = str(p.with_name(p.stem + "_new.gpkg"))
             self.check_uav_input_exists(alt)
 
-        # use python of venv (!)
+        # Run winmol_run.py in the resolved compute environment.
+        if not self.python_exe or not os.path.exists(self.python_exe):
+            QtWidgets.QMessageBox.warning(
+                self, "WINMOL environment not ready",
+                self.env.get("message")
+                or "The WINMOL Python environment is not set up yet. "
+                "Restart QGIS to run setup, or set an existing interpreter "
+                "in the plugin settings.")
+            return
         command = [
-            get_venv_python_path(self.venv_path),
+            self.python_exe,
             "-u",
             script_path,
             self.model_path,
@@ -644,10 +660,12 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self.worker.moveToThread(self.thread)
             self.worker.progress_signal.connect(self.update_progress)
             self.thread.started.connect(self.worker.run_process)
+            # layers load ONLY on success; failures surface in the log/dialog
+            self.worker.succeeded.connect(self.load_layers_to_session)
+            self.worker.error.connect(self.handle_process_error)
             self.worker.finished.connect(self.thread.quit)
             self.worker.finished.connect(self.worker.deleteLater)
             self.thread.finished.connect(self.thread.deleteLater)
-            self.thread.finished.connect(self.load_layers_to_session)
             self.worker.update_signal.connect(self.update_output_log)
             self.thread.start()
         # catch out of memory error
@@ -663,6 +681,14 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
     def update_output_log(self, text):
         # Update your QPlainTextEdit with the output
         self.output_log.appendPlainText(text)
+
+    def handle_process_error(self, message):
+        """Show a failure instead of silently loading empty/absent layers."""
+        self.update_output_log(message)
+        try:
+            QtWidgets.QMessageBox.warning(self, "WINMOL Analyzer", message)
+        except Exception:
+            pass
 
     def load_layers_to_session(self):
         """Load outputs after processing finishes.

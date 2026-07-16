@@ -24,65 +24,32 @@
  This script initializes the plugin, making it known to QGIS.
 """
 import os
-import site
-import sys
-
-
-def _add_venv_site_packages(venv_path: str) -> None:
-    """Make venv-installed packages importable from within QGIS' Python.
-
-    Dependencies are installed into the plugin's internal venv, but QGIS runs
-    its own Python interpreter. We therefore need to add the venv's
-    site-packages directory to sys.path before importing plugin modules that
-    depend on those packages.
-    """
-
-    if not venv_path:
-        return
-
-    if sys.platform == "win32":
-        sp = os.path.join(venv_path, "Lib", "site-packages")
-        scripts = os.path.join(venv_path, "Scripts")
-        if os.path.isdir(scripts):
-            try:
-                os.add_dll_directory(scripts)
-            except Exception:
-                # Best-effort; missing this should not stop the plugin.
-                pass
-    else:
-        pyver = f"python{sys.version_info.major}.{sys.version_info.minor}"
-        sp = os.path.join(venv_path, "lib", pyver, "site-packages")
-
-    if os.path.isdir(sp):
-        site.addsitedir(sp)
 
 
 # noinspection PyPep8Naming
 def classFactory(iface):  # pylint: disable=invalid-name
-    """Load WINMOLAnalyzer
- class from file WINMOLAnalyzer
-.
+    """Load the WINMOLAnalyzer plugin.
+
+    The compute environment (onnxruntime + geo stack; NO TensorFlow) is
+    resolved/created here, but NEVER fatally: a declined or failed setup logs
+    a message and still loads the plugin, so QGIS is never left with a "broken
+    plugin". The dialog re-checks readiness before running and offers a retry.
 
     :param iface: A QGIS interface instance.
-    :type iface: QgsInterface
     """
     # Imported here (not at module top) so the package stays importable outside
-    # QGIS -- e.g. under pytest -- where these QGIS-only deps are unavailable.
-    from .plugin_utils.installer import WINMOL_VENV_NAME, \
-        ensure_venv, ensure_dependencies
+    # QGIS -- e.g. under pytest -- where the QGIS-only deps are unavailable.
+    from .plugin_utils.installer import resolve_environment
 
-    project_path = os.path.dirname(__file__)
+    plugin_dir = os.path.dirname(__file__)
+    env = resolve_environment(plugin_dir, prompt=True)
 
-    venv_path = ensure_venv(
-        os.path.join(
-            project_path,
-            WINMOL_VENV_NAME
-        )
-    )
-    ensure_dependencies(venv_path)
-
-    # Make packages from the internal venv importable in QGIS' Python.
-    _add_venv_site_packages(venv_path)
+    try:
+        from qgis.core import Qgis, QgsMessageLog
+        level = Qgis.Info if env.get("python") else Qgis.Warning
+        QgsMessageLog.logMessage(env.get("message", ""), "WINMOL", level)
+    except Exception:
+        pass
 
     from .winmol_analyzer import WINMOLAnalyzer
-    return WINMOLAnalyzer(iface, venv_path)
+    return WINMOLAnalyzer(iface, env)

@@ -38,9 +38,9 @@ from .winmol_analyzer_dialog import WINMOLAnalyzerDialog
 class WINMOLAnalyzer:
     """QGIS Plugin Implementation."""
 
-    venv_path = None
+    env = None
 
-    def __init__(self, iface, venv_path):
+    def __init__(self, iface, env):
         """Constructor.
 
         :param iface: An interface instance that will be passed to this class
@@ -71,7 +71,7 @@ class WINMOLAnalyzer:
         # Check if plugin was started the first time in current QGIS session
         # Must be set in initGui() to survive plugin reloads
         self.first_start = None
-        self.venv_path = venv_path
+        self.env = env or {}
 
     # noinspection PyMethodMayBeStatic
     def tr(self, message):
@@ -191,7 +191,7 @@ class WINMOLAnalyzer:
         # the plugin is started
         if self.first_start:
             self.first_start = False
-            self.dlg = WINMOLAnalyzerDialog(None, self.venv_path)
+            self.dlg = WINMOLAnalyzerDialog(None, self.env)
 
         # show the dialog
         self.dlg.show()
