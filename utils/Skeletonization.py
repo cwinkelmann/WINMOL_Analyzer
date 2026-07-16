@@ -109,7 +109,7 @@ def get_nodes(skel: np.ndarray) -> Tuple[List[Tuple[int, int]], Any]:
         skel = remove_branchpoints_from_skel(skel, branch_points)
         end_nodes, branch_points = find_skeleton_nodes(skel)
         bp_count = bp_count + len(branch_points)
-    skel = morphology.skeletonize(skel)
+    skel = morphology.skeletonize(skel)  # TODO is this code correct?
     print("Branch points removed: ", bp_count)
     print("Detected end nodes: ", len(end_nodes))
     t.stop()
