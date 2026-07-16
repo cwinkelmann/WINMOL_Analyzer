@@ -1,0 +1,9 @@
+# Dev-only: converting the Keras (HDF5) models to ONNX
+# (scripts/convert_models_to_onnx.py). NOT needed to run the analyzer, which
+# uses onnxruntime via the vendored OnnxSegmenter. Keras 2 HDF5 needs the
+# legacy-Keras shim under TF >= 2.16.
+tensorflow==2.16.2
+tf-keras==2.16.0
+tf2onnx==1.17.0
+onnx>=1.16
+onnxruntime>=1.17
