@@ -1,3 +1,6 @@
+# Local Claude Code settings (machine-local, not shared)
+.claude/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
