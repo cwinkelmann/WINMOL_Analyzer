@@ -1,6 +1,6 @@
 {
-    "Beech": "https://zenodo.org/records/10491124/files/model_UNet_SpecDS_Beech_512_2023-02-28_042751.hdf5?download=1",
-    "Spruce": "https://zenodo.org/records/10491124/files/model_UNet_SpecDS_Spruce_512_2023-02-27_061925.hdf5?download=1",
-    "Spruce_Deadwood": "https://zenodo.org/records/15907576/files/model_UNet_SpecDS_Spruce_Deadwood_512_2024-12-19_194758.hdf5?download=1",
-    "General": "https://zenodo.org/records/10491124/files/model_UNet_GenDS_512_2023-02-27_211141.hdf5?download=1"
+    "General": "https://github.com/cwinkelmann/WINMOL_Analyzer/releases/download/models-onnx-v1/General.onnx",
+    "Beech": "https://github.com/cwinkelmann/WINMOL_Analyzer/releases/download/models-onnx-v1/Beech.onnx",
+    "Spruce": "https://github.com/cwinkelmann/WINMOL_Analyzer/releases/download/models-onnx-v1/Spruce.onnx",
+    "Spruce_Deadwood": "https://github.com/cwinkelmann/WINMOL_Analyzer/releases/download/models-onnx-v1/Spruce_Deadwood.onnx"
 }
