@@ -10,10 +10,8 @@ numpy==1.26.4
 pandas==2.2.3
 fiona==1.10.1
 pyproj==3.6.1
-# plain tensorflow (not tensorflow-cpu): CPU-only without the [and-cuda]
-# extra, and it ships both x86_64 (CI runners) and aarch64 wheels (local
-# Apple-Silicon docker validation).
-tensorflow==2.16.2
-tf-keras==2.16.0
-h5py>=3.10
+# ONNX runtime is the only inference dependency (no TensorFlow). Pinned so the
+# golden stem map stays reproducible; onnxruntime ships wheels for x86_64
+# (CI runners) and aarch64 (local Apple-Silicon docker validation).
+onnxruntime==1.19.2
 pytest==8.*

@@ -12,6 +12,8 @@ on:
       - "docker/ci/**"
       - "requirements/base.txt"
       - "requirements/ci.txt"
+      - "requirements/convert.txt"
+      - "scripts/convert_models_to_onnx.py"
       - ".github/workflows/ci-image.yml"
 
 permissions:

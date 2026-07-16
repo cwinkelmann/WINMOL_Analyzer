@@ -29,10 +29,14 @@ import shutil
 import sys
 import tempfile
 
-# --- determinism + legacy-keras guards (before ANY heavy import) -----------
+# --- determinism guards (before ANY heavy import) --------------------------
 if os.environ.get("PYTHONHASHSEED") != "0":
     os.environ["PYTHONHASHSEED"] = "0"
     os.execv(sys.executable, [sys.executable] + sys.argv)
+# ONNX inference must be deterministic and match Linux CI: force CPU
+# onnxruntime (CoreML/CUDA may differ). TF_USE_LEGACY_KERAS is only consulted
+# if a .hdf5 model is passed via --model.
+os.environ.setdefault("WINMOL_ONNX_FORCE_CPU", "1")
 os.environ.setdefault("TF_USE_LEGACY_KERAS", "1")
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -52,8 +56,7 @@ FIXTURES_DIR = helpers.FIXTURES_DIR
 DEFAULT_SOURCE = os.path.join(
     REPO_ROOT, "standalone", "pred", "notebook_crop_input.tif")
 DEFAULT_MODEL = os.path.join(
-    REPO_ROOT, "standalone", "model",
-    "model_UNet_GenDS_512_2023-02-27_211141.hdf5")
+    REPO_ROOT, "standalone", "model_onnx", "General.onnx")
 
 # Determinism overrides baked into the config snapshot. Serial workers pin
 # result ORDER (imap_unordered / callback appends) and CONTENT (the refine

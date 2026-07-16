@@ -1,24 +1,26 @@
-"""Golden inference test: crop_input.tif + UNet HDF5 -> stem map.
+"""Golden inference test: crop_input.tif + ONNX U-Net -> stem map.
 
-Marked slow (loads TensorFlow + a 374 MB model). Comparison is
-agreement-based, not exact: TF results can vary at floating-point level
-across devices (CPU/Metal) and library versions, and the binarization
-threshold turns tiny logit differences into isolated pixel flips.
-Everything downstream is pinned exactly because the stage tests start from
-the SAVED stem map, not a fresh prediction.
+Marked slow (loads onnxruntime + a ~124 MB model and predicts the whole crop).
+No TensorFlow. Forces CPU onnxruntime so it matches the CPU-generated fixtures;
+comparison is agreement-based (isolated boundary-pixel flips are expected across
+onnxruntime builds). Everything downstream is pinned exactly because the stage
+tests start from the SAVED stem map, not a fresh prediction.
 """
 
 import json
 import os
 
-import numpy as np
-import pytest
+# Deterministic + CPU onnxruntime, to match how the fixtures were generated.
+os.environ.setdefault("WINMOL_ONNX_FORCE_CPU", "1")
 
-import helpers
+import numpy as np   # noqa: E402
+import pytest        # noqa: E402
+
+import helpers       # noqa: E402
 
 MODEL_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "standalone", "model", "model_UNet_GenDS_512_2023-02-27_211141.hdf5")
+    "standalone", "model_onnx", "General.onnx")
 
 pytestmark = pytest.mark.slow
 
@@ -26,8 +28,9 @@ pytestmark = pytest.mark.slow
 @pytest.fixture(scope="module")
 def model():
     if not os.path.exists(MODEL_PATH):
-        pytest.skip(f"model not found: {MODEL_PATH}")
-    pytest.importorskip("tensorflow")
+        pytest.skip(f"ONNX model not found: {MODEL_PATH} "
+                    f"(run scripts/convert_models_to_onnx.py)")
+    pytest.importorskip("onnxruntime")
     from utils import IO
     return IO.load_model_from_path(MODEL_PATH)
 
@@ -37,10 +40,10 @@ def test_model_identity_matches_fixture_generation(fixtures_dir):
     with open(os.path.join(fixtures_dir, "manifest.json")) as f:
         manifest = json.load(f)
     if not os.path.exists(MODEL_PATH):
-        pytest.skip("model file absent")
+        pytest.skip("ONNX model file absent")
     from generate_fixtures import sha16
     assert sha16(MODEL_PATH) == manifest["model"]["sha256_16"], (
-        "local model differs from the one that generated the fixtures — "
+        "local ONNX model differs from the one that generated the fixtures — "
         "regenerate fixtures or restore the model")
 
 

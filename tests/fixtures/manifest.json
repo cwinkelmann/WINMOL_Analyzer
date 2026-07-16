@@ -1,16 +1,16 @@
 {
  "counts": {
-  "stage_build_stem_parts": 258,
-  "stage_connect_stems": 62,
-  "stage_find_segments": 258,
-  "stage_quantified_contour": 62,
-  "stage_quantified_edt": 62,
-  "stage_restore_geo": 258
+  "stage_build_stem_parts": 269,
+  "stage_connect_stems": 58,
+  "stage_find_segments": 269,
+  "stage_quantified_contour": 58,
+  "stage_quantified_edt": 58,
+  "stage_restore_geo": 269
  },
  "crossings_in_window": -1,
  "model": {
-  "file": "model_UNet_GenDS_512_2023-02-27_211141.hdf5",
-  "sha256_16": "7314266214015f69"
+  "file": "General.onnx",
+  "sha256_16": "8034a2cd654e0f91"
  },
  "pythonhashseed": "0",
  "source": "standalone/pred/notebook_crop_input.tif",

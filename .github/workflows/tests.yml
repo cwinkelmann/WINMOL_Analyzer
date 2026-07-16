@@ -58,11 +58,10 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Link baked-in model into the expected path
+      - name: Link baked-in ONNX model into the expected path
         run: |
-          mkdir -p standalone/model
-          ln -sf /opt/winmol/model/model_UNet_GenDS_512_2023-02-27_211141.hdf5 \
-            standalone/model/
+          mkdir -p standalone/model_onnx
+          ln -sf /opt/winmol/model_onnx/General.onnx standalone/model_onnx/
 
       - name: Run model-dependent tests
         run: >

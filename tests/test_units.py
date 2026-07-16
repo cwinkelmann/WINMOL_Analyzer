@@ -151,7 +151,6 @@ def test_build_tile_grid_covers_raster_exactly():
 # ---------------------------------------------------------------------------
 
 def test_to_float32_image_dtype_behavior():
-    pytest.importorskip("tensorflow")  # utils.Prediction imports tf top-level
     from utils.Prediction import _to_float32_image
     u8 = np.array([0, 255], dtype=np.uint8)
     assert np.allclose(_to_float32_image(u8), [0.0, 1.0])
@@ -167,7 +166,6 @@ def test_to_float32_image_dtype_behavior():
 # ---------------------------------------------------------------------------
 
 def test_binarize_prediction_core():
-    pytest.importorskip("tensorflow")  # utils.Prediction imports tf top-level
     from utils.Prediction import _binarize_prediction_core
     pred = np.array([[0.49, 0.5], [0.51, 1.0]], dtype=np.float32)
     mask = np.ones_like(pred, dtype=bool)

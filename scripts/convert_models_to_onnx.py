@@ -30,7 +30,6 @@ if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
 import numpy as np              # noqa: E402
-import rasterio                 # noqa: E402
 
 MODEL_DIR = os.path.join(REPO, "standalone", "model")
 # config.json key -> local Keras file (the four shipped Zenodo models)
@@ -46,6 +45,7 @@ FIXTURE_CROP = os.path.join(REPO, "tests", "fixtures", "crop_input.tif")
 
 def _real_tiles(n=4, size=512):
     """A batch of NHWC [N,size,size,3] float32 [0,1] tiles from the fixture."""
+    import rasterio   # only needed for the parity check
     with rasterio.open(FIXTURE_CROP) as s:
         img = (s.read([1, 2, 3]).transpose(1, 2, 0) / 255.0).astype("float32")
     h, w, _ = img.shape
@@ -57,12 +57,12 @@ def _real_tiles(n=4, size=512):
     return np.ascontiguousarray(np.stack(tiles))
 
 
-def convert_one(name, out_dir):
+def convert_one(name, out_dir, model_dir=MODEL_DIR):
     import tensorflow as tf   # noqa: F401 (env parity)
     import tf2onnx
     from tensorflow import keras
 
-    hdf5 = os.path.join(MODEL_DIR, MODELS[name])
+    hdf5 = os.path.join(model_dir, MODELS[name])
     if not os.path.exists(hdf5):
         print(f"[skip] {name}: {hdf5} not found")
         return None
@@ -148,24 +148,34 @@ def parity(name, onnx_path, keras_model):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", default=None, help="convert a single key")
+    ap.add_argument("--model-dir", default=MODEL_DIR,
+                    help="dir holding the source .hdf5 files")
     ap.add_argument("--out-dir",
                     default=os.path.join(REPO, "standalone", "model_onnx"))
     ap.add_argument("--raw-tol", type=float, default=1e-3,
                     help="sanity bound on raw-probability max diff")
+    ap.add_argument("--no-parity", action="store_true",
+                    help="convert only, skip the fixture-based parity check "
+                         "(used in the CI image build, which has no fixture)")
     args = ap.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
     keys = [args.only] if args.only else list(MODELS)
     worst_raw, worst_disagree = 0.0, 0.0
     for name in keys:
-        res = convert_one(name, args.out_dir)
+        res = convert_one(name, args.out_dir, model_dir=args.model_dir)
         if res is None:
             continue
         onnx_path, model = res
+        if args.no_parity:
+            print(f"[convert-only] {name} -> {onnx_path}\n")
+            continue
         raw, disagree = parity(name, onnx_path, model)
         worst_raw = max(worst_raw, raw)
         worst_disagree = max(worst_disagree, disagree)
         print()
+    if args.no_parity:
+        return
     # Gate: the binarized stem mask must be identical (0 disagreement);
     # raw probability diff is only sanity-bounded.
     ok = worst_disagree == 0.0 and worst_raw <= args.raw_tol

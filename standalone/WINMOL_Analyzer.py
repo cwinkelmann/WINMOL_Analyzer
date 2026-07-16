@@ -6,14 +6,9 @@
 import os
 import sys
 
-# The pretrained WINMOL models are Keras 2 HDF5 artifacts and fail to load under
-# the Keras 3 bundled with TensorFlow >= 2.16. Route tf.keras to the legacy
-# Keras 2 shim (tf-keras) when available. This MUST run before TensorFlow is
-# imported. Set explicitly in the environment to override.
-os.environ.setdefault("TF_USE_LEGACY_KERAS", "1")
-
-from tensorflow import keras
-
+# Models are ONNX, loaded via IO.load_model_from_path (onnxruntime, no
+# TensorFlow). A legacy Keras .hdf5 still loads if TensorFlow is installed
+# (IO handles it and sets the legacy-Keras shim as needed).
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from classes.Config import Config
@@ -38,11 +33,12 @@ def run_pipeline(model_path, img_path, pred_dir, output_dir, config=None):
         config = Config()
     config.display()
 
-    # Load the model from the HDF5 file
-    model = keras.models.load_model(model_path, compile=False)
+    # Load the model (.onnx via onnxruntime, or .hdf5/.keras if TF present)
+    model = IO.load_model_from_path(model_path)
 
-    # Display a summary of the loaded model architecture
-    model.summary()
+    # Display a summary of the loaded model, if available
+    if hasattr(model, "summary"):
+        model.summary()
 
     # Extract the base name of the input image file
     file_name = os.path.splitext(os.path.basename(img_path))[0]
