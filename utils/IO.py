@@ -228,20 +228,19 @@ def load_model_from_path(model_path):
 
 
 def _load_onnx_model(model_path):
-    """Load a .onnx segmenter via the winmol_unet runtime adapter.
+    """Load a .onnx segmenter via the vendored OnnxSegmenter.
 
     OnnxSegmenter exposes predict_on_batch(NHWC) and normalizes runtime OOM to a
     retryable exception, so it is a drop-in for the Keras model everywhere the
-    analyzer runs inference. Requires the winmol_unet package (which pulls in
-    onnxruntime) to be installed in this environment.
+    analyzer runs inference. Needs only numpy + onnxruntime (no TensorFlow, no
+    external winmol_unet).
     """
     try:
-        from winmol_unet.runtime import OnnxSegmenter
+        from utils.onnx_runtime import OnnxSegmenter
     except Exception as e:
         raise RuntimeError(
-            "Loading a .onnx model requires the 'winmol_unet' package "
-            "(and onnxruntime) in this environment. Install it, e.g. "
-            "`pip install -e /path/to/WINMOL_segmentor_pt`. "
+            "Loading a .onnx model requires 'onnxruntime' in this "
+            "environment. Install it: `pip install onnxruntime`. "
             f"Original import error: {e}"
         ) from e
     print(f"Loading ONNX model via OnnxSegmenter: {model_path}")
