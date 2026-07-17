@@ -31,6 +31,13 @@ def test_venv_python_path_platform():
         assert "/bin/python" in p
 
 
+def test_venv_location_falls_back_inside_plugin_off_qgis(tmp_path):
+    # Off-QGIS (no profile dir) the venv lives inside the plugin dir, which is
+    # what the tests and headless runs assume.
+    loc = inst.venv_location(str(tmp_path))
+    assert loc == os.path.join(str(tmp_path), inst.WINMOL_VENV_NAME)
+
+
 def test_sentinel_gate_roundtrip(tmp_path, monkeypatch):
     venv = tmp_path / "winmol_venv"
     # fake an existing venv python so is_ready checks the marker, not the exe

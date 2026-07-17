@@ -167,3 +167,7 @@ cython_debug/
 # venv created by plugin
 winmol_venv
 venv
+__autograph_generated_file*.py
+pytest-of-*/
+winmol_fixture_tiles_*/
+winmol_test_tiles_*/

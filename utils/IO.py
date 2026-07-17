@@ -56,6 +56,13 @@ def get_raster_info(path) -> dict:
 
 def atomic_tmp_path(final_path: str) -> str:
     p = Path(final_path)
+    # An empty/dir-only path yields Path('.') whose .with_suffix() raises the
+    # cryptic "PosixPath('.') has an empty name". Fail with an actionable
+    # message instead (e.g. when the stem-map output arg is empty).
+    if not p.name:
+        raise ValueError(
+            "No output stem-map path was provided (got "
+            f"{final_path!r}); pass a file path for the stem map raster.")
     return str(p.with_suffix(p.suffix + '.tmp'))
 
 
@@ -195,36 +202,32 @@ def load_model_from_path(model_path):
     from tensorflow.keras import layers
     from tensorflow.keras.utils import get_custom_objects
 
-    # Function to open the model with a fallback mechanism
+    # These pretrained WINMOL HDF5 models were saved with Keras 2 and carry
+    # layer configs that Keras 3 rejects on load:
+    #   * Dropout(seed=<float>)      -> Keras 3 requires an int seed
+    #   * Conv2DTranspose(groups=..) -> 'groups' was removed in Keras 3
+    # Register transparent shims that fix both BEFORE the (single) load, so it
+    # succeeds cleanly instead of failing with an alarming traceback and then
+    # retrying. The shims are pass-through for models that don't need them.
     def custom_dropout(**kwargs):
-        if 'seed' in kwargs and isinstance(kwargs['seed'], float):
-            kwargs['seed'] = int(kwargs['seed'])  # Convert seed to int
+        seed = kwargs.get('seed')
+        if isinstance(seed, float):
+            kwargs['seed'] = int(seed)
         return layers.Dropout(**kwargs)
 
     class CustomConv2DTranspose(layers.Conv2DTranspose):
-        # Remove 'groups' parameter if present
         def __init__(self, *args, **kwargs):
-            kwargs.pop("groups", None)
+            kwargs.pop("groups", None)   # unsupported in Keras 3
             super().__init__(*args, **kwargs)
 
-        def call(self, inputs, **kwargs):
-            return super().call(inputs, **kwargs)
+    get_custom_objects()["Dropout"] = custom_dropout
+    get_custom_objects()["Conv2DTranspose"] = CustomConv2DTranspose
 
     try:
-        print("Trying to load model using open_model()")
         return keras.models.load_model(model_path, compile=False)
     except Exception as e:
-        print("open_model() failed:", e)
-
-    try:
-        print("Retrying with custom layers (Dropout, Conv2DTranspose)")
-        get_custom_objects()["Dropout"] = custom_dropout
-        get_custom_objects()["Conv2DTranspose"] = CustomConv2DTranspose
-        return keras.models.load_model(model_path, compile=False)
-    except Exception as e:
-        print("Loading with custom layers also failed:", e)
-
-    raise RuntimeError("Failed to load model with all methods.")
+        raise RuntimeError(
+            f"Failed to load Keras model {model_path}: {e}")
 
 
 def _load_onnx_model(model_path):

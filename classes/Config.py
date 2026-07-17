@@ -21,7 +21,11 @@ class Config(object):
     prediction_batch_gpu = 4
     prediction_batch_max_gpu = 16
     prediction_batch_multi_gpu = 12     # local per-worker batch
-    prediction_batch_autotune = True
+    # Off by default: the autotune times ~6 batch sizes x 5 repeats before the
+    # first tile, and on Apple/CoreML each distinct batch size forces a model
+    # recompile -> a long SILENT stall for ~1% throughput. Enable via
+    # WINMOL_CONFIG_OVERRIDES_JSON on CUDA if you want it.
+    prediction_batch_autotune = False
     prediction_batch_autotune_patience = 4
     prediction_batch_autotune_repeats = 5
     prediction_batch_autotune_min_improve = 0.005

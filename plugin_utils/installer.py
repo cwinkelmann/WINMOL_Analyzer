@@ -34,10 +34,11 @@ MODELS_PATH = "models"
 READY_MARKER = ".winmol_ready"
 QSETTINGS_PYTHON_KEY = "winmol/python_executable"
 
-# The code uses PEP 604 unions (str | None), so it requires Python >= 3.10.
-# (macOS system /usr/bin/python3 is 3.9 and is therefore rejected.)
-MIN_PY = (3, 10)
-MAX_PY = (3, 12)
+# WINMOL standardises on Python 3.11 everywhere: the code is validated only on
+# 3.11 and the managed environment is always built as 3.11 (downloaded via
+# plugin_utils/py311.py when the host has none). MIN==MAX pins it exactly.
+MIN_PY = (3, 11)
+MAX_PY = (3, 11)
 
 _PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -53,6 +54,51 @@ def plugin_requirements_path() -> Path:
     if not path.exists():   # fall back to base if plugin.txt is absent
         path = repo_requirements_dir().joinpath("base.txt")
     return path
+
+
+def managed_root(plugin_dir) -> str:
+    """Directory holding WINMOL's managed artifacts (the venv and, when
+    downloaded, the Python 3.11 runtime).
+
+    Prefer a location OUTSIDE the plugin directory (under the QGIS profile dir)
+    so uninstalling the plugin -- a recursive delete of ``plugin_dir`` -- never
+    has to remove thousands of venv/runtime files and symlinks. That deletion
+    is exactly what QGIS reports as "plugin uninstall failed" when a half-built
+    or symlinked venv lives inside the plugin folder. Off-QGIS (unit tests,
+    headless) there is no profile, so fall back to ``plugin_dir``.
+    """
+    try:
+        from qgis.core import QgsApplication
+        base = QgsApplication.qgisSettingsDirPath()
+        if base:
+            return os.path.join(base, "winmol")
+    except Exception:
+        pass
+    return plugin_dir
+
+
+def venv_location(plugin_dir) -> str:
+    """Absolute path of the managed venv (under managed_root)."""
+    return os.path.join(managed_root(plugin_dir), WINMOL_VENV_NAME)
+
+
+def managed_base_python(plugin_dir, progress=None) -> str:
+    """A Python 3.11 interpreter to build the venv from.
+
+    Prefer a 3.11 already on PATH (no download); otherwise download a
+    relocatable python-build-standalone 3.11 into ``managed_root/py311`` — so a
+    bare machine with only QGIS (fresh Windows, macOS system 3.9, no conda)
+    still gets a working 3.11. Raises RuntimeError only if no 3.11 is on PATH
+    AND the download/extract fails.
+    """
+    import shutil
+    for name in ("python3.11", "python3.11.exe", "python3", "python"):
+        exe = shutil.which(name)
+        if exe and _python_version(exe) == (3, 11):
+            return exe
+    from . import py311
+    dest = os.path.join(managed_root(plugin_dir), "py311")
+    return py311.ensure_python311(dest, progress=progress)
 
 
 def get_python_command() -> str:
@@ -246,15 +292,31 @@ def download_models(plugin_dir, config_path=None) -> list:
     return missing
 
 
-def setup_environment(venv_path, base_python=None, download=True) -> dict:
+def setup_environment(venv_path, base_python=None, download=True,
+                      plugin_dir=None, progress=None) -> dict:
     """Create the venv and install deps (idempotent via the sentinel).
     Returns {'python': <exe>, 'missing_models': [...]}. Raises only on a real
-    environment failure (venv/pip/deps); callers convert that to a retry."""
-    plugin_dir = os.path.dirname(venv_path)
+    environment failure (venv/pip/deps); callers convert that to a retry.
+
+    The venv is always built on Python 3.11: ``base_python`` is used if given,
+    else a 3.11 is resolved (PATH or a downloaded PBS build) via
+    ``managed_base_python``. ``plugin_dir`` is where models are downloaded
+    (``<plugin_dir>/models``) and where the runtime is cached; it must be
+    passed explicitly now that the venv lives outside the plugin directory.
+    ``progress`` (callable taking a status string) surfaces download/build
+    steps to the UI."""
+    if plugin_dir is None:
+        plugin_dir = os.path.dirname(venv_path)
     if not is_ready(venv_path):
         if not os.path.exists(get_venv_python_path(venv_path)):
-            create_venv(venv_path, base_python)
+            base = base_python or managed_base_python(plugin_dir,
+                                                      progress=progress)
+            if progress:
+                progress("Creating the WINMOL environment…")
+            create_venv(venv_path, base)
         ensure_pip(venv_path)
+        if progress:
+            progress("Installing dependencies (onnxruntime + geo stack)…")
         install_requirements(venv_path)
         _write_marker(venv_path)
     missing = download_models(plugin_dir) if download else []
@@ -264,7 +326,7 @@ def setup_environment(venv_path, base_python=None, download=True) -> dict:
 
 # --- top-level resolution used by classFactory -----------------------------
 
-def resolve_environment(plugin_dir, prompt=True) -> dict:
+def resolve_environment(plugin_dir, prompt=True, build=True) -> dict:
     """Decide which Python runs winmol_run.py, setting one up if needed.
 
     Returns a status dict:
@@ -272,8 +334,13 @@ def resolve_environment(plugin_dir, prompt=True) -> dict:
        'python': <exe or None>, 'venv_path': <path>, 'message': <str>,
        'missing_models': [...]}
     Never raises — a bad state is reported, not thrown, so QGIS keeps loading.
+
+    With ``build=False`` (used at plugin load) it never does heavy work: if no
+    ready env exists it returns 'needs_setup' instead of downloading Python /
+    building the venv, so QGIS startup can't block. The dialog then builds the
+    environment asynchronously (with progress) on first open/run.
     """
-    venv_path = os.path.join(plugin_dir, WINMOL_VENV_NAME)
+    venv_path = venv_location(plugin_dir)
     result = {"venv_path": venv_path, "python": None, "missing_models": []}
 
     byo = configured_python_executable()
@@ -300,6 +367,14 @@ def resolve_environment(plugin_dir, prompt=True) -> dict:
                       message="WINMOL environment ready.")
         return result
 
+    if not build:
+        result.update(
+            status="needs_setup",
+            message="WINMOL environment not set up yet. Open the plugin and "
+                    "use the Environment button to create it (Python 3.11 + "
+                    "onnxruntime).")
+        return result
+
     if prompt and not _confirm_setup():
         result.update(status="declined",
                       message="WINMOL setup declined; run it later from the "
@@ -307,7 +382,7 @@ def resolve_environment(plugin_dir, prompt=True) -> dict:
         return result
 
     try:
-        info = setup_environment(venv_path)
+        info = setup_environment(venv_path, plugin_dir=plugin_dir)
         result.update(status="installed", python=info["python"],
                       missing_models=info["missing_models"],
                       message="WINMOL environment installed.")
