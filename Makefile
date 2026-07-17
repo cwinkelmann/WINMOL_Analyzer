@@ -41,17 +41,20 @@ SOURCES = \
 	__init__.py \
 	winmol_analyzer.py winmol_analyzer_dialog.py
 
-PLUGINNAME = winmol_analyzer
+PLUGINNAME = WINMOL_Analyzer
 
+# The plugin GUI (QGIS side) AND the compute core it shells out to: winmol_run.py
+# needs classes/, utils/, plugin_utils/, config.json and requirements/ to run.
 PY_FILES = \
 	__init__.py \
-	winmol_analyzer.py winmol_analyzer_dialog.py
+	winmol_analyzer.py winmol_analyzer_dialog.py \
+	tasks_threads.py winmol_run.py winmol_batch.py
 
 UI_FILES = winmol_analyzer_dialog_base.ui
 
-EXTRAS = metadata.txt icon.png
+EXTRAS = metadata.txt icon.png config.json
 
-EXTRA_DIRS =
+EXTRA_DIRS = classes utils plugin_utils requirements
 
 COMPILED_RESOURCE_FILES = resources.py
 
@@ -66,7 +69,7 @@ PEP8EXCLUDE=pydev,resources.py,conf.py,third_party,ui
 #	* Windows:
 #	  AppData\Roaming\QGIS\QGIS3\profiles\default\python\plugins'
 
-QGISDIR=~/.local/share/QGIS/QGIS3/profiles/default/python/plugins/
+QGISDIR=.local/share/QGIS/QGIS3/profiles/default
 
 #################################################
 # Normally you would not need to edit below here
@@ -113,23 +116,21 @@ test: compile transcompile
 	@echo "e.g. source run-env-linux.sh <path to qgis install>; make test"
 	@echo "----------------------"
 
-deploy: compile doc transcompile
+deploy: compile
 	@echo
 	@echo "------------------------------------------"
-	@echo "Deploying plugin to your .qgis2 directory."
+	@echo "Deploying plugin to your QGIS profile."
 	@echo "------------------------------------------"
-	# The deploy  target only works on unix like operating system where
-	# the Python plugin directory is located at:
-	# $HOME/$(QGISDIR)/python/plugins
-	mkdir -p $(HOME)/$(QGISDIR)/python/plugins/$(PLUGINNAME)
-	cp -vf $(PY_FILES) $(HOME)/$(QGISDIR)/python/plugins/$(PLUGINNAME)
-	cp -vf $(UI_FILES) $(HOME)/$(QGISDIR)/python/plugins/$(PLUGINNAME)
-	cp -vf $(COMPILED_RESOURCE_FILES) $(HOME)/$(QGISDIR)/python/plugins/$(PLUGINNAME)
-	cp -vf $(EXTRAS) $(HOME)/$(QGISDIR)/python/plugins/$(PLUGINNAME)
-	cp -vfr i18n $(HOME)/$(QGISDIR)/python/plugins/$(PLUGINNAME)
-	cp -vfr $(HELP) $(HOME)/$(QGISDIR)/python/plugins/$(PLUGINNAME)/help
-	# Copy extra directories if any
-	(foreach EXTRA_DIR,(EXTRA_DIRS), cp -R (EXTRA_DIR) (HOME)/(QGISDIR)/python/plugins/(PLUGINNAME)/;)
+	# Installs into $(HOME)/$(QGISDIR)/python/plugins/$(PLUGINNAME).
+	$(eval DEST := $(HOME)/$(QGISDIR)/python/plugins/$(PLUGINNAME))
+	mkdir -p "$(DEST)"
+	cp -vf $(PY_FILES) "$(DEST)"
+	cp -vf $(UI_FILES) "$(DEST)"
+	cp -vf $(COMPILED_RESOURCE_FILES) "$(DEST)"
+	cp -vf $(EXTRAS) "$(DEST)"
+	# Copy the compute-core directories the subprocess needs.
+	for d in $(EXTRA_DIRS); do \
+		rm -rf "$(DEST)/$$d"; cp -vfr "$$d" "$(DEST)/"; done
 
 
 # The dclean target removes compiled python files from plugin directory
