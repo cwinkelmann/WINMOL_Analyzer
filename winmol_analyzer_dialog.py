@@ -46,6 +46,15 @@ from .tasks_threads import Worker
 
 current_path = os.path.dirname(__file__)
 
+# Keep-alive for background threads that outlive the dialog. A parentless
+# QThread whose only Python reference is a dialog attribute gets GC-deleted when
+# the dialog is torn down (QGIS quit, plugin unload/reload) — and destroying a
+# QThread while its OS thread still runs triggers Qt's qFatal() -> abort(),
+# taking down all of QGIS. If a thread can't be stopped promptly at teardown we
+# stash it here (module scope survives dialog GC) so it is never collected while
+# running; it self-evicts on finished().
+_ALIVE_BG = set()
+
 # This loads your .ui file so that PyQt can populate your plugin with the
 # elements from Qt Designer
 FORM_CLASS, _ = uic.loadUiType(
@@ -67,6 +76,9 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self.output_lineEdit_nodes.setReadOnly(True)
             self.output_toolButton_trees.setEnabled(False)
             self.output_toolButton_nodes.setEnabled(False)
+            # Output is optional now: empty -> temp folder, then Export.
+            self.output_lineEdit_stem.setPlaceholderText(
+                "optional — leave empty to use a temp folder, then Export…")
         except Exception:
             pass
         self._updating_output_fields = False
@@ -86,6 +98,19 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.crs = None
         self.worker = None
         self.thread = None
+        # Background environment-build thread (download 3.11 + venv + pip).
+        self._env_thread = None
+        self._env_worker = None
+        # Re-entrancy guard: reassigning self.thread while its OS thread is
+        # still running destroys a live QThread -> Qt qFatal() -> the whole
+        # QGIS process aborts. Never start a second run over a live one.
+        self._run_active = False
+        # Outputs of the last successful run, for the Export action. Each entry
+        # is an absolute path (stem map + optional gpkg).
+        self._last_outputs = []
+        # If True, the stem map went to a temp dir and should be offered for
+        # export (the user didn't choose a permanent output path).
+        self._last_output_is_temp = False
 
         # Create a Config instance
         self.config = Config()
@@ -94,12 +119,15 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.output_log.setReadOnly(True)
         self.env = env or {}
         self.python_exe = self.env.get("python")
-        # models live next to the plugin (works for both venv and BYO-env)
-        plugin_dir = os.path.dirname(
-            self.env.get("venv_path")
-            or os.path.join(os.path.dirname(__file__), "winmol_venv"))
+        # models live next to the plugin. Derive from this file's location --
+        # NOT from venv_path, which may now live outside the plugin dir (in the
+        # QGIS profile) so that uninstalling the plugin can't fail on it.
+        plugin_dir = os.path.dirname(os.path.abspath(__file__))
         self.models_dir = os.path.join(plugin_dir, "models")
         self.populate_model_combo_box()
+        # Controls that aren't in the .ui: persistent Environment button +
+        # a QGIS layer selector for the input raster.
+        self._add_custom_controls()
         # If no usable interpreter yet, offer the environment picker once the
         # dialog is visible (deferred so it doesn't block construction).
         if not self._env_ready():
@@ -182,10 +210,13 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
 
         self.model_comboBox.addItem("Custom")
 
-        if model_names and "General" in model_names:
-            idx = self.model_comboBox.findText("General")
-            if idx >= 0:
-                self.model_comboBox.setCurrentIndex(idx)
+        # Default to Spruce_Deadwood (bundled), then fall back to General.
+        for _default in ("Spruce_Deadwood", "General"):
+            if model_names and _default in model_names:
+                idx = self.model_comboBox.findText(_default)
+                if idx >= 0:
+                    self.model_comboBox.setCurrentIndex(idx)
+                    break
 
         try:
             self.model_comboBox.blockSignals(False)
@@ -336,8 +367,23 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self.output_lineEdit_stem.setText(file_path)
 
     def set_path_from_line_edit(self):
-        # Single user-controlled output path: stem map output.
-        stem_out = self._normalize_stem_map_output(self.output_lineEdit_stem.text().strip())
+        # Input path: always re-read from the visible field (the source of
+        # truth). The user may have typed it, or a layer was picked from the
+        # QgsMapLayerComboBox — either way the cached self.uav_path from the
+        # file dialog is not authoritative. Empty here == the "No such file"
+        # crash in rasterio, so we capture it now and validate in run_process.
+        self.uav_path = self.uav_lineEdit.text().strip()
+
+        # Output stem map path is OPTIONAL. If the user left it empty we write
+        # to a temp dir and offer an Export afterwards, so a run "just works"
+        # without forcing a path up front. (An empty path otherwise reaches
+        # IO.atomic_tmp_path as Path("") and crashes with the cryptic
+        # "PosixPath('.') has an empty name" deep in the prediction phase.)
+        stem_field = self.output_lineEdit_stem.text().strip()
+        self._last_output_is_temp = not bool(stem_field)
+        if not stem_field:
+            stem_field = self._temp_stem_map_base()
+        stem_out = self._normalize_stem_map_output(stem_field)
         self.stem_path = stem_out
 
         # Derived vector output: '<base>_detected_stems.gpkg'
@@ -350,11 +396,38 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         else:
             self.trees_path = ""
 
+        # Remember what this run will produce, for the Export action.
+        self._last_outputs = [p for p in (self.stem_path, self.trees_path) if p]
+
         # Keep UI in sync (read-only display)
         try:
             self.output_lineEdit_trees.setText(gpkg_path if self.output_checkBox_trees.isChecked() or self.output_checkBox_nodes.isChecked() else "")
         except Exception:
             pass
+
+    def _winmol_tmp_dir(self) -> str:
+        """A temp area for outputs when no output path is given. Under the QGIS
+        profile so it's discoverable, falling back to the system temp dir."""
+        base = None
+        try:
+            from qgis.core import QgsApplication
+            base = QgsApplication.qgisSettingsDirPath()
+        except Exception:
+            base = None
+        root = os.path.join(base, "winmol", "tmp") if base else None
+        if not root:
+            import tempfile
+            root = os.path.join(tempfile.gettempdir(), "winmol")
+        os.makedirs(root, exist_ok=True)
+        return root
+
+    def _temp_stem_map_base(self) -> str:
+        """Unique base path for a temp stem map: '<tmp>/<input>_<id>'.
+        _normalize_stem_map_output appends '_stem_map.tiff'."""
+        import uuid
+        stem = Path(self.uav_path).stem if self.uav_path else "winmol"
+        return os.path.join(self._winmol_tmp_dir(),
+                            f"{stem}_{uuid.uuid4().hex[:8]}")
 
     def _suggest_stem_map_output(self, uav_path: str) -> str:
         """Derive default stem map output path from input image path."""
@@ -575,15 +648,80 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
 
     def cancel_process(self):
         # Actually terminate the child process, not just the thread signal.
-        if self.worker:
+        # Guard on _run_active: after a run ends the worker is deleteLater'd,
+        # so calling into it would hit a deleted C++ object.
+        if self._run_active and self.worker:
             self.update_output_log("Cancelling…")
-            self.worker.cancel()
+            try:
+                self.worker.cancel()
+            except RuntimeError:
+                pass
 
     def close_application(self):
         print("Closing application")
         self.close()
 
+    def closeEvent(self, event):
+        # Never let a running background QThread be destroyed while its OS
+        # thread is alive — that qFatals QGIS. Stop/park threads first.
+        self._shutdown_threads()
+        super().closeEvent(event)
+
+    def _shutdown_threads(self):
+        """Stop background threads (inference + env build) so the dialog and
+        its parentless QThreads can be torn down safely. Call this from the
+        plugin's unload() too, before QGIS drops the dialog reference."""
+        # Inference: cancelling terminates the child process, so the thread's
+        # read loop returns quickly and the thread can be waited out.
+        if self._run_active and self.worker is not None:
+            try:
+                self.worker.cancel()
+            except (RuntimeError, AttributeError):
+                pass
+        self._reap_thread(self.thread, self.worker)
+        # Env build: request cancel; network reads are timeout-bounded, but a
+        # pip install mid-flight can't be interrupted, so it may get parked.
+        if self._env_worker is not None:
+            try:
+                self._env_worker.cancel()
+            except (RuntimeError, AttributeError):
+                pass
+        self._reap_thread(self._env_thread, self._env_worker)
+
+    def _reap_thread(self, thread, worker):
+        """Quit + wait a bounded time for a QThread. If it is still running
+        (e.g. pip mid-install), park it in _ALIVE_BG so it is never GC'd while
+        running (which would qFatal); it self-evicts when it finishes."""
+        if thread is None:
+            return
+        try:
+            if not thread.isRunning():
+                return
+            thread.quit()
+            if thread.wait(8000):
+                return
+            _ALIVE_BG.add(thread)
+            if worker is not None:
+                _ALIVE_BG.add(worker)
+
+            def _evict(t=thread, w=worker):
+                _ALIVE_BG.discard(t)
+                _ALIVE_BG.discard(w)
+            thread.finished.connect(_evict)
+        except RuntimeError:
+            pass
+
     def run_process(self):
+        # Guard against re-entry: a second Run while one is live would reassign
+        # self.thread and destroy a still-running QThread -> Qt qFatal aborts
+        # the whole QGIS process. (This is what crashed QGIS.)
+        if self._run_active:
+            QtWidgets.QMessageBox.information(
+                self, "WINMOL Analyzer",
+                "A run is already in progress. Wait for it to finish, or press "
+                "Cancel, before starting another.")
+            return
+
         # Path to the Python script
         path_dirname = os.path.dirname(__file__)
         script_path = os.path.join(path_dirname, "winmol_run.py")
@@ -605,6 +743,30 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
 
         self.set_selected_process_type()
         self.set_path_from_line_edit()
+
+        # Validate the input BEFORE launching the subprocess: an empty or
+        # missing path otherwise surfaces as an opaque rasterio
+        # "No such file or directory" deep in winmol_run.py.
+        if not self.uav_path:
+            QtWidgets.QMessageBox.warning(
+                self, "WINMOL Analyzer",
+                "No input GeoTiff selected. Pick a file, type a path, or "
+                "choose a loaded raster layer.")
+            return
+        if not os.path.exists(self.uav_path):
+            QtWidgets.QMessageBox.warning(
+                self, "WINMOL Analyzer",
+                f"Input GeoTiff was not found:\n{self.uav_path}")
+            return
+        # The stem map raster is always written; an empty output path crashes
+        # the prediction phase. set_path_from_line_edit auto-derives it from the
+        # input, so this only trips if that derivation somehow failed.
+        if not self.stem_path or Path(self.stem_path).name == "":
+            QtWidgets.QMessageBox.warning(
+                self, "WINMOL Analyzer",
+                "No output path is set and none could be derived from the "
+                "input. Set an output stem map path.")
+            return
 
         # check if uav image is loaded in qgis
         self.check_uav_input_exists(self.stem_path)
@@ -669,10 +831,27 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self.worker.finished.connect(self.thread.quit)
             self.worker.finished.connect(self.worker.deleteLater)
             self.thread.finished.connect(self.thread.deleteLater)
+            self.thread.finished.connect(self._on_run_finished)
             self.worker.update_signal.connect(self.update_output_log)
+            # Mark active + lock the Run and Environment buttons BEFORE
+            # starting, so a second click can't reassign self.thread (abort) or
+            # start a competing env build.
+            self._run_active = True
+            for _b in ("run_button", "env_button"):
+                _w = getattr(self, _b, None)
+                if _w is not None:
+                    try:
+                        _w.setEnabled(False)
+                    except Exception:
+                        pass
             self.thread.start()
         # catch out of memory error
         except MemoryError:
+            self._run_active = False
+            try:
+                self.run_button.setEnabled(True)
+            except Exception:
+                pass
             self.worker.update_signal.disconnect(self.update_output_log)
             self.update_output_log(
                 "The operation ran out of memory. "
@@ -693,7 +872,156 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         except Exception:
             pass
 
+    def _on_run_finished(self):
+        """Runs on thread.finished (success OR failure): clear the active flag
+        so the next run can safely build a fresh thread, and re-enable the UI.
+        Offers Export if the run produced outputs on disk."""
+        self._run_active = False
+        # Re-enable Run, and the Environment button unless an env build is in
+        # flight (its own handlers manage it then).
+        for _b, _cond in (("run_button", True),
+                          ("env_button", self._env_thread is None)):
+            _w = getattr(self, _b, None)
+            if _w is not None and _cond:
+                try:
+                    _w.setEnabled(True)
+                except Exception:
+                    pass
+        produced = any(os.path.exists(p) for p in self._last_outputs)
+        self._set_export_enabled(produced)
+        if produced and self._last_output_is_temp:
+            self.update_output_log(
+                "Outputs were written to a temp folder. Use 'Export…' to save "
+                "them to a permanent location.")
+
+    def _set_export_enabled(self, on):
+        btn = getattr(self, "export_button", None)
+        if btn is not None:
+            try:
+                btn.setEnabled(bool(on))
+            except Exception:
+                pass
+
+    def export_results(self):
+        """Copy the last run's outputs (stem map + any gpkg) to a folder the
+        user chooses. Lets runs default to a temp dir yet still be saved."""
+        import shutil
+        outputs = [p for p in self._last_outputs if os.path.exists(p)]
+        if not outputs:
+            QtWidgets.QMessageBox.information(
+                self, "WINMOL Analyzer",
+                "No results to export yet. Run an analysis first.")
+            return
+        target_dir = QFileDialog.getExistingDirectory(
+            self, "Export results to folder", "")
+        if not target_dir:
+            return
+        copied = []
+        for src in outputs:
+            try:
+                dst = os.path.join(target_dir, os.path.basename(src))
+                shutil.copy2(src, dst)
+                copied.append(dst)
+                # bring along a sidecar stats file if the raster has one
+                sidecar = src + ".aux.xml"
+                if os.path.exists(sidecar):
+                    shutil.copy2(sidecar, dst + ".aux.xml")
+            except Exception as exc:
+                self.update_output_log(f"Export failed for {src}: {exc}")
+        if copied:
+            self.update_output_log("Exported:\n" + "\n".join(copied))
+            QtWidgets.QMessageBox.information(
+                self, "WINMOL Analyzer",
+                f"Exported {len(copied)} file(s) to:\n{target_dir}")
+
     # --- compute-environment selection --------------------------------------
+
+    def _add_custom_controls(self):
+        """Add controls not present in the .ui: a persistent 'Environment…'
+        button and a QGIS layer selector for the input raster. Defensive — if
+        a widget can't be placed (e.g. an older/newer QGIS gui API), the file
+        picker and on-open env prompt still work."""
+        # Persistent Environment button (top bar, always visible).
+        try:
+            bar = QtWidgets.QWidget(self)
+            h = QtWidgets.QHBoxLayout(bar)
+            h.setContentsMargins(0, 0, 0, 0)
+            self.env_button = QtWidgets.QPushButton("Environment…", bar)
+            self.env_button.setToolTip(
+                "Choose or create the Python environment that runs the "
+                "analysis (a conda env / venv with onnxruntime + geo libs).")
+            self.env_button.clicked.connect(self.choose_environment)
+            self.env_status_label = QtWidgets.QLabel(bar)
+            self.export_button = QtWidgets.QPushButton("Export…", bar)
+            self.export_button.setToolTip(
+                "Save the last run's outputs (stem map / stems) to a folder. "
+                "Runs without an output path go to a temp folder until "
+                "exported.")
+            self.export_button.setEnabled(False)
+            self.export_button.clicked.connect(self.export_results)
+            h.addWidget(self.env_button)
+            h.addWidget(self.env_status_label, 1)
+            h.addWidget(self.export_button)
+            top = getattr(self, "verticalLayout_7", None) or self.layout()
+            if top is not None:
+                top.insertWidget(0, bar)
+            self._refresh_env_status()
+        except Exception as exc:                       # pragma: no cover - GUI
+            print("WINMOL: could not add Environment button:", exc)
+
+        # Input raster layer selector (pick a layer already loaded in QGIS).
+        try:
+            from qgis.gui import QgsMapLayerComboBox
+            from qgis.core import QgsMapLayerProxyModel
+            self.uav_layer_combo = QgsMapLayerComboBox(self)
+            self.uav_layer_combo.setFilters(QgsMapLayerProxyModel.RasterLayer)
+            self.uav_layer_combo.setAllowEmptyLayer(True)
+            self.uav_layer_combo.setToolTip(
+                "Or pick a raster layer already loaded in QGIS")
+            # Connect AFTER construction so the combo's initial auto-selection
+            # doesn't fire into our slot; then force 'empty' so we never
+            # clobber a typed path when the dialog opens.
+            self.uav_layer_combo.layerChanged.connect(
+                self._on_uav_layer_changed)
+            row = QtWidgets.QWidget(self)
+            hr = QtWidgets.QHBoxLayout(row)
+            hr.setContentsMargins(0, 0, 0, 0)
+            hr.addWidget(QtWidgets.QLabel("Loaded layer:", row))
+            hr.addWidget(self.uav_layer_combo, 1)
+            grid = getattr(self, "gridLayout", None)
+            if grid is not None and hasattr(grid, "addWidget"):
+                grid.addWidget(row, 3, 0, 1, 3)
+            elif getattr(self, "verticalLayout_4", None) is not None:
+                self.verticalLayout_4.insertWidget(1, row)
+            try:
+                self.uav_layer_combo.setLayer(None)
+            except Exception:
+                pass
+        except Exception as exc:                       # pragma: no cover - GUI
+            print("WINMOL: could not add layer selector:", exc)
+
+    def _on_uav_layer_changed(self, layer):
+        """A raster layer was chosen: use its source as the input path."""
+        try:
+            if layer is None or not layer.isValid():
+                return
+            # Strip GDAL subdataset/URI decorations (e.g. 'path|layername').
+            src = layer.source().split("|")[0]
+            if src:
+                self.uav_lineEdit.setText(src)
+                self.uav_path = src
+                self.check_input_file()
+        except Exception:                              # pragma: no cover - GUI
+            pass
+
+    def _refresh_env_status(self):
+        lbl = getattr(self, "env_status_label", None)
+        if lbl is None:
+            return
+        if self._env_ready():
+            lbl.setText(f"Env: {self.python_exe}")
+        else:
+            lbl.setText("Env: not set — click Environment…")
 
     def _env_ready(self):
         return bool(self.python_exe) and os.path.exists(self.python_exe)
@@ -702,6 +1030,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         """Persist the chosen interpreter and use it immediately (no restart)."""
         self.python_exe = exe
         QgsSettings().setValue(installer.QSETTINGS_PYTHON_KEY, exe)
+        self._refresh_env_status()
 
     def choose_environment(self):
         """Interactive picker: use an existing interpreter (venv/conda) or
@@ -763,21 +1092,86 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
                 "Dependency install failed:\n" + (r.stderr or r.stdout)[-800:])
 
     def _create_environment(self):
+        """Build the compute environment (download Python 3.11 if needed, make
+        the venv, pip-install deps) on a background thread so QGIS stays
+        responsive. Progress streams to the log."""
+        if self._env_thread is not None:
+            self.update_output_log("Environment setup is already running…")
+            return
         plugin_dir = os.path.dirname(os.path.abspath(__file__))
-        self.update_output_log("Creating WINMOL environment… "
-                               "(this can take a few minutes)")
+        self.update_output_log(
+            "Setting up the WINMOL environment (Python 3.11 + onnxruntime + "
+            "geo libraries). First run downloads ~30 MB and can take a few "
+            "minutes…")
         try:
-            venv = os.path.join(plugin_dir, installer.WINMOL_VENV_NAME)
-            info = installer.setup_environment(venv)
-            self._set_python(info["python"])
+            self.log_widget.setCurrentIndex(1)   # show the log tab
+        except Exception:
+            pass
+        from .tasks_threads import EnvSetupWorker
+        self._env_thread = QThread()
+        self._env_worker = EnvSetupWorker(plugin_dir)
+        self._env_worker.moveToThread(self._env_thread)
+        self._env_thread.started.connect(self._env_worker.run)
+        self._env_worker.log.connect(self.update_output_log)
+        self._env_worker.done.connect(self._on_env_ready)
+        self._env_worker.failed.connect(self._on_env_failed)
+        # Quit the thread and drop the worker once it finishes either way.
+        self._env_worker.done.connect(self._env_thread.quit)
+        self._env_worker.failed.connect(self._env_thread.quit)
+        self._env_worker.done.connect(self._env_worker.deleteLater)
+        self._env_worker.failed.connect(self._env_worker.deleteLater)
+        self._env_thread.finished.connect(self._env_thread.deleteLater)
+        self._env_thread.finished.connect(self._clear_env_thread)
+        # Lock the buttons that would race the build.
+        for _b in ("env_button", "run_button"):
+            _w = getattr(self, _b, None)
+            if _w is not None:
+                try:
+                    _w.setEnabled(False)
+                except Exception:
+                    pass
+        self._env_thread.start()
+
+    def _clear_env_thread(self):
+        """thread.finished: drop refs so a later build makes a fresh thread,
+        and re-enable the env button."""
+        self._env_thread = None
+        self._env_worker = None
+        _w = getattr(self, "env_button", None)
+        if _w is not None:
+            try:
+                _w.setEnabled(True)
+            except Exception:
+                pass
+
+    def _on_env_ready(self, exe):
+        if exe:
+            self._set_python(exe)
             self.update_output_log("Environment ready.")
-        except Exception as exc:
-            self.update_output_log(f"Could not create environment: {exc}")
-            QtWidgets.QMessageBox.warning(
-                self, "WINMOL environment",
-                f"Could not create an environment automatically:\n{exc}\n\n"
-                "Use 'Choose interpreter…' to point at an existing conda "
-                "env or venv instead.")
+        else:
+            self.update_output_log(
+                "Environment setup finished but returned no interpreter.")
+        # Only re-enable Run if no inference run is currently active.
+        _w = getattr(self, "run_button", None)
+        if _w is not None and not self._run_active:
+            try:
+                _w.setEnabled(True)
+            except Exception:
+                pass
+
+    def _on_env_failed(self, msg):
+        self.update_output_log(f"Could not create environment: {msg}")
+        _w = getattr(self, "run_button", None)
+        if _w is not None and not self._run_active:
+            try:
+                _w.setEnabled(True)
+            except Exception:
+                pass
+        QtWidgets.QMessageBox.warning(
+            self, "WINMOL environment",
+            f"Could not create an environment automatically:\n{msg}\n\n"
+            "Use 'Choose interpreter…' to point at an existing conda "
+            "env or venv instead.")
 
     def load_layers_to_session(self):
         """Load outputs after processing finishes.
@@ -878,6 +1272,11 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.progress_bar.setValue(value)
 
     def check_swap_memory(self):
+        # psutil is optional in QGIS's Python (see the guarded import at the
+        # top); without it, just skip the advisory rather than raising
+        # AttributeError on top of the MemoryError that got us here.
+        if psutil is None:
+            return
         swap = psutil.swap_memory()
         ram = psutil.virtual_memory()
 

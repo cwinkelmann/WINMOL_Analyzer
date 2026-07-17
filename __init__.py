@@ -42,7 +42,10 @@ def classFactory(iface):  # pylint: disable=invalid-name
     from .plugin_utils.installer import resolve_environment
 
     plugin_dir = os.path.dirname(__file__)
-    env = resolve_environment(plugin_dir, prompt=True)
+    # build=False: never download Python / build the venv on the QGIS load
+    # thread (that could take minutes and freeze startup). Just report
+    # readiness; the dialog builds the environment asynchronously if needed.
+    env = resolve_environment(plugin_dir, prompt=False, build=False)
 
     try:
         from qgis.core import Qgis, QgsMessageLog

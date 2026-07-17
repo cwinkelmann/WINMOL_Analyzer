@@ -78,3 +78,36 @@ class Worker(QObject):
     def get_total_lines(self):
         return {"Stems": 34, "Trees": 118, "Nodes": 125}.get(
             self.command[-1], 100)
+
+
+class EnvSetupWorker(QObject):
+    """Builds the WINMOL compute environment off the GUI thread: resolves /
+    downloads Python 3.11, creates the venv, pip-installs the deps. Emits log
+    lines for progress and done/failed at the end. Keeps QGIS responsive during
+    a multi-minute first-run setup."""
+
+    log = pyqtSignal(str)
+    done = pyqtSignal(str)      # interpreter path on success ('' if unknown)
+    failed = pyqtSignal(str)    # error message
+
+    def __init__(self, plugin_dir):
+        super().__init__()
+        self.plugin_dir = plugin_dir
+        self._cancelled = False
+
+    def cancel(self):
+        """Best-effort cancel flag. The heavy steps (download, pip) aren't
+        interruptible mid-call, but network reads are timeout-bounded, so the
+        worker returns within a bounded time and teardown can wait it out."""
+        self._cancelled = True
+
+    def run(self):
+        try:
+            from .plugin_utils import installer
+            venv = installer.venv_location(self.plugin_dir)
+            info = installer.setup_environment(
+                venv, plugin_dir=self.plugin_dir,
+                progress=lambda m: self.log.emit(str(m)))
+            self.done.emit(info.get("python") or "")
+        except Exception as exc:
+            self.failed.emit(str(exc))

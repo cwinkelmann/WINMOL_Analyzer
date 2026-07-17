@@ -184,6 +184,15 @@ class WINMOLAnalyzer:
 
     def unload(self):
         """Removes the plugin menu item and icon from QGIS GUI."""
+        # Stop any running background threads BEFORE QGIS drops the dialog
+        # reference: destroying a still-running QThread (e.g. unloading/reloading
+        # the plugin mid-run) triggers Qt's qFatal() and aborts all of QGIS.
+        dlg = getattr(self, "dlg", None)
+        if dlg is not None and hasattr(dlg, "_shutdown_threads"):
+            try:
+                dlg._shutdown_threads()
+            except Exception:
+                pass
         for action in self.actions:
             self.iface.removePluginMenu(
                 self.tr(u'&WINMOL Analyzer'),
