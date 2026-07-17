@@ -165,8 +165,15 @@ def _write_marker(venv_path) -> None:
 
 def create_venv(venv_path, base_python=None) -> None:
     base_python = base_python or choose_base_python()
-    subprocess.run([base_python, "-m", "venv", "--copies", venv_path],
-                   check=True, capture_output=True)
+    # No --copies: the macOS Command Line Tools python (3.9) cannot create
+    # venvs without symlinks ("This build of python cannot create venvs without
+    # using symlinks"). The symlinked default works on all platforms.
+    r = subprocess.run([base_python, "-m", "venv", venv_path],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"venv creation failed with {base_python} (exit {r.returncode}): "
+            f"{(r.stderr or r.stdout).strip()[:600]}")
 
 
 def ensure_pip(venv_path) -> None:
