@@ -7,7 +7,7 @@
   "stage_quantified_edt": 58,
   "stage_restore_geo": 269
  },
- "crossings_in_window": -1,
+ "crossings_in_window": 30,
  "model": {
   "file": "General.onnx",
   "sha256_16": "8034a2cd654e0f91"

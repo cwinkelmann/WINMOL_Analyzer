@@ -341,7 +341,8 @@ def run_tiled_variant(stem_map_path, snapshot, merged_out):
         tmp_merged = os.path.join(work_dir, "merged.gpkg")
         IO.merge_and_filter_tiled_results(
             work_dir=work_dir, output_gpkg=tmp_merged,
-            edge_buffer_m=config.tile_overlap_m, config=config)
+            edge_buffer_m=config.tile_overlap_m, config=config,
+            stem_map_path=stem_map_path)
 
         if os.path.exists(merged_out):
             try:

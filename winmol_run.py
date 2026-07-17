@@ -287,6 +287,9 @@ class ImageProcessing:
             output_gpkg=out_path,
             edge_buffer_m=plan.tile_overlap_m,
             config=self.config,
+            # Pass the full stem-map extent so stems on the ortho's true outer
+            # boundary (corners) aren't trimmed by the interior-seam dedup.
+            stem_map_path=self.stem_path,
         )
 
     def run_stem_pipeline(self, plan):

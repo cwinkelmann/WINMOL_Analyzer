@@ -68,7 +68,7 @@ def test_tiled_vectorization_and_merge_matches_golden(
         IO.merge_and_filter_tiled_results(
             work_dir=work_dir, output_gpkg=merged,
             edge_buffer_m=pipeline_config.tile_overlap_m,
-            config=pipeline_config)
+            config=pipeline_config, stem_map_path=stem_map_path)
 
         helpers.assert_gpkg_stems_match(
             merged, os.path.join(fixtures_dir, "golden_merged.gpkg"))

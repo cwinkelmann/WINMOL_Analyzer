@@ -959,15 +959,39 @@ def _ensure_crs(gdf, target_crs):
     return gdf
 
 
-def _raster_filter_geom(raster_path, edge_buffer_m):
+def _raster_filter_geom(raster_path, edge_buffer_m, ortho_bounds=None):
+    """Keep-region for a tile's stems during the merge.
+
+    Shrinking the tile footprint inward by edge_buffer_m dedups stems that also
+    appear in the overlapping neighbour tile. But a tile side that coincides
+    with the ortho's TRUE OUTER boundary has no neighbour, so shrinking there
+    silently drops real stems (worst at the corners, where two sides meet).
+    When ortho_bounds is known we buffer ONLY the interior-seam sides and leave
+    boundary sides at the true extent.
+    """
     if not raster_path:
         return None, None
     try:
         with rasterio.open(raster_path) as src:
-            geom = box(*src.bounds)
-            inner = geom.buffer(-abs(edge_buffer_m))
+            b = src.bounds
+            eb = abs(edge_buffer_m)
+            if ortho_bounds is not None:
+                tol = eb * 1e-3
+                ob = ortho_bounds
+
+                def _side(v, o, sign):
+                    # keep true extent on the ortho boundary; else shrink inward
+                    return v if abs(v - o) <= tol else v + sign * eb
+                left = _side(b.left, ob.left, +1)
+                bottom = _side(b.bottom, ob.bottom, +1)
+                right = _side(b.right, ob.right, -1)
+                top = _side(b.top, ob.top, -1)
+                inner = box(left, bottom, right, top) if right > left \
+                    and top > bottom else box(*b)
+            else:
+                inner = box(*b).buffer(-eb)
             if getattr(inner, 'is_empty', False):
-                inner = geom
+                inner = box(*b)
             return inner, src.crs
     except Exception:
         return None, None
@@ -1090,10 +1114,12 @@ def _select_child(gdf, tile_id, kept_local):
     return out
 
 
-def _process_tile(prefix, gpkg_path, raster_path, edge_buffer_m, target_crs):
+def _process_tile(prefix, gpkg_path, raster_path, edge_buffer_m, target_crs,
+                  ortho_bounds=None):
     tile_id = _tile_id_from_prefix(prefix)
 
-    filter_geom, raster_crs = _raster_filter_geom(raster_path, edge_buffer_m)
+    filter_geom, raster_crs = _raster_filter_geom(
+        raster_path, edge_buffer_m, ortho_bounds=ortho_bounds)
 
     stems, nodes, vectors = _read_tile_gpkg(gpkg_path)
     print(
@@ -1518,6 +1544,16 @@ def merge_and_filter_tiled_results(
     work_dir = os.path.abspath(work_dir)
     output_gpkg = _default_output_gpkg(work_dir, output_gpkg)
 
+    # Full-ortho extent: lets _raster_filter_geom keep stems on the ortho's
+    # true outer boundary (only interior tile seams get the dedup shrink).
+    ortho_bounds = None
+    if stem_map_path:
+        try:
+            with rasterio.open(stem_map_path) as _s:
+                ortho_bounds = _s.bounds
+        except Exception:
+            ortho_bounds = None
+
     _remove_existing_output(output_gpkg)
 
     tiles = _detect_tiles(work_dir, output_gpkg)
@@ -1550,6 +1586,7 @@ def merge_and_filter_tiled_results(
             raster_path,
             edge_buffer_m,
             target_crs,
+            ortho_bounds=ortho_bounds,
         )
         if out is None:
             continue
