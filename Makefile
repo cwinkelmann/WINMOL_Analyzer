@@ -69,7 +69,13 @@ PEP8EXCLUDE=pydev,resources.py,conf.py,third_party,ui
 #	* Windows:
 #	  AppData\Roaming\QGIS\QGIS3\profiles\default\python\plugins'
 
+# Auto-detect the profile location by OS (override on the command line if you
+# use a non-default profile). Windows: pass QGISDIR explicitly.
+ifeq ($(shell uname),Darwin)
+QGISDIR=Library/Application Support/QGIS/QGIS3/profiles/default
+else
 QGISDIR=.local/share/QGIS/QGIS3/profiles/default
+endif
 
 #################################################
 # Normally you would not need to edit below here
