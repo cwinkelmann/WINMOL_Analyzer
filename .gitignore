@@ -171,3 +171,4 @@ __autograph_generated_file*.py
 pytest-of-*/
 winmol_fixture_tiles_*/
 winmol_test_tiles_*/
+benchmark/out/
