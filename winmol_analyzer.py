@@ -28,8 +28,13 @@ from qgis.PyQt.QtCore import QCoreApplication, QSettings, QTranslator
 from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import QAction
 
-# Initialize Qt resources from file resources.py
-from .resources import *
+# Initialize Qt resources (optional): the compiled resources.py is PyQt5-format
+# and may not load under Qt6/QGIS 4. Icons fall back to the icon.png file, so a
+# failure here is cosmetic, not fatal.
+try:
+    from .resources import *  # noqa: F401,F403
+except Exception:
+    pass
 
 # Import the code for the dialog
 from .winmol_analyzer_dialog import WINMOLAnalyzerDialog
@@ -165,7 +170,9 @@ class WINMOLAnalyzer:
     def initGui(self):
         """Create the menu entries and toolbar icons inside the QGIS GUI."""
 
-        icon_path = ':/plugins/winmol_analyzer/icon.png'
+        # Load from the file (works on Qt5 and Qt6) rather than the compiled
+        # ':/plugins/...' resource, which is PyQt5-format.
+        icon_path = os.path.join(os.path.dirname(__file__), 'icon.png')
         self.add_action(
             icon_path,
             text=self.tr(u'Detects stems from UAV images'),
