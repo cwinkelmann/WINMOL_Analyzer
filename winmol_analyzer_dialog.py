@@ -35,11 +35,13 @@ except Exception:
 
 # qgis.PyQt shims to the active Qt binding (PyQt5 on QGIS 3, PyQt6 on QGIS 4).
 from qgis.PyQt.QtWidgets import QFileDialog
-from qgis.PyQt.QtCore import QThread
-from qgis.core import QgsProject, QgsVectorLayer, QgsRasterLayer
+from qgis.PyQt.QtCore import QThread, QTimer
+from qgis.core import (
+    QgsProject, QgsVectorLayer, QgsRasterLayer, QgsSettings)
 from qgis.PyQt import QtWidgets, uic
 
 from .classes.Config import Config
+from .plugin_utils import installer
 from .tasks_threads import Worker
 
 current_path = os.path.dirname(__file__)
@@ -98,6 +100,10 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             or os.path.join(os.path.dirname(__file__), "winmol_venv"))
         self.models_dir = os.path.join(plugin_dir, "models")
         self.populate_model_combo_box()
+        # If no usable interpreter yet, offer the environment picker once the
+        # dialog is visible (deferred so it doesn't block construction).
+        if not self._env_ready():
+            QTimer.singleShot(0, self.choose_environment)
         self.process_type = None
 
         # Nodes output uses the Trees output path (no separate file/path field).
@@ -612,14 +618,11 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             alt = str(p.with_name(p.stem + "_new.gpkg"))
             self.check_uav_input_exists(alt)
 
-        # Run winmol_run.py in the resolved compute environment.
-        if not self.python_exe or not os.path.exists(self.python_exe):
-            QtWidgets.QMessageBox.warning(
-                self, "WINMOL environment not ready",
-                self.env.get("message")
-                or "The WINMOL Python environment is not set up yet. "
-                "Restart QGIS to run setup, or set an existing interpreter "
-                "in the plugin settings.")
+        # Run winmol_run.py in the resolved compute environment; if it isn't
+        # ready, let the user pick/create one right here (no restart).
+        if not self._env_ready():
+            self.choose_environment()
+        if not self._env_ready():
             return
         command = [
             self.python_exe,
@@ -689,6 +692,92 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             QtWidgets.QMessageBox.warning(self, "WINMOL Analyzer", message)
         except Exception:
             pass
+
+    # --- compute-environment selection --------------------------------------
+
+    def _env_ready(self):
+        return bool(self.python_exe) and os.path.exists(self.python_exe)
+
+    def _set_python(self, exe):
+        """Persist the chosen interpreter and use it immediately (no restart)."""
+        self.python_exe = exe
+        QgsSettings().setValue(installer.QSETTINGS_PYTHON_KEY, exe)
+
+    def choose_environment(self):
+        """Interactive picker: use an existing interpreter (venv/conda) or
+        create one. Updates the interpreter live — no QGIS restart needed."""
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("WINMOL compute environment")
+        box.setText(
+            "WINMOL needs a Python environment (onnxruntime + geo libraries) "
+            "to run the analysis.\n\nChoose an existing interpreter (a conda "
+            "env or venv), or let WINMOL create one.")
+        b_choose = box.addButton("Choose interpreter…",
+                                 QtWidgets.QMessageBox.AcceptRole)
+        b_create = box.addButton("Create for me",
+                                 QtWidgets.QMessageBox.ActionRole)
+        box.addButton("Cancel", QtWidgets.QMessageBox.RejectRole)
+        box.exec_() if hasattr(box, "exec_") else box.exec()
+        clicked = box.clickedButton()
+        if clicked == b_choose:
+            self._choose_interpreter()
+        elif clicked == b_create:
+            self._create_environment()
+
+    def _choose_interpreter(self):
+        exe, _ = QFileDialog.getOpenFileName(
+            self, "Select a Python interpreter (e.g. <env>/bin/python)", "")
+        if not exe:
+            return
+        ver = installer._python_version(exe)
+        if not (installer.MIN_PY <= ver <= installer.MAX_PY):
+            QtWidgets.QMessageBox.warning(
+                self, "Unsupported Python",
+                f"{exe} is Python {ver[0]}.{ver[1]}; WINMOL needs "
+                f"{installer.MIN_PY[0]}.{installer.MIN_PY[1]}-"
+                f"{installer.MAX_PY[0]}.{installer.MAX_PY[1]}.")
+            return
+        if installer._has_compute_deps(exe):
+            self._set_python(exe)
+            self.update_output_log(f"Using interpreter: {exe}")
+            return
+        reply = QtWidgets.QMessageBox.question(
+            self, "Missing dependencies",
+            f"{exe} lacks WINMOL dependencies (onnxruntime/rasterio/"
+            "geopandas). Install them into it now?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
+        if reply == QtWidgets.QMessageBox.Yes:
+            self._pip_install_into(exe)
+
+    def _pip_install_into(self, exe):
+        import subprocess
+        req = str(installer.plugin_requirements_path())
+        self.update_output_log(f"Installing dependencies into {exe} …")
+        r = subprocess.run([exe, "-m", "pip", "install", "-r", req],
+                           capture_output=True, text=True)
+        if r.returncode == 0 and installer._has_compute_deps(exe):
+            self._set_python(exe)
+            self.update_output_log("Dependencies installed; interpreter ready.")
+        else:
+            self.update_output_log(
+                "Dependency install failed:\n" + (r.stderr or r.stdout)[-800:])
+
+    def _create_environment(self):
+        plugin_dir = os.path.dirname(os.path.abspath(__file__))
+        self.update_output_log("Creating WINMOL environment… "
+                               "(this can take a few minutes)")
+        try:
+            venv = os.path.join(plugin_dir, installer.WINMOL_VENV_NAME)
+            info = installer.setup_environment(venv)
+            self._set_python(info["python"])
+            self.update_output_log("Environment ready.")
+        except Exception as exc:
+            self.update_output_log(f"Could not create environment: {exc}")
+            QtWidgets.QMessageBox.warning(
+                self, "WINMOL environment",
+                f"Could not create an environment automatically:\n{exc}\n\n"
+                "Use 'Choose interpreter…' to point at an existing conda "
+                "env or venv instead.")
 
     def load_layers_to_session(self):
         """Load outputs after processing finishes.
