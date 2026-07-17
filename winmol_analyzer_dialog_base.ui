@@ -77,7 +77,7 @@
          <item row="0" column="0">
           <widget class="QLabel" name="uav_input_label">
            <property name="text">
-            <string>Input UAV</string>
+            <string>Input GeoTiff</string>
            </property>
           </widget>
          </item>

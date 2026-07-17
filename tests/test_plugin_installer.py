@@ -38,6 +38,8 @@ def test_sentinel_gate_roundtrip(tmp_path, monkeypatch):
     pybin.mkdir(parents=True)
     exe = "python.exe" if sys.platform == "win32" else "python"
     (pybin / exe).write_text("")
+    # the fake python can't report a version; pretend it's supported
+    monkeypatch.setattr(inst, "_python_version", lambda p: (3, 11))
 
     assert inst.is_ready(str(venv)) is False      # no marker yet
     inst._write_marker(str(venv))
@@ -76,17 +78,30 @@ def test_resolve_environment_never_raises_and_reports(tmp_path, monkeypatch):
 
 def test_resolve_environment_uses_byo_when_deps_present(tmp_path, monkeypatch):
     monkeypatch.setattr(inst, "configured_python_executable",
-                        lambda: "/usr/bin/python3")
+                        lambda: "/opt/env/bin/python")
+    monkeypatch.setattr(inst, "_python_version", lambda e: (3, 11))
     monkeypatch.setattr(inst, "_has_compute_deps", lambda exe: True)
     res = inst.resolve_environment(str(tmp_path))
     assert res["status"] == "byo"
-    assert res["python"] == "/usr/bin/python3"
+    assert res["python"] == "/opt/env/bin/python"
 
 
 def test_resolve_environment_flags_byo_missing_deps(tmp_path, monkeypatch):
     monkeypatch.setattr(inst, "configured_python_executable",
-                        lambda: "/usr/bin/python3")
+                        lambda: "/opt/env/bin/python")
+    monkeypatch.setattr(inst, "_python_version", lambda e: (3, 11))
     monkeypatch.setattr(inst, "_has_compute_deps", lambda exe: False)
     res = inst.resolve_environment(str(tmp_path))
     assert res["status"] == "error"
     assert "onnxruntime" in res["message"]
+
+
+def test_resolve_environment_rejects_too_old_byo(tmp_path, monkeypatch):
+    # a Python 3.9 interpreter (e.g. macOS /usr/bin/python3) is rejected:
+    # the code uses PEP 604 unions and needs >= 3.10.
+    monkeypatch.setattr(inst, "configured_python_executable",
+                        lambda: "/usr/bin/python3")
+    monkeypatch.setattr(inst, "_python_version", lambda e: (3, 9))
+    res = inst.resolve_environment(str(tmp_path))
+    assert res["status"] == "error"
+    assert "3.9" in res["message"]

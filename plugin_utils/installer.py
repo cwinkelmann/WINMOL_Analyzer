@@ -34,8 +34,9 @@ MODELS_PATH = "models"
 READY_MARKER = ".winmol_ready"
 QSETTINGS_PYTHON_KEY = "winmol/python_executable"
 
-# Minimum/most-tested CPython for the pinned compute deps.
-MIN_PY = (3, 9)
+# The code uses PEP 604 unions (str | None), so it requires Python >= 3.10.
+# (macOS system /usr/bin/python3 is 3.9 and is therefore rejected.)
+MIN_PY = (3, 10)
 MAX_PY = (3, 12)
 
 _PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -145,9 +146,13 @@ def _marker_path(venv_path) -> str:
 
 
 def is_ready(venv_path) -> bool:
-    """True when the venv exists and was installed against the current reqs."""
-    if not os.path.exists(get_venv_python_path(venv_path)):
+    """True when the venv exists, runs a supported Python, and was installed
+    against the current requirements."""
+    py = get_venv_python_path(venv_path)
+    if not os.path.exists(py):
         return False
+    if not (MIN_PY <= _python_version(py) <= MAX_PY):
+        return False   # e.g. a stale 3.9 venv the code can't run
     try:
         with open(_marker_path(venv_path)) as f:
             return json.load(f).get("req_hash") == _requirements_hash()
@@ -273,7 +278,14 @@ def resolve_environment(plugin_dir, prompt=True) -> dict:
 
     byo = configured_python_executable()
     if byo:
-        if _has_compute_deps(byo):
+        ver = _python_version(byo)
+        if not (MIN_PY <= ver <= MAX_PY):
+            result.update(
+                status="error", python=None,
+                message=(f"Configured interpreter {byo} is Python "
+                         f"{ver[0]}.{ver[1]}; WINMOL needs "
+                         f"{MIN_PY[0]}.{MIN_PY[1]}-{MAX_PY[0]}.{MAX_PY[1]}."))
+        elif _has_compute_deps(byo):
             result.update(status="byo", python=byo,
                           message=f"Using configured interpreter: {byo}")
         else:
