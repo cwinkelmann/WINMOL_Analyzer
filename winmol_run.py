@@ -1,11 +1,23 @@
 #!/usr/bin/env python
 from __future__ import annotations
 
-import json
 import os
+import sys
+
+# Determinism: the vector stage's connect_stems joins stems in an order that
+# depends on set-iteration of string-hashed Part objects (docs/CODE_REVIEW_2.md
+# A-4). Python salts string hashing per process, so WITHOUT a fixed seed the
+# SAME orthomosaic yields a slightly different number of stems on every run.
+# Pin the seed (as tests/generate_fixtures.py and tests/conftest.py already do)
+# by re-executing once with PYTHONHASHSEED=0 before anything hashes into a set.
+# '-u' is re-added so the plugin still gets unbuffered, line-streamed logs.
+if os.environ.get("PYTHONHASHSEED") != "0":
+    os.environ["PYTHONHASHSEED"] = "0"
+    os.execv(sys.executable, [sys.executable, "-u"] + sys.argv)
+
+import json
 import shutil
 import subprocess
-import sys
 import tempfile
 
 from classes.Config import Config
