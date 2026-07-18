@@ -303,7 +303,16 @@ calc_v_d = calc_v_d_contour
 def calc_d(node, line, contours):
     node = Point(node)
     d = 0
-    intersects = contours.geometry.intersection(line)
+    # Only intersect the line against polygons whose bounding box overlaps it —
+    # a line cannot intersect a polygon whose bbox it misses, so the set of
+    # non-empty intersections (and thus d, a max) is identical to intersecting
+    # against all polygons. contours.sindex is a cached STRtree built once per
+    # GeoDataFrame, turning O(measuring_points x polygons) GEOS intersections
+    # into O(measuring_points x candidates). Bit-identical result.
+    idx = contours.sindex.query(line)
+    if len(idx) == 0:
+        return d
+    intersects = contours.geometry.iloc[idx].intersection(line)
     intersects = intersects[~intersects.is_empty]
 
     for i in intersects:
