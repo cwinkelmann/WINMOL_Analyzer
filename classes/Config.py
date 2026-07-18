@@ -18,7 +18,7 @@ class Config(object):
 
     # runtime worker / batching knobs
     prediction_batch_cpu = 1
-    prediction_batch_gpu = 8       # writer thread overlaps writes; feed the GPU
+    prediction_batch_gpu = 4
     prediction_batch_max_gpu = 16
     prediction_batch_multi_gpu = 12     # local per-worker batch
     # Off by default: the autotune times ~6 batch sizes x 5 repeats before the
