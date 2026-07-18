@@ -62,14 +62,40 @@ class OnnxSegmenter:
     def __init__(self, model_path, providers=None):
         self.model_path = model_path
         self.providers = providers or _default_providers()
+        # Optional op-level profiling: WINMOL_ONNX_PROFILE=1 makes onnxruntime
+        # emit a chrome-trace JSON with per-op time AND the execution provider
+        # each op ran on (e.g. CoreMLExecutionProvider vs CPUExecutionProvider)
+        # -- i.e. how much actually ran on the Metal/ANE accelerator. No sudo.
+        so = None
+        self._profile_prefix = None
+        if os.environ.get("WINMOL_ONNX_PROFILE", "").strip().lower() in (
+                "1", "true", "yes"):
+            so = ort.SessionOptions()
+            so.enable_profiling = True
+            self._profile_prefix = (
+                os.environ.get("WINMOL_ONNX_PROFILE_PREFIX")
+                or "winmol_onnx_profile")
+            so.profile_file_prefix = self._profile_prefix
         self.session = ort.InferenceSession(
-            str(model_path), providers=self.providers)
+            str(model_path), sess_options=so, providers=self.providers)
+        if self._profile_prefix:
+            import atexit
+            atexit.register(self._flush_profile)
+            print(f"[onnx-profile] enabled (prefix {self._profile_prefix})",
+                  flush=True)
         inp = self.session.get_inputs()[0]
         out = self.session.get_outputs()[0]
         self.input_name = inp.name
         self.output_name = out.name
         self.input_layout = _layout(inp.shape, IN_CHANNELS)
         self.output_layout = _layout(out.shape, OUT_CHANNELS)
+
+    def _flush_profile(self):
+        try:
+            path = self.session.end_profiling()
+            print(f"[onnx-profile] wrote {path}", flush=True)
+        except Exception:
+            pass
 
     @staticmethod
     def _as_numpy(x):

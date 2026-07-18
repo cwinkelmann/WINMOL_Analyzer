@@ -114,7 +114,62 @@ def _boundary_stems(gpkg: str, stem_map: str, edge_m: float):
         return None, None
 
 
-def run_variant(v, ortho, out_dir, python_exe, process, force_cpu, edge_m):
+def _parse_onnx_profile(path):
+    """onnxruntime chrome-trace -> per-execution-provider op time (i.e. how much
+    ran on CoreML/ANE vs CPU) + the heaviest ops."""
+    try:
+        with open(path) as f:
+            events = json.load(f)
+    except Exception as e:
+        return {"error": str(e)}
+    prov, ops, total = {}, {}, 0.0
+    for e in events:
+        if e.get("cat") != "Node" or not str(e.get("name", "")).endswith(
+                "kernel_time"):
+            continue
+        dur = float(e.get("dur", 0))
+        a = e.get("args", {})
+        p = a.get("provider", "?").replace("ExecutionProvider", "")
+        prov[p] = prov.get(p, 0.0) + dur
+        op = a.get("op_name", "?")
+        ops[op] = ops.get(op, 0.0) + dur
+        total += dur
+    top = sorted(ops.items(), key=lambda x: -x[1])[:6]
+    return {
+        "provider_pct": {p: round(100 * d / total, 1)
+                         for p, d in prov.items()} if total else {},
+        "top_ops_ms": [(o, round(d / 1000, 1)) for o, d in top],
+        "total_node_ms": round(total / 1000, 1),
+    }
+
+
+def _parse_powermetrics(path):
+    """GPU + ANE utilisation from a powermetrics capture. On Apple silicon
+    CoreML often runs on the ANE, which shows as ANE power but NOT GPU % --
+    that's why the process looked 'idle' in Activity Monitor's GPU view."""
+    try:
+        text = open(path, errors="replace").read()
+    except Exception as e:
+        return {"error": str(e)}
+
+    def nums(pat):
+        return [float(x) for x in re.findall(pat, text)]
+
+    def st(a):
+        return ({"avg": round(sum(a) / len(a), 1), "max": round(max(a), 1),
+                 "n": len(a)} if a else None)
+    gpu = nums(r"GPU\s*(?:HW\s*)?active residency:\s*([\d.]+)%")
+    return {
+        "gpu_active_pct": st(gpu),
+        "gpu_power_mW": st(nums(r"GPU Power:\s*([\d.]+)\s*mW")),
+        "ane_power_mW": st(nums(r"ANE Power:\s*([\d.]+)\s*mW")),
+        "gpu_busy_fraction": (round(sum(1 for x in gpu if x > 5) / len(gpu), 2)
+                              if gpu else None),
+    }
+
+
+def run_variant(v, ortho, out_dir, python_exe, process, force_cpu, edge_m,
+                onnx_profile=False, powermetrics=False, pm_interval=500):
     label, branch, model = v["label"], v.get("branch"), v["model"]
     wt = None
     cwd = REPO
@@ -141,11 +196,37 @@ def run_variant(v, ortho, out_dir, python_exe, process, force_cpu, edge_m):
         if force_cpu:
             env["WINMOL_ONNX_FORCE_CPU"] = "1"
         env.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+        onnx_prefix = None
+        if onnx_profile and str(model).lower().endswith(".onnx"):
+            onnx_prefix = os.path.join(out_dir, f"{label}_onnxprof")
+            env["WINMOL_ONNX_PROFILE"] = "1"
+            env["WINMOL_ONNX_PROFILE_PREFIX"] = onnx_prefix
+        pm_proc = None
+        pm_file = os.path.join(out_dir, f"{label}_powermetrics.txt")
+        if powermetrics:
+            try:
+                pm_proc = subprocess.Popen(
+                    ["sudo", "-n", "powermetrics", "-s",
+                     "gpu_power,ane_power,cpu_power", "-i", str(pm_interval)],
+                    stdout=open(pm_file, "w"), stderr=subprocess.DEVNULL)
+                time.sleep(1.0)
+                if pm_proc.poll() is not None:
+                    print("    [profile] powermetrics could not start; run "
+                          "`sudo -v` first to cache credentials.")
+                    pm_proc = None
+            except FileNotFoundError:
+                pm_proc = None
         print(f"    running: {' '.join(cmd)}")
         t0 = time.monotonic()
         proc = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True,
                               text=True)
         wall = time.monotonic() - t0
+        if pm_proc:
+            pm_proc.terminate()
+            try:
+                pm_proc.wait(timeout=5)
+            except Exception:
+                pm_proc.kill()
         if proc.returncode != 0:
             print(f"    [error] exit {proc.returncode}\n"
                   f"{proc.stdout[-2000:]}\n{proc.stderr[-800:]}")
@@ -153,6 +234,13 @@ def run_variant(v, ortho, out_dir, python_exe, process, force_cpu, edge_m):
         metrics = _parse_run(proc.stdout)
         metrics["wall_s"] = round(wall, 1)
         metrics["model"] = os.path.basename(model)
+        if powermetrics and os.path.exists(pm_file):
+            metrics["gpu_profile"] = _parse_powermetrics(pm_file)
+        if onnx_prefix:
+            import glob
+            hits = sorted(glob.glob(onnx_prefix + "*"))
+            if hits:
+                metrics["onnx_profile"] = _parse_onnx_profile(hits[-1])
         gpkg = f"{trees_out}_detected_stems.gpkg"
         if not os.path.exists(gpkg) and os.path.exists(f"{trees_out}.gpkg"):
             gpkg = f"{trees_out}.gpkg"
@@ -214,6 +302,14 @@ def main():
                     help="force onnxruntime CPU (device-neutral)")
     ap.add_argument("--tf-legacy-keras", action="store_true",
                     help="set TF_USE_LEGACY_KERAS=1 for TF variants")
+    ap.add_argument("--onnx-profile", action="store_true",
+                    help="onnxruntime op-level profile (CoreML/ANE vs CPU op "
+                         "time); no sudo, onnx variants only")
+    ap.add_argument("--powermetrics", action="store_true",
+                    help="sample GPU+ANE utilisation via powermetrics during "
+                         "each run (needs sudo; caches creds once)")
+    ap.add_argument("--pm-interval", type=int, default=500,
+                    help="powermetrics sample interval (ms)")
     ap.add_argument("--edge-m", type=float, default=12.0)
     ap.add_argument("--out-dir", default=os.path.join(REPO, "benchmark", "out"))
     args = ap.parse_args()
@@ -230,12 +326,19 @@ def main():
     if st.stdout.strip() and any(v.get("branch") for v in variants):
         print("[warn] working tree not clean; branch worktrees use committed "
               "state only")
+    if args.powermetrics:
+        print("[profile] powermetrics needs sudo — caching credentials "
+              "(one prompt)…")
+        subprocess.run(["sudo", "-v"])
 
     results = []
     for v in variants:
         results.append((v["label"],
                         run_variant(v, args.ortho, args.out_dir, args.python,
-                                    args.process, args.cpu, args.edge_m)))
+                                    args.process, args.cpu, args.edge_m,
+                                    onnx_profile=args.onnx_profile,
+                                    powermetrics=args.powermetrics,
+                                    pm_interval=args.pm_interval)))
 
     print("\n" + "=" * 66)
     print("BENCHMARK RESULT")
@@ -292,6 +395,26 @@ def main():
                     faster = labels[1] if y < x else labels[0]
                     print(f"{name:14}: {max(x, y) / min(x, y):.2f}x "
                           f"faster on {faster}")
+
+    # profiling detail
+    if any(m and (m.get("onnx_profile") or m.get("gpu_profile"))
+           for _, m in results):
+        print("\nPROFILE")
+        for lbl, m in results:
+            if not m:
+                continue
+            op = m.get("onnx_profile")
+            if op and not op.get("error"):
+                print(f"  {lbl}: onnx op-time by provider {op['provider_pct']} "
+                      f"% (total {op['total_node_ms']} ms) | heaviest "
+                      f"{op['top_ops_ms']}")
+            gp = m.get("gpu_profile")
+            if gp and not gp.get("error"):
+                g = gp.get("gpu_active_pct")
+                print(f"  {lbl}: system GPU active {g}% | GPU busy fraction "
+                      f"{gp.get('gpu_busy_fraction')} | ANE power "
+                      f"{gp.get('ane_power_mW')} mW  (CoreML on the ANE shows "
+                      f"here, not in GPU %)")
 
     out_json = os.path.join(args.out_dir, "benchmark_result.json")
     with open(out_json, "w") as fh:
