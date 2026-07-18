@@ -45,3 +45,16 @@ Assuming there are multiple geotiff raster layers in QGIS, it should be possible
 candidates would quantization, prunning, onnx speedup Especially on cpu it should run faster
 #### Do a speed and feature benchmark
 Are all the optimisations faster and by how much? How does accuracy change in the end.
+
+### Persist the batch-size autotune result
+The prediction batch-size autotune (`prediction_batch_autotune`) is currently
+OFF by default because it re-runs on every prediction: a silent multi-minute
+stall on CoreML/Metal (it recompiles the model for each candidate batch size)
+for only ~1% throughput. Better: run it ONCE, keyed by
+(hardware signature + model + execution provider), persist the chosen batch size
+(a small JSON cache in the QGIS profile / next to the model, or via QgsSettings),
+and reuse it on later runs — skipping the autotune entirely when a cached entry
+matches. Then the tuning cost is paid once and every subsequent run gets the
+optimal batch for free. Invalidate the cache when the model, provider, or
+hardware changes. (Note: measured per-device — e.g. on this M2/CoreML the
+optimum was ~batch 5; a large CUDA GPU will likely prefer a much bigger batch.)
