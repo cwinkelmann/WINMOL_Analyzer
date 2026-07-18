@@ -512,30 +512,6 @@ def _split_jobs_for_producers(jobs, producer_workers: int):
     return out or [jobs]
 
 
-def _print_stream_progress(done, stats, total_tiles, start, q, queue_depth,
-                           n_producers, batch, config, layout):
-    now = time.monotonic()
-    elapsed = max(now - start, 1e-9)
-    rate = done / elapsed
-    eta_s = (total_tiles - done) / rate if rate > 0 else float('inf')
-    d = max(done, 1)
-    queue_fill = (q.qsize() / max(queue_depth, 1)) if queue_depth > 0 else 0.0
-    core = config.img_width - config.overlap_pred
-    print(
-        f"Written tile {done}/{total_tiles} | {done / total_tiles:.1%} | "
-        f"{rate * 60:.1f} tiles/min | ETA {_format_eta(eta_s)} | "
-        f"avg read {stats['total_read_s'] / d:.3f}s "
-        f"prep {stats['total_prep_s'] / d:.3f}s "
-        f"infer {stats['total_infer_s'] / d:.3f}s "
-        f"write {stats['total_write_s'] / d:.3f}s | "
-        f"batch {batch} | queue {queue_fill:.0%} full | "
-        f"producers {n_producers} | "
-        f"src {layout['px_per_tile_x']}x{layout['px_per_tile_y']} -> "
-        f"out {core}x{core}",
-        flush=True,
-    )
-
-
 def predict_stream_to_raster(
     uav_path: str,
     output_stem_map: str,
@@ -602,93 +578,57 @@ def predict_stream_to_raster(
     ]
 
     tmp_path = IO.atomic_tmp_path(output_stem_map)
+    done = 0
+    last_report = time.monotonic()
     start = time.monotonic()
+    total_read_s = 0.0
+    total_prep_s = 0.0
+    total_infer_s = 0.0
+    total_write_s = 0.0
     active_batch_size = initial_batch_size
     pending_items = []
     finished_producers = 0
-
-    # Writer thread: binarize + DEFLATE raster write run HERE, off the inference
-    # thread, so they overlap the next batch's prep+infer and the GPU runs
-    # back-to-back. Output windows are disjoint (per-tile dst_row/dst_col), so
-    # the bytes are independent of timing/order -> deterministic. Only this one
-    # thread ever touches `dst` (rasterio is not thread-safe). Memory is bounded
-    # by the write queue's maxsize (backpressure blocks the consumer's put()).
-    write_q = queue.Queue(maxsize=max(2, queue_depth))
-    stats = {'done': 0, 'total_read_s': 0.0, 'total_prep_s': 0.0,
-             'total_infer_s': 0.0, 'total_write_s': 0.0}
-    writer_error = [None]
-    crop = config.overlap_pred // 2
-    threshold = float(getattr(config, 'stem_binary_threshold', 0.5))
-
-    def _writer(dst):
-        last_report = time.monotonic()
-        while True:
-            batch = write_q.get()
-            if batch is None:
-                break
-            if writer_error[0] is not None:
-                continue        # already failed: drain to avoid put() deadlock
-            try:
-                pred = batch['pred']
-                mask_resized = batch['mask_resized']
-                w0 = time.perf_counter()
-                for idx, job in enumerate(batch['jobs']):
-                    hi = config.img_width - crop
-                    pred_core = pred[idx, crop:hi, crop:hi, 0]
-                    mask_core = mask_resized[idx, crop:hi, crop:hi, 0] > 0.5
-                    pred_core = _binarize_prediction_core(
-                        pred_core, mask_core, threshold=threshold)
-                    _write_prediction_core(dst, pred_core, job, layout)
-                    stats['done'] += 1
-                stats['total_write_s'] += time.perf_counter() - w0
-            except Exception as exc:        # pragma: no cover
-                writer_error[0] = exc
-                continue
-            now = time.monotonic()
-            done = stats['done']
-            if (done == 1 or done == total_tiles
-                    or (now - last_report) >= progress_interval_s):
-                _print_stream_progress(
-                    done, stats, total_tiles, start, q, queue_depth,
-                    len(producers), active_batch_size, config, layout)
-                last_report = now
 
     for producer in producers:
         producer.start()
 
     with rasterio.open(tmp_path, 'w', **out_profile) as dst:
-        writer = threading.Thread(target=_writer, args=(dst,), daemon=True)
-        writer.start()
-        first_batch = True
         while finished_producers < len(producers) or pending_items:
             while (finished_producers < len(producers)
                    and len(pending_items) < chunk_size
                    ):
                 payload = q.get()
-                if (isinstance(payload, dict)
-                        and payload.get('producer_done')):
+                if (
+                    isinstance(payload, dict)
+                    and payload.get('producer_done')
+                ):
                     finished_producers += 1
                     continue
                 if payload is None:
                     finished_producers += 1
                     continue
                 pending_items.extend(payload['items'])
-                stats['total_read_s'] += float(payload.get('read_s', 0.0))
+                total_read_s += float(payload.get('read_s', 0.0))
 
             if not pending_items:
                 continue
-            if writer_error[0] is not None:
-                break
 
-            if first_batch:
+            if done == 0:
                 sample_tiles = [tile for _, tile, _ in
                                 pending_items[:chunk_size]]
                 sample_masks = [mask for _, _, mask in
                                 pending_items[:chunk_size]]
+                # active_batch_size = _autotune_batch_size(
+                #     sample_tiles, sample_masks, model,
+                #     config, initial_batch_size)
                 active_batch_size = _autotune_batch_size(
-                    sample_tiles, sample_masks, model, config,
-                    initial_batch_size, label='Prediction micro-batch')
-                first_batch = False
+                    sample_tiles,
+                    sample_masks,
+                    model,
+                    config,
+                    initial_batch_size,
+                    label='Prediction micro-batch',
+                )
 
             current_n = min(active_batch_size, len(pending_items))
             items = pending_items[:current_n]
@@ -699,23 +639,62 @@ def predict_stream_to_raster(
             prep0 = time.perf_counter()
             tile_tensor, mask_resized = _prepare_inference_batch(
                 raw_tiles, raw_masks, config)
-            stats['total_prep_s'] += time.perf_counter() - prep0
+            total_prep_s += time.perf_counter() - prep0
 
             infer0 = time.perf_counter()
             pred = model.predict_on_batch(tile_tensor)
-            stats['total_infer_s'] += time.perf_counter() - infer0
+            total_infer_s += time.perf_counter() - infer0
 
-            # Force the device->host copy so the next predict_on_batch can't
-            # clobber it, and drop the raw tiles (only the job window is needed
-            # to write) to keep the write queue small.
-            pred = np.ascontiguousarray(np.asarray(pred))
-            write_q.put({'jobs': [job for job, _, _ in items],
-                         'pred': pred, 'mask_resized': mask_resized})
+            crop = config.overlap_pred // 2
+            write_batch_s = 0.0
+            for idx, (job, _, _) in enumerate(items):
+                pred_core = pred[idx, crop:(
+                    config.img_width - crop), crop:(
+                        config.img_width - crop), 0]
+                mask_core = mask_resized[idx, crop:(
+                    config.img_width - crop), crop:(
+                        config.img_width - crop), 0] > 0.5
+                pred_core = _binarize_prediction_core(
+                    pred_core,
+                    mask_core,
+                    threshold=float(getattr(
+                        config, 'stem_binary_threshold', 0.5)),
+                )
+                write_batch_s += _write_prediction_core(
+                    dst, pred_core, job, layout)
+                done += 1
+            total_write_s += write_batch_s
 
-        write_q.put(None)               # sentinel: writer drains then exits
-        writer.join()
-        if writer_error[0] is not None:
-            raise writer_error[0]
+            now = time.monotonic()
+            if (
+                done == 1
+                or done == total_tiles
+                or (now - last_report) >= progress_interval_s
+            ):
+                elapsed = max(now - start, 1e-9)
+                rate = done / elapsed
+                eta_s = (total_tiles - done) / rate if rate > 0 \
+                    else float('inf')
+                avg_read = total_read_s / max(done, 1)
+                avg_prep = total_prep_s / max(done, 1)
+                avg_infer = total_infer_s / max(done, 1)
+                avg_write = total_write_s / max(done, 1)
+                queue_fill = (q.qsize() / max(queue_depth, 1)) \
+                    if queue_depth > 0 else 0.0
+                print(
+                    f"Written tile {done}/{total_tiles} | "
+                    f"{done / total_tiles:.1%} | "
+                    f"{rate * 60:.1f} tiles/min | ETA {_format_eta(eta_s)} | "
+                    f"avg read {avg_read:.3f}s prep {avg_prep:.3f}s infer "
+                    f"{avg_infer:.3f}s write {avg_write:.3f}s | "
+                    f"batch {active_batch_size} | queue {queue_fill:.0%} full"
+                    f" | producers {len(producers)} | "
+                    f"src {layout['px_per_tile_x']}x{layout['px_per_tile_y']} "
+                    f"-> out {config.img_width - config.overlap_pred}x"
+                    f"{config.img_width - config.overlap_pred}",
+                    flush=True,
+                )
+                last_report = now
 
     for producer in producers:
         producer.join()
