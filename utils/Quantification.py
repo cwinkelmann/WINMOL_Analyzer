@@ -5,6 +5,7 @@
 
 import math
 import multiprocessing as mp
+from multiprocessing.pool import ThreadPool
 from typing import List, Tuple
 
 import geopandas as gpd
@@ -73,7 +74,16 @@ def quantify_stems(stems: List[Stem], pred, profile, config=None):
         for stem in stems_:
             stems__.append(quantify_stem(stem))
     else:
-        with mp.Pool(workers) as pool:
+        # ThreadPool, not mp.Pool. These stages map over individual Stem
+        # objects (shapely geometry + diameter lists), so a process pool has to
+        # pickle every stem out to a worker and the result back. Measured on
+        # one 4096 px tile with 1567 stems: process pool 45.2 s vs 4.6 s
+        # serial -- ~10x SLOWER, with the cost flat in worker count (2/4/7 all
+        # ~45 s), i.e. pure transport overhead against 4.6 s of real work.
+        # Threads share memory, so the transport disappears; measured 4.8 s
+        # with byte-identical output. Coarse-grained pools that hand whole
+        # tiles to workers (VectorTilePipeline) are left as processes.
+        with ThreadPool(workers) as pool:
             for stem in pool.imap_unordered(clean_diameter, stems):
                 stems_.append(stem)
             for stem in pool.imap_unordered(quantify_stem, stems_):
@@ -146,7 +156,9 @@ def get_diameters(stems: List[Stem], pred, profile, config=None):
                 except Exception as error:
                     error_callback(error)
         else:
-            with mp.Pool(workers) as pool:
+            # ThreadPool for the same reason as quantify_stems: a process pool
+            # would pickle every Stem AND the full contour list to each worker.
+            with ThreadPool(workers) as pool:
                 r = []
                 for stem in stems:
                     r.append(pool.apply_async(
