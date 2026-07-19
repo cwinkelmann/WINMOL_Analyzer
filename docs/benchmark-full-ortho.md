@@ -72,3 +72,67 @@ Zenodo).
   before the 2026-07-11 fix.
 - Per-run logs with full timing lines: `standalone/output/full_*/run.log`.
 - Side-by-side figure: `docs/three_models_comparison.png`.
+
+---
+
+# Original pipeline vs the full change stack
+
+A different comparison from the model benchmark above: same model weights on
+both sides, **the pipeline itself** is what changes.
+
+Input: `20220212_Barnekow_4.tiff` (9610×8662 px, 2.1 cm GSD, ~198×179 m),
+2026-07-19, Apple Silicon, `winmol_run.py … Trees`, headless (no QGIS),
+**median of 3 runs per configuration** via
+`benchmark/bench_orig_vs_changed.py` (see `benchmark/README.md`).
+
+- **original** — `origin/main`, TensorFlow/Keras `.hdf5`, `PYTHONHASHSEED`
+  unset, i.e. exactly as shipped
+- **changed** — the full stack, ONNX/onnxruntime
+- **+threadpool** — the same, with the quantification pool fix (PR #7)
+
+Both sides run the *same weights*: `General.onnx` was converted from
+`model_UNet_GenDS_512_2023-02-27_211141.hdf5` at 0.0000 % binary-mask
+disagreement (`onnx-conversion-parity.md`), so output differences come from the
+pipeline, not the model.
+
+## Results
+
+| | original | changed | changed + threadpool |
+|---|---|---|---|
+| wall time (median) | 793.0 s | 114.2 s | **76.5 s** |
+| per-run wall | 651 / 903 / 793 | 97 / 114 / 115 | 74.7 / 76.5 / 77.3 |
+| stems | 449 | 484 | **484** |
+| per-run stems | **446 / 451 / 449** | 484 / 484 / 484 | 484 / 484 / 484 |
+| volume | 400.661 m³ | 439.228 m³ | **439.228 m³** |
+| identical geometry across runs | **no — 3 distinct** | yes | yes |
+
+**10.4× faster end to end**, of which 1.5× comes from the threadpool fix alone.
+
+## What the numbers mean
+
+- **Reproducibility is the headline for anyone doing science with this.** The
+  original returned three different stem counts and three different geometries
+  from three identical runs of one file — a ±5-stem noise floor that any
+  before/after comparison was being read against. That is now zero.
+- **The +35 stems are recovered detections, not a different model.** Same
+  weights on both sides, so the difference is the ortho-boundary edge fix
+  recovering stems the tiled merge had been discarding. ~39 m³ of timber on a
+  single 3.5 ha site.
+- **The threadpool fix is provably output-preserving**: stem count *and* total
+  volume are byte-identical to the run before it (484, 439.228 m³). It is
+  purely a speedup.
+- **Timing also steadied.** The original swung 651–903 s (32 %); the fixed
+  stack runs 74.7–77.3 s (3 %).
+
+## Caveats
+
+- Wall time is an **end-to-end old-stack-vs-new-stack** figure: it includes the
+  TensorFlow → onnxruntime change as well as the pipeline work, because that is
+  what a user experiences after upgrading. It is not an isolated measurement of
+  the pipeline edits.
+- Apple Silicon, where the vector phase dominates. On a CUDA machine inference
+  nearly vanishes and the profile changes *shape*, so the ratio will differ.
+  The harness is written to run there — see `benchmark/README.md`.
+- A tile-level extrapolation predicted ~125 s for the threadpool fix; the
+  measured 76.5 s is better than predicted, and the reason has not been
+  isolated. Treat the tile→ortho arithmetic as a lower bound, not a model.
