@@ -13,20 +13,25 @@ jobs:
         with:
           path: WINMOL_Analyzer
 
-      - name: Update metadata.txt version inline
+      - name: Build the plugin package
+        # Uses `git archive`, so the file set comes from .gitattributes
+        # (export-ignore) — the SAME single list `make package` uses. The
+        # previous hand-maintained -x list had drifted: it still shipped
+        # tests/fixtures, docs/ and 11 MB of standalone/*.ipynb notebooks.
         run: |
+          set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
-          cd WINMOL_Analyzer
-          if grep -q '^version=' metadata.txt; then
-            sed -i "s/^version=.*/version=$VERSION/" metadata.txt
+          mkdir -p build
+          git -C WINMOL_Analyzer archive --prefix=WINMOL_Analyzer/ HEAD \
+            | tar -x -C build
+          META=build/WINMOL_Analyzer/metadata.txt
+          if grep -q '^version=' "$META"; then
+            sed -i "s/^version=.*/version=$VERSION/" "$META"
           else
-            echo "version=$VERSION" >> metadata.txt
+            echo "version=$VERSION" >> "$META"
           fi
-
-      - name: Archive Release
-        uses: montudor/action-zip@v1
-        with:
-          args: zip -r WINMOL_Analyzer_QGIS_Plugin.zip WINMOL_Analyzer -x "*.git*" -x "*documentation/*" -x "*winmol_venv/*" -x "*Dockerfile" -x "*startDocker.sh" -x "*.github/*" -x "*standalone/input/*" -x "*standalone/output/*" -x "*standalone/model/*" -x "*standalone/pred/*" -x "*__pycache*" -x "*pylintrc"
+          (cd build && zip -9r ../WINMOL_Analyzer_QGIS_Plugin.zip WINMOL_Analyzer)
+          echo "Packaged $(du -h WINMOL_Analyzer_QGIS_Plugin.zip | cut -f1)"
       - name: Upload Release
         uses: ncipollo/release-action@v1.12.0
         with:
