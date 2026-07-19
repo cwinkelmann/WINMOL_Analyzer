@@ -3,6 +3,8 @@ import sys
 
 from qgis.PyQt.QtCore import QObject, pyqtSignal
 
+from .plugin_utils.childenv import child_env
+
 
 class Worker(QObject):
     """Runs winmol_run.py in a subprocess on a QThread, streaming its output
@@ -32,6 +34,12 @@ class Worker(QObject):
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                 startupinfo.wShowWindow = subprocess.SW_HIDE
 
+            # child_env() strips the PYTHONHOME/PYTHONPATH and GDAL_DATA/
+            # PROJ_LIB that QGIS exports. winmol_run.py runs a DIFFERENT
+            # interpreter with its own vendored GDAL, so inheriting QGIS's
+            # would either stop it starting or point it at the wrong proj.db.
+            # WINMOL_* overrides (e.g. WINMOL_CONFIG_OVERRIDES_JSON) are
+            # deliberately preserved.
             self._popen = subprocess.Popen(
                 self.command,
                 stdout=subprocess.PIPE,
@@ -39,6 +47,7 @@ class Worker(QObject):
                 universal_newlines=True,
                 bufsize=1,
                 startupinfo=startupinfo,
+                env=child_env(),
             )
             for line in iter(self._popen.stdout.readline, ""):
                 self.update_signal.emit(line.rstrip("\n"))

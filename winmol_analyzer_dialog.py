@@ -1083,7 +1083,8 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         req = str(installer.plugin_requirements_path())
         self.update_output_log(f"Installing dependencies into {exe} …")
         r = subprocess.run([exe, "-m", "pip", "install", "-r", req],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, timeout=3600,
+                           env=installer.child_env())
         if r.returncode == 0 and installer._has_compute_deps(exe):
             self._set_python(exe)
             self.update_output_log("Dependencies installed; interpreter ready.")

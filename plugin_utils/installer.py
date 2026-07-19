@@ -29,6 +29,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from .childenv import child_env
+
 WINMOL_VENV_NAME = "winmol_venv"
 MODELS_PATH = "models"
 READY_MARKER = ".winmol_ready"
@@ -119,10 +121,14 @@ def get_venv_python_path(venv_path) -> str:
 
 def _python_version(executable) -> tuple:
     try:
+        # -I isolates the child from user site-packages and env vars; child_env
+        # additionally strips the PYTHONHOME/PYTHONPATH QGIS exports, which
+        # would otherwise point this interpreter at QGIS's stdlib and stop it
+        # starting at all (see plugin_utils/childenv.py).
         out = subprocess.run(
-            [executable, "-c",
+            [executable, "-I", "-c",
              "import sys;print('%d.%d' % sys.version_info[:2])"],
-            capture_output=True, text=True, timeout=30)
+            capture_output=True, text=True, timeout=30, env=child_env())
         if out.returncode == 0:
             major, minor = out.stdout.strip().split(".")
             return (int(major), int(minor))
@@ -160,8 +166,9 @@ def choose_base_python() -> str:
 def _has_compute_deps(executable) -> bool:
     try:
         out = subprocess.run(
-            [executable, "-c", "import onnxruntime, rasterio, geopandas"],
-            capture_output=True, timeout=60)
+            [executable, "-I", "-c",
+             "import onnxruntime, rasterio, geopandas"],
+            capture_output=True, timeout=60, env=child_env())
         return out.returncode == 0
     except Exception:
         return False
@@ -219,8 +226,12 @@ def create_venv(venv_path, base_python=None) -> None:
     # No --copies: the macOS Command Line Tools python (3.9) cannot create
     # venvs without symlinks ("This build of python cannot create venvs without
     # using symlinks"). The symlinked default works on all platforms.
+    # env=child_env() is load-bearing: with QGIS's PYTHONHOME inherited, this
+    # exact call is what died on Windows with "could not import runpy module"
+    # (-m is handled by runpy, which cannot load from a foreign stdlib).
     r = subprocess.run([base_python, "-m", "venv", venv_path],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, timeout=300,
+                       env=child_env())
     if r.returncode != 0:
         raise RuntimeError(
             f"venv creation failed with {base_python} (exit {r.returncode}): "
@@ -229,18 +240,20 @@ def create_venv(venv_path, base_python=None) -> None:
 
 def ensure_pip(venv_path) -> None:
     py = get_venv_python_path(venv_path)
-    if subprocess.run([py, "-c", "import pip"],
-                      capture_output=True).returncode == 0:
+    if subprocess.run([py, "-I", "-c", "import pip"], capture_output=True,
+                      timeout=120, env=child_env()).returncode == 0:
         return
     if subprocess.run([py, "-m", "ensurepip", "--upgrade"],
-                      capture_output=True).returncode == 0:
+                      capture_output=True, timeout=300,
+                      env=child_env()).returncode == 0:
         return
     # last resort: bootstrap pip from the network
     get_pip = Path(_PLUGIN_DIR, "plugin_utils", "get-pip.py")
     if not get_pip.exists():
         urllib.request.urlretrieve(
             "https://bootstrap.pypa.io/get-pip.py", str(get_pip))
-    r = subprocess.run([py, str(get_pip)], capture_output=True)
+    r = subprocess.run([py, str(get_pip)], capture_output=True, timeout=600,
+                       env=child_env())
     if r.returncode != 0:
         raise RuntimeError(
             "Could not bootstrap pip in the WINMOL venv. On Debian/Ubuntu "
@@ -253,7 +266,7 @@ def install_requirements(venv_path) -> None:
     req = str(plugin_requirements_path())
     r = subprocess.run(
         [py, "-m", "pip", "install", "--upgrade", "-r", req],
-        capture_output=True)
+        capture_output=True, timeout=3600, env=child_env())
     if r.returncode != 0:
         raise RuntimeError(
             f"pip failed installing {req} (exit {r.returncode}). "
