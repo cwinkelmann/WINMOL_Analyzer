@@ -1,0 +1,129 @@
+name: Plugin environment (Windows / macOS / Linux)
+
+# The golden-master suite in tests.yml runs inside a Linux ghcr image, so it
+# can never catch a platform bug. It didn't: the plugin's environment creation
+# was broken on Windows QGIS for a year ("could not import runpy module",
+# plugin_utils/childenv.py) and CI was green throughout. Windows runners cannot
+# run a Linux container, so this workflow is deliberately container-less and
+# provisions everything from scratch on each OS.
+#
+# isolation   -- the env-leak regression net. Stdlib only, ~1 min, BLOCKING.
+# deps        -- really pip-installs requirements/plugin.txt and exercises the
+#                GDAL vendored inside the rasterio/pyogrio wheels.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Fixtures are only reproducible under a fixed hash seed (review A-4);
+  # set here so tests/conftest.py's re-exec guard never fires (its output is
+  # swallowed without a tty).
+  PYTHONHASHSEED: "0"
+
+jobs:
+  isolation:
+    name: Env isolation — ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false          # one OS failing must not hide the others
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install test runner only
+        run: python -m pip install --upgrade pip pytest
+
+      - name: Environment isolation + installer unit tests
+        # These import nothing heavier than the stdlib, so they run on a bare
+        # interpreter and give a fast, unambiguous signal per platform.
+        run: >
+          python -m pytest -q
+          tests/test_child_env.py
+          tests/test_env_leak_regression.py
+          tests/test_plugin_installer.py
+
+      - name: Simulate QGIS's polluted environment
+        # Belt and braces: re-run the same tests with the pollution actually
+        # present in the runner's environment, the way QGIS leaves it.
+        # PYTHONHOME is deliberately NOT set here — it would break the runner's
+        # own interpreter before pytest could start. The tests set it
+        # themselves, per-child, via monkeypatch.
+        env:
+          PYTHONPATH: ${{ github.workspace }}/not-a-real-stdlib
+          GDAL_DATA: ${{ github.workspace }}/not-a-real-gdal
+          PROJ_LIB: ${{ github.workspace }}/not-a-real-proj
+        run: >
+          python -m pytest -q
+          tests/test_child_env.py
+          tests/test_env_leak_regression.py
+
+  deps:
+    name: Install plugin deps — ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Create the compute venv the way the plugin does
+        run: python -m venv winmol_venv
+
+      - name: Install requirements/plugin.txt
+        # The real check: onnxruntime + the geo stack must resolve to binary
+        # wheels on every platform. --only-binary means a missing wheel fails
+        # loudly here instead of silently trying to compile GDAL on a user's
+        # machine.
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then PY=winmol_venv/Scripts/python.exe;
+          else PY=winmol_venv/bin/python; fi
+          echo "PY=$PY" >> "$GITHUB_ENV"
+          "$PY" -m pip install --upgrade pip
+          "$PY" -m pip install --only-binary=:all: -r requirements/plugin.txt
+
+      - name: Verify the vendored GDAL actually works
+        # rasterio and pyogrio each bundle their own GDAL/PROJ. This opens the
+        # committed fixture and reads its CRS, which is what would fail if the
+        # wheel's data files were missing or a stray GDAL_DATA/PROJ_LIB were
+        # picked up.
+        shell: bash
+        run: |
+          "$PY" -c "
+          import rasterio, pyogrio, onnxruntime, geopandas
+          print('onnxruntime', onnxruntime.__version__)
+          print('rasterio   ', rasterio.__version__, '| GDAL', rasterio.__gdal_version__)
+          with rasterio.open('tests/fixtures/crop_input.tif') as src:
+              assert src.crs is not None, 'no CRS -- vendored PROJ data missing'
+              print('fixture    ', src.width, 'x', src.height, src.crs)
+          "
+
+      - name: Verify the compute core imports
+        # The modules winmol_run.py pulls in must import cleanly against the
+        # freshly installed wheels. (winmol_run.py itself is not invoked here:
+        # with no arguments it only prints usage, which asserts nothing.)
+        shell: bash
+        run: |
+          "$PY" -c "
+          import sys; sys.path.insert(0, '.')
+          import utils.IO, utils.onnx_runtime, classes.Config
+          print('compute core imports OK')
+          "

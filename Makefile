@@ -177,9 +177,7 @@ package: compile
 	@echo "------------------------------------"
 	@echo "Exporting plugin to zip package.	"
 	@echo "------------------------------------"
-	rm -f $(PLUGINNAME).zip
-	git archive --prefix=$(PLUGINNAME)/ -o $(PLUGINNAME).zip $(VERSION)
-	echo "Created package: $(PLUGINNAME).zip"
+	bash scripts/build_plugin_zip.sh $(VERSION) $(PLUGINNAME).zip
 
 upload: zip
 	@echo
