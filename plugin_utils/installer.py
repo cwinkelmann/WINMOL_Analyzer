@@ -305,6 +305,23 @@ def download_models(plugin_dir, config_path=None) -> list:
     return missing
 
 
+def installed_message(missing_models) -> str:
+    """The message shown after a successful environment build.
+
+    download_models() never raises, so a hosting gap or an offline machine
+    leaves the plugin installed but model-less. Say so explicitly and name the
+    escape hatch, rather than reporting plain success and letting the user
+    discover an empty model list on their own.
+    """
+    if not missing_models:
+        return "WINMOL environment installed."
+    names = ", ".join(sorted(missing_models))
+    return ("WINMOL environment installed, but these models could not be "
+            f"downloaded: {names}. Check your internet connection and use the "
+            "Environment button to retry, or Browse to select a local .onnx "
+            "model file.")
+
+
 def setup_environment(venv_path, base_python=None, download=True,
                       plugin_dir=None, progress=None) -> dict:
     """Create the venv and install deps (idempotent via the sentinel).
@@ -398,7 +415,7 @@ def resolve_environment(plugin_dir, prompt=True, build=True) -> dict:
         info = setup_environment(venv_path, plugin_dir=plugin_dir)
         result.update(status="installed", python=info["python"],
                       missing_models=info["missing_models"],
-                      message="WINMOL environment installed.")
+                      message=installed_message(info["missing_models"]))
     except Exception as exc:   # pragma: no cover - environment dependent
         result.update(status="error",
                       message=f"WINMOL setup failed: {exc}")
