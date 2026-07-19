@@ -89,6 +89,7 @@ Input: `20220212_Barnekow_4.tiff` (9610×8662 px, 2.1 cm GSD, ~198×179 m),
   unset, i.e. exactly as shipped
 - **changed** — the full stack, ONNX/onnxruntime
 - **+threadpool** — the same, with the quantification pool fix (PR #7)
+- **+indexes** — plus the spatial-index and `get_neighbors` fixes (PR #9)
 
 Both sides run the *same weights*: `General.onnx` was converted from
 `model_UNet_GenDS_512_2023-02-27_211141.hdf5` at 0.0000 % binary-mask
@@ -97,16 +98,17 @@ pipeline, not the model.
 
 ## Results
 
-| | original | changed | changed + threadpool |
-|---|---|---|---|
-| wall time (median) | 793.0 s | 114.2 s | **76.5 s** |
-| per-run wall | 651 / 903 / 793 | 97 / 114 / 115 | 74.7 / 76.5 / 77.3 |
-| stems | 449 | 484 | **484** |
-| per-run stems | **446 / 451 / 449** | 484 / 484 / 484 | 484 / 484 / 484 |
-| volume | 400.661 m³ | 439.228 m³ | **439.228 m³** |
-| identical geometry across runs | **no — 3 distinct** | yes | yes |
+| | original | changed | +threadpool | +indexes |
+|---|---|---|---|---|
+| wall time (median) | 793.0 s | 114.2 s | 76.5 s | **67.8 s** |
+| per-run wall | 651 / 903 / 793 | 97 / 114 / 115 | 74.7 / 76.5 / 77.3 | 66.9 / 67.8 / 68.7 |
+| stems | 449 | 484 | 484 | **484** |
+| per-run stems | **446 / 451 / 449** | 484 / 484 / 484 | 484 / 484 / 484 | 484 / 484 / 484 |
+| volume | 400.661 m³ | 439.228 m³ | 439.228 m³ | **439.228 m³** |
+| identical geometry across runs | **no — 3 distinct** | yes | yes | yes |
 
-**10.4× faster end to end**, of which 1.5× comes from the threadpool fix alone.
+**11.7× faster end to end.** Output is untouched by every optimisation step:
+484 stems and 439.228 m³ from `changed` onwards.
 
 ## What the numbers mean
 
@@ -133,6 +135,15 @@ pipeline, not the model.
 - Apple Silicon, where the vector phase dominates. On a CUDA machine inference
   nearly vanishes and the profile changes *shape*, so the ratio will differ.
   The harness is written to run there — see `benchmark/README.md`.
-- A tile-level extrapolation predicted ~125 s for the threadpool fix; the
-  measured 76.5 s is better than predicted, and the reason has not been
-  isolated. Treat the tile→ortho arithmetic as a lower bound, not a model.
+- **Tile-level timings do not extrapolate to the full orthomosaic.** Predicted
+  ~125 s for the threadpool fix, measured 76.5 s (pessimistic); predicted
+  55–65 s for the index fixes, measured 67.8 s (optimistic). Wrong in both
+  directions, so the arithmetic is not a forecast in either.
+
+  The mechanism, which caps what further vector-stage work can buy: the full
+  orthomosaic processes tiles **in parallel across a process pool**, so per-tile
+  CPU savings are divided by the worker count rather than summed. The index and
+  skeleton fixes were worth ~50 s of CPU on one dense profiling tile
+  (6560×7064, 1567 stems) but **8.7 s** of wall clock on the whole run. Expect
+  further vector-stage optimisation to keep showing large tile-level factors and
+  small wall-clock ones.
