@@ -66,6 +66,72 @@ optimal batch for free. Invalidate the cache when the model, provider, or
 hardware changes. (Note: measured per-device — e.g. on this M2/CoreML the
 optimum was ~batch 5; a large CUDA GPU will likely prefer a much bigger batch.)
 
+### Split semantic segmentation from vectorization
+
+Today the two halves are welded together: `winmol_run.py … Stems` stops after
+prediction and writes the binary stem-map raster, but there is **no way in** —
+nothing can take an existing stem map and run only the vector stage. The only
+use of `stem_map_path` is the merge-time edge fix; the vector phase always
+follows a fresh inference in the same process.
+
+That makes tuning the vector side needlessly expensive. Every experiment with
+`edge_buffer_m`, the minimum stem length, the 25 cm diameter step, or the
+`connect_stems` join thresholds costs a full re-inference over the whole
+orthomosaic — even though the segmentation is bit-identical each time. On the
+full-ortho benchmark the vector phase is already **~73 %** of a DeepLab run
+(173 s of 236 s), so the iteration loop is dominated by work that did not need
+redoing.
+
+Proposal: add a `Vectorize` process type (or `--from-stem-map`) that takes a
+stem-map GeoTIFF as its input instead of an orthomosaic and runs
+skeletonize → build parts → connect → quantify → merge. The seam already
+exists — the golden fixtures are staged exactly along it
+(`tests/fixtures/stage_build_stem_parts.json.gz`, `stage_connect_stems.json.gz`,
+`stage_quantified_*.json.gz`), so the stage functions are separable in practice
+and the tests already prove each boundary.
+
+Benefits beyond speed: parameter sweeps become cheap enough to automate; a
+segmentation mask from *any* source can be vectorized (see the exemplar-based
+backbone below, or a hand-corrected mask); and a bad vectorization can be
+re-run on a stored stem map without touching the GPU. Worth pairing with a
+small manifest next to the stem map recording the model, config and commit that
+produced it, so a vectorization result is still traceable to its segmentation.
+
+### Exemplar-based segmentation with a self-supervised backbone (DINO)
+
+Instead of a U-Net trained on the 21 annotated orthomosaics, use a
+self-supervised vision backbone (DINOv2/DINOv3, ideally a variant pretrained on
+aerial/remote-sensing imagery) as a frozen feature extractor, let the user
+click a handful of **exemplar** stems in the canvas, and build the mask by
+matching patch features against those exemplars (cosine similarity in feature
+space, optionally a light logistic head or k-NN over the exemplar set).
+
+Why it is attractive here: adapting to a new site, species mix, season or sensor
+currently means retraining and re-annotating. An exemplar approach adapts in
+seconds with a few clicks and no labels, which fits the actual field workflow —
+a forester looking at one storm event who wants *these* stems found. It also
+composes well with the QGIS canvas-interaction feature already listed above.
+
+**The honest risk is spatial resolution.** ViT backbones work on patches
+(DINOv2 uses 14 px), so raw patch-level features are far coarser than the
+structures being segmented: a stem at 2–4 cm GSD is only a handful of pixels
+wide, and a naive patch-similarity mask would be uselessly blocky. Any serious
+attempt needs one of the high-resolution adaptations — FeatUp-style feature
+upsampling, sliding-window inference at overlapping offsets, or a shallow
+decoder trained on the existing annotations while the backbone stays frozen.
+That last option is probably the pragmatic first experiment: it reuses the
+labels already available and only asks whether frozen DINO features beat a
+from-scratch U-Net encoder.
+
+Integration is cheap on our side, which lowers the cost of trying it. The
+pipeline consumes a **binarised** mask, so anything that emits one is a drop-in;
+`utils/onnx_runtime.py` already reads the model's declared layout and handles
+**NCHW** exports (i.e. PyTorch → ONNX) alongside the NHWC Zenodo conversions,
+so a DINO head exported to ONNX needs no loader changes provided it honours the
+`[N,512,512,3] → [N,512,512,1]` external contract. Combined with the
+segmentation/vectorization split above, this could be evaluated end-to-end
+against the golden fixtures without disturbing the existing model path.
+
 ### Inference Docker Containers
 Currently there is a dockerfile.blackwell, Dockefile_olive container
 
