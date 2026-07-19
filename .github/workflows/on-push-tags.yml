@@ -20,18 +20,9 @@ jobs:
         # tests/fixtures, docs/ and 11 MB of standalone/*.ipynb notebooks.
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
-          mkdir -p build
-          git -C WINMOL_Analyzer archive --prefix=WINMOL_Analyzer/ HEAD \
-            | tar -x -C build
-          META=build/WINMOL_Analyzer/metadata.txt
-          if grep -q '^version=' "$META"; then
-            sed -i "s/^version=.*/version=$VERSION/" "$META"
-          else
-            echo "version=$VERSION" >> "$META"
-          fi
-          (cd build && zip -9r ../WINMOL_Analyzer_QGIS_Plugin.zip WINMOL_Analyzer)
-          echo "Packaged $(du -h WINMOL_Analyzer_QGIS_Plugin.zip | cut -f1)"
+          cd WINMOL_Analyzer
+          bash scripts/build_plugin_zip.sh HEAD \
+            ../WINMOL_Analyzer_QGIS_Plugin.zip "${GITHUB_REF_NAME#v}"
       - name: Upload Release
         uses: ncipollo/release-action@v1.12.0
         with:
