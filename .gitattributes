@@ -40,9 +40,5 @@ docs/               export-ignore
 documentation/      export-ignore
 standalone/         export-ignore
 
-# --- stale QGIS Plugin Builder boilerplate (GeoApt LLC, 2011-2019) ---------
-README.txt          export-ignore
-README.html         export-ignore
-
 # --- source for a generated file that IS shipped (resources.py) ------------
 resources.qrc       export-ignore
