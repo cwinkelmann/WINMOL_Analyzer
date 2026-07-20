@@ -20,3 +20,9 @@
 # hardware with the provider check in docker/gpu/README.md before trusting any
 # timing.
 onnxruntime-gpu[cuda,cudnn]
+
+# Without psutil, HardwareInfo._detect_total_ram_gb() returns 0.0 and the run
+# logs "RAM=0.0 GB". Cosmetic on CUDA — the figure only feeds that log line and
+# macOS Metal detection, not the execution plan — but a wrong number in the log
+# is a wrong number, and psutil is tiny.
+psutil>=5.9

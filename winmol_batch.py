@@ -153,13 +153,15 @@ def main(argv: List[str]) -> int:
     )
     parser.add_argument(
         "--input",
-        default=DEFAULT_INPUT_FOLDER,
-        help=f"Input folder (default: {DEFAULT_INPUT_FOLDER})",
+        default=os.environ.get("WINMOL_INPUT_DIR", DEFAULT_INPUT_FOLDER),
+        help=("Input folder (default: $WINMOL_INPUT_DIR or "
+              f"{DEFAULT_INPUT_FOLDER})"),
     )
     parser.add_argument(
         "--output",
-        default=DEFAULT_OUTPUT_FOLDER,
-        help=f"Output folder (default: {DEFAULT_OUTPUT_FOLDER})",
+        default=os.environ.get("WINMOL_OUTPUT_DIR", DEFAULT_OUTPUT_FOLDER),
+        help=("Output folder (default: $WINMOL_OUTPUT_DIR or "
+              f"{DEFAULT_OUTPUT_FOLDER})"),
     )
 
     parser.add_argument(

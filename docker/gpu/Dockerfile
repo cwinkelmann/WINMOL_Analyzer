@@ -29,8 +29,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
     # Deterministic stem counts: connect_stems iterates a set of string-hashed
     # objects, so an unpinned seed changes the result run to run.
     PYTHONHASHSEED=0 \
-    # Where --model-dir looks unless overridden. Mount models here.
-    WINMOL_MODEL_DIR=/models
+    # Defaults for the mount points. These are ENV, not CMD, on purpose:
+    # CMD is REPLACED WHOLESALE the moment a user passes any argument, so
+    # `docker run <image> Spruce_Deadwood` would silently drop --input/--output
+    # baked into CMD and fall back to ./standalone/input. ENV survives that.
+    WINMOL_MODEL_DIR=/models \
+    WINMOL_INPUT_DIR=/input \
+    WINMOL_OUTPUT_DIR=/output
 
 # libexpat1 is needed by the geo stack's XML handling (same as the CI image).
 RUN apt-get update \
@@ -67,6 +72,7 @@ VOLUME ["/models", "/input", "/output"]
 # it so CI matches the golden fixtures; setting it here would silently disable
 # the GPU this image exists for.
 ENTRYPOINT ["python", "-u", "winmol_batch.py"]
-# Model names come from config.json and are capitalised: General, Beech,
-# Spruce, Spruce_Deadwood.
-CMD ["General", "--input", "/input", "--output", "/output"]
+# Only the model name — the directories come from ENV above, so overriding this
+# (e.g. `docker run <image> Spruce_Deadwood`) cannot lose them.
+# Names: General, Beech, Spruce, Spruce_Deadwood (case-insensitive).
+CMD ["General"]
