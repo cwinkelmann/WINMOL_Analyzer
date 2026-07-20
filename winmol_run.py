@@ -148,6 +148,7 @@ class ImageProcessing:
         print(f"  producer_workers = {plan.producer_workers}")
         print(f"  progress_interval_s = {plan.progress_interval_s}")
         print(f"  est_pred_tiles   = {plan.estimated_prediction_tiles}")
+        print(f"  est_vector_tiles = {plan.estimated_vector_tiles}")
         self._apply_plan_to_config(plan)
         return plan
 
