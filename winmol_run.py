@@ -233,39 +233,35 @@ class ImageProcessing:
                 plan.tile_inner_px,
                 halo_px,
             )
-            tile_paths = []
-            skipped_tiles = 0
-            for job in jobs:
-                pred_tile, tile_profile = IO.load_raster_window_with_profile(
-                    pred_path or self.stem_path, job.halo_window)
-                pred_arr = pred_tile if hasattr(pred_tile, 'size') else None
-                if (
-                    pred_arr is None
-                    or pred_arr.size == 0
-                    or not (pred_arr >= 1).any()
-                ):
-                    skipped_tiles += 1
-                    continue
-                tile_path = os.path.join(
-                    work_dir, f"{job.tile_id}_roi_stem_map.tif")
-                IO.write_tile_raster(pred_tile, tile_profile, tile_path)
-                tile_paths.append(tile_path)
-            print(
-                f"Prepared {len(tile_paths)}/{len(jobs)} vector tiles "
-                f"with foreground | skipped_empty {skipped_tiles}"
+            from utils.VectorTilePipeline import (
+                make_tile_spec,
+                process_prediction_tiles,
             )
-            if not tile_paths:
-                print("No foreground tiles found for vector stage.")
-                return None
-            from utils.VectorTilePipeline import process_prediction_tiles
 
-            process_prediction_tiles(
-                tile_paths,
+            # Workers read their windows straight from the stem map: no
+            # serial parent read pass, ONE foreground check per tile, and
+            # no tile re-read (the tile GeoTIFF is still written in the
+            # worker — the merge stage and the failure-inspection contract
+            # both rely on it).
+            src_path = pred_path or self.stem_path
+            tile_specs = [
+                make_tile_spec(src_path, job.tile_id, job.halo_window)
+                for job in jobs
+            ]
+            print(
+                f"Queued {len(tile_specs)} vector tiles | "
+                f"foreground checked in tile workers"
+            )
+            results = process_prediction_tiles(
+                tile_specs,
                 self.config,
                 self.process_type,
                 work_dir,
                 plan.cpu_workers,
             )
+            if not any(result is not None for result in results):
+                print("No foreground tiles found for vector stage.")
+                return None
             merged = self.run_merge_phase(plan, work_dir)
             if plan.keep_temp:
                 print(f"Keeping tile work directory: {work_dir}")
