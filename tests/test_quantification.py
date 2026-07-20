@@ -67,6 +67,34 @@ def test_edt_and_contour_disagree(golden):
     assert not np.allclose(d_contour, d_edt)
 
 
+def test_get_diameters_all_background_returns_empty(stem_map):
+    """All-background prediction must return [] as at 74717d6, not raise.
+
+    With mask=foreground, rasterio.features.shapes yields no features for
+    an all-zero raster, so GeoDataFrame.from_features([]) has no
+    'raster_val' column and the filter would KeyError without the empty
+    guard. The tiled pipeline early-returns before reaching this, but
+    standalone/WINMOL_Analyzer.py calls quantify_stems unconditionally,
+    so a zero-detection image must not crash."""
+    _, profile = stem_map
+    pred = np.zeros((64, 64), dtype=np.uint8)
+    assert Quant.get_diameters([], pred, profile) == []
+
+
+def test_get_diameters_all_background_zero_diameters(connect_stage_stems,
+                                                     stem_map,
+                                                     pipeline_config):
+    """Non-empty stems over an all-background prediction: every node gets
+    diameter 0.0 (no contour chord), same as the unmasked shapes() path."""
+    _, profile = stem_map
+    pred = np.zeros((64, 64), dtype=np.uint8)
+    stems = Quant.get_diameters(
+        connect_stage_stems, pred, profile, config=pipeline_config)
+    assert len(stems) == len(connect_stage_stems)
+    for stem in stems:
+        assert all(d == 0.0 for d in stem.segment_diameter_list)
+
+
 def test_shapes_foreground_mask_equals_postfiltered_shapes(stem_map):
     """get_diameters now passes mask=foreground to rasterio.features.shapes
     instead of polygonizing everything and filtering raster_val == 1 post

@@ -142,17 +142,27 @@ def get_diameters(stems: List[Stem], pred, profile, config=None):
         # anyway. Foreground polygons (holes included) are unchanged and
         # calc_d takes an order-insensitive max over them.
         mask = pred_bin.astype(bool)
-        pred_shapes_ = (
-            {'properties': {'raster_val': value}, 'geometry': geom}
-            for geom, value in rasterio.features.shapes(
-                pred_bin,
-                mask=mask,
-                transform=transform,
+        if mask.any():
+            pred_shapes_ = (
+                {'properties': {'raster_val': value}, 'geometry': geom}
+                for geom, value in rasterio.features.shapes(
+                    pred_bin,
+                    mask=mask,
+                    transform=transform,
+                )
             )
-        )
-        pred_shapes = list(pred_shapes_)
-        pred_shapes = gpd.GeoDataFrame.from_features(pred_shapes)
-        pred_shapes = pred_shapes[pred_shapes['raster_val'] == 1]
+            pred_shapes = list(pred_shapes_)
+            pred_shapes = gpd.GeoDataFrame.from_features(pred_shapes)
+            pred_shapes = pred_shapes[pred_shapes['raster_val'] == 1]
+        else:
+            # All-background raster: shapes(mask=all-False) yields no
+            # features, and from_features([]) would lack the 'raster_val'
+            # column, so the filter above would KeyError. The unmasked
+            # call at 74717d6 emitted the background polygon and filtered
+            # it, ending up with an empty frame — preserve that contract
+            # (standalone/WINMOL_Analyzer.py calls quantify_stems
+            # unconditionally on zero-detection images).
+            pred_shapes = gpd.GeoDataFrame({'raster_val': []}, geometry=[])
         # One STRtree for the whole stage instead of one per calc_d call.
         pred_shapes = ContourIndex(pred_shapes)
 
