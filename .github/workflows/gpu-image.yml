@@ -1,0 +1,102 @@
+name: GPU image
+
+# Builds and publishes the CUDA compute image (docker/gpu/Dockerfile) to GHCR.
+#
+# On a TAG push this publishes the released version. workflow_dispatch is
+# provided so the image can be built without cutting a release — useful because
+# it cannot be built on an arm64 Mac at all (onnxruntime-gpu ships only
+# manylinux x86_64 wheels), so CI is the first place the build is exercised.
+#
+# pull_request builds WITHOUT pushing, so a broken Dockerfile fails in review
+# rather than at release time.
+
+on:
+  push:
+    tags:
+      - "*"
+  pull_request:
+    paths:
+      - "docker/gpu/**"
+      - "requirements/geo.txt"
+      - "requirements/gpu.txt"
+      - ".github/workflows/gpu-image.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/winmol-analyzer-gpu
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Only log in when we intend to push; pull_request builds stay read-only.
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          # A tag push yields both the version and `latest`; other runs get a
+          # branch/sha tag that cannot be mistaken for a release.
+          tags: |
+            type=ref,event=tag
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
+            type=sha,format=short
+
+      - name: Build (and push on tag)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/gpu/Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The image is built on a CPU runner, so CUDA cannot be exercised here.
+      # What CAN be checked is that it is not silently broken: the compute core
+      # imports, the CLI parses, and onnxruntime is the GPU build.
+      - name: Smoke-test the image
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          IMG="$(echo '${{ steps.meta.outputs.tags }}' | head -n1)"
+          docker run --rm --entrypoint python "$IMG" -c \
+            "import utils.IO, utils.onnx_runtime, classes.Config; print('compute core OK')"
+          docker run --rm "$IMG" --help > /dev/null && echo "CLI OK"
+          docker run --rm --entrypoint python "$IMG" -c \
+            "import onnxruntime as o; ps=o.get_available_providers(); print('providers:', ps); \
+             assert 'CUDAExecutionProvider' in ps, 'GPU build missing CUDA provider'"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### GPU image"
+            echo ""
+            echo '```'
+            echo '${{ steps.meta.outputs.tags }}'
+            echo '```'
+            echo ""
+            echo "Pushed: ${{ github.event_name != 'pull_request' }}"
+            echo ""
+            echo "CUDA itself is NOT exercised here — the runner has no GPU."
+            echo "Verify on the target machine, see \`docker/gpu/README.md\`."
+          } >> "$GITHUB_STEP_SUMMARY"

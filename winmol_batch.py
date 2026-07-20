@@ -108,6 +108,30 @@ def merge_results(
     )
 
 
+def _resolve_model_name(model_paths):
+    """argparse `type` that accepts a model name in any case.
+
+    The model names originally lived in a hardcoded lowercase dict
+    (`spruce` / `beech` / `general`). When they moved to config.json keys they
+    became capitalised, which silently broke every existing invocation --
+    `winmol_batch.py general` had worked since 2025 and started erroring.
+    Matching case-insensitively keeps those callers (and the Dockerfiles in the
+    repo root) working, while the canonical capitalised names are what gets
+    used internally.
+    """
+    lookup = {name.lower(): name for name in model_paths}
+
+    def _resolve(value):
+        try:
+            return lookup[value.lower()]
+        except KeyError:
+            raise argparse.ArgumentTypeError(
+                f"invalid model {value!r}; choose from "
+                + ", ".join(sorted(model_paths)))
+
+    return _resolve
+
+
 def main(argv: List[str]) -> int:
     # Only the KEYS are needed here (for `choices`), and those come from
     # config.json, not from the model directory — so the default dir is fine
@@ -122,8 +146,10 @@ def main(argv: List[str]) -> int:
     )
     parser.add_argument(
         "model",
-        choices=sorted(model_paths.keys()),
-        help="Model to use (from config.json)",
+        type=_resolve_model_name(model_paths),
+        help=("Model to use (from config.json): "
+              + ", ".join(sorted(model_paths)) + ". Case-insensitive."),
+        metavar="{" + ",".join(sorted(model_paths)) + "}",
     )
     parser.add_argument(
         "--input",
