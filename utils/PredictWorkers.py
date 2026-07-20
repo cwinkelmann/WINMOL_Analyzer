@@ -45,33 +45,24 @@ def _raw_tile_to_batchable(tile_img):
 
 
 def _prepare_inference_batch(raw_tiles, raw_masks, config):
-    import tensorflow as tf
+    """Delegate to the migrated implementation in utils.Prediction.
 
-    batch = np.stack([_raw_tile_to_batchable(t) for t in raw_tiles], axis=0)
-    tile_tensor = tf.convert_to_tensor(batch, dtype=tf.float32)
-    tile_tensor = tf.image.resize(
-        tile_tensor,
-        size=[config.img_height, config.img_width],
-        method='bicubic',
-        antialias=False,
-    )
+    This module carried its own copy that still used `tf.image.resize`, so the
+    MULTI-GPU path never left TensorFlow behind when the rest of the repo moved
+    to ONNX. It only surfaces with more than one GPU, which is why a
+    single-GPU machine never hit it:
 
-    if raw_masks is None:
-        raw_masks = [np.any(
-            _raw_tile_to_batchable(t) != 0, axis=2) for t in raw_tiles]
+        File "utils/PredictWorkers.py", line 230, in prediction_worker
+          import tensorflow as tf
+        ModuleNotFoundError: No module named 'tensorflow'
 
-    mask_batch = np.stack(
-        [m.astype(np.float32)[:, :, None] for m in raw_masks],
-        axis=0,
-    )
-    mask_tensor = tf.convert_to_tensor(mask_batch, dtype=tf.float32)
-    mask_tensor = tf.image.resize(
-        mask_tensor,
-        size=[config.img_height, config.img_width],
-        method='nearest',
-        antialias=False,
-    )
-    return tile_tensor, mask_tensor.numpy()
+    Delegating rather than porting the code a second time keeps the single-GPU
+    and multi-GPU paths bit-identical by construction — the golden fixtures pin
+    the Prediction version, and a divergent copy here could drift from them
+    unnoticed.
+    """
+    from utils.Prediction import _prepare_inference_batch as _prepare
+    return _prepare(raw_tiles, raw_masks, config)
 
 
 def _resampling_layout(shape, profile, config):
@@ -226,16 +217,14 @@ def prediction_worker(
     results,
     config_dict: dict,
 ):
+    # Pins this worker to one GPU. onnxruntime honours CUDA_VISIBLE_DEVICES,
+    # so the device is selected before any provider is created.
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
-    import tensorflow as tf
     from utils.IO import load_model_from_path
-
-    gpus = tf.config.list_physical_devices('GPU')
-    for gpu in gpus:
-        try:
-            tf.config.experimental.set_memory_growth(gpu, True)
-        except Exception:
-            pass
+    # There used to be a `import tensorflow` + set_memory_growth block here.
+    # It configured TENSORFLOW's allocator, which does nothing now that
+    # inference runs through onnxruntime -- and it made TensorFlow a hard
+    # runtime requirement of the multi-GPU path alone.
 
     cfg = _config_from_dict(config_dict)
     model = load_model_from_path(model_path)
@@ -269,16 +258,14 @@ def prediction_service_worker(
     results,
     config_dict: dict,
 ):
+    # Pins this worker to one GPU. onnxruntime honours CUDA_VISIBLE_DEVICES,
+    # so the device is selected before any provider is created.
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
-    import tensorflow as tf
     from utils.IO import load_model_from_path
-
-    gpus = tf.config.list_physical_devices('GPU')
-    for gpu in gpus:
-        try:
-            tf.config.experimental.set_memory_growth(gpu, True)
-        except Exception:
-            pass
+    # There used to be a `import tensorflow` + set_memory_growth block here.
+    # It configured TENSORFLOW's allocator, which does nothing now that
+    # inference runs through onnxruntime -- and it made TensorFlow a hard
+    # runtime requirement of the multi-GPU path alone.
 
     cfg = _config_from_dict(config_dict)
     model = load_model_from_path(model_path)
