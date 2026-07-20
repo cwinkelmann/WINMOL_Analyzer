@@ -147,3 +147,63 @@ pipeline, not the model.
   (6560×7064, 1567 stems) but **8.7 s** of wall clock on the whole run. Expect
   further vector-stage optimisation to keep showing large tile-level factors and
   small wall-clock ones.
+
+---
+
+# CUDA: legacy container vs new container
+
+The macOS figures above compare git refs on CPU/CoreML. This compares the two
+**container images** on an NVIDIA GPU — the closest thing to what a user
+actually deploys.
+
+Input: `20220212_Barnekow_4.tiff`, model **Spruce_Deadwood** on both sides,
+2026-07-20, **RTX 4080 SUPER** (driver 580.159.03, CUDA 13.0), 3 runs each,
+median reported, via `benchmark/run_container_comparison.sh`.
+
+- **legacy** — `Dockerfile.blackwell`: NVIDIA NGC TensorFlow base, `.hdf5`
+  models, cloned from upstream `StefanReder/main`
+- **new** — `docker/gpu/Dockerfile`: `python:3.11-slim` + `onnxruntime-gpu`,
+  `.onnx` models, this fork
+
+Same weights on both sides: `Spruce_Deadwood.onnx` was converted from
+`model_UNet_SpecDS_Spruce_Deadwood_512_2024-12-19_194758.hdf5`.
+
+## Results
+
+| | legacy | new |
+|---|---|---|
+| wall time (median) | 126 s | **36 s** |
+| per run | 126 / 116 / 129 | 38 / 36 / 34 |
+| stems | 407 / 411 / **414** | **458 / 458 / 458** |
+| volume | 254.22 / 253.54 / 255.05 m³ | **276.03 m³** ×3 |
+| identical geometry across runs | **no — 3 distinct** | **yes** |
+
+**3.5× faster, +47 stems (+11.4 %), +21.8 m³, and reproducible.**
+
+## What to take from it
+
+- **The nondeterminism is not a macOS artefact.** Three identical runs of one
+  file on one GPU produced three different stem counts *and* three different
+  volumes — a ±7-stem, ±1.5 m³ spread. Any before/after comparison on the old
+  stack was being read against that noise floor. The new side returned the same
+  MD5 three times.
+- **3.5× here versus 11.7× on macOS is the expected shape, not a
+  disappointment.** On CUDA, inference collapses toward zero while the
+  CPU-bound vector phase does not move, so the ratio compresses as the vector
+  phase comes to dominate. Predicting it from the macOS number would have been
+  wrong — as two earlier tile-level predictions were, in both directions.
+- **Not directly comparable to the macOS table above**: different model
+  (Spruce_Deadwood vs General) and different hardware, so absolute counts
+  differ. The direction and the determinism result are what carry across.
+
+## Reproducing
+
+```bash
+REPEATS=3 benchmark/run_container_comparison.sh    # detached; survives logout
+cat /tmp/winmol-bench/SUMMARY.txt
+```
+
+`Dockerfile.blackwell` needs a fix before it will build at all: a `## TODO`
+comment placed after a line-continuation backslash escapes the space rather
+than the newline, so `git clone` parses as a new instruction
+(`unknown instruction: git`).
