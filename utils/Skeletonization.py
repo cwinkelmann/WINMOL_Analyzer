@@ -491,11 +491,19 @@ def refine_skeleton_segment(part: Part, low_bounds: Tuple[int, int],
         p_last = [parts[0].start, parts[0].stop]
         parts[0].path = []
         parts[0].path.extend([w])
-        temp = np.full(skel.shape, False)
+        # Pixels consumed from skel since the last accepted measuring
+        # point. Replaces a np.full(skel.shape, ...) snapshot per accepted
+        # point plus whole-window np.where restores: the list is O(steps
+        # walked), the arrays were O(window area). Restoring iterates the
+        # same pixel set the boolean mask held, so skel ends up identical.
+        # (The old code also re-allocated temp on branches that exit the
+        # loop immediately, e.g. after the split-at-stop restore -- those
+        # allocations were dead and have no list equivalent here.)
+        visited = []
         while w != z:
             x, y = w
             skel[(x, y)] = False
-            temp[(x, y)] = True
+            visited.append((x, y))
             ww = get_neighbors(x, y, skel)
             if ww:
                 w = ww[0]
@@ -508,12 +516,11 @@ def refine_skeleton_segment(part: Part, low_bounds: Tuple[int, int],
                                         low_bounds, up_bounds)
                         parts.append(new_part)
                         parts[0].stop = n
-                        skel[np.where(temp.__eq__(True))] = True
-                        temp = np.full(skel.shape, False)
+                        for px in visited:
+                            skel[px] = True
                         split_ = split_ + 1
                     else:
                         parts[0].path.extend([w])
-                        temp = np.full(skel.shape, False)
                 else:
                     if math.dist(n, w) > measuring_point_spacing:
                         if n == parts[0].start:
@@ -530,7 +537,7 @@ def refine_skeleton_segment(part: Part, low_bounds: Tuple[int, int],
                                 parts[0].path.extend([w])
                                 p_last = p_recent
                                 n = w
-                                temp = np.full(skel.shape, False)
+                                visited = []
                         else:
                             if angle > 30:
                                 new_part = Part(n, parts[0].stop,
@@ -538,14 +545,15 @@ def refine_skeleton_segment(part: Part, low_bounds: Tuple[int, int],
                                                 low_bounds, up_bounds)
                                 parts.append(new_part)
                                 parts[0].stop = n
-                                skel[np.where(temp.__eq__(True))] = True
+                                for px in visited:
+                                    skel[px] = True
                                 z = w
                                 split_ = split_ + 1
                             else:
                                 parts[0].path.extend([w])
                                 p_last = p_recent
                                 n = w
-                                temp = np.full(skel.shape, False)
+                                visited = []
             else:
                 parts[0].path.extend([(x, y)])
                 parts[0].stop = (x, y)
