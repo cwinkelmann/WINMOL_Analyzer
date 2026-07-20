@@ -75,44 +75,54 @@ job — but the thresholds were not chosen with H100-class hardware in mind, whe
 startup is cheap and the job is often "small" by tile count while still worth
 spreading. Raising them is a code change.
 
-## Suggested defaults by machine
+## Measured: a config sweep, and why nothing helped
 
-These are **starting points to measure from, not tuned values.** Nothing below
-has been benchmarked; the defaults were set for laptops and small workstations,
-and are clearly conservative on a large node.
+Six configurations, 3 runs each, Spruce_Deadwood on Barnekow, RTX 4080 SUPER
+(16 cores), via `benchmark/`:
 
-**Workstation / laptop (8–16 cores, 1 GPU)** — leave the defaults alone.
+| config | median | vs base | stems | output |
+|---|---|---|---|---|
+| **baseline** | **33 s** | — | 458 | — |
+| `max_vector_tile_workers:1` | 43 s | +30 % | 458 | same |
+| `max_cpu_workers:128` | 34 s | +3 % | 458 | same |
+| + `max_vector_tile_workers:16` | 34 s | +3 % | 458 | same |
+| `tile_inner_px:2048` | 46 s | +39 % | **459** | **changed** |
+| `tile_inner_px:8192` | 40 s | +21 % | **456** | **changed** |
 
-**Large node (100+ cores, multi-GPU)**
+**No output-preserving config beat the defaults.** They are well tuned for a
+normal workstation; do not tune this blindly.
 
-```json
-{
-  "max_cpu_workers": 96,
-  "multi_gpu_cpu_workers": 96,
-  "max_vector_tile_workers": 24,
-  "prediction_batch_multi_gpu": 16
-}
+### Why the overrides did nothing — read the resolved plan
+
+Every run resolved to `cpu_workers = 11` and `vector_tile_workers = 2`,
+*including* the one setting `max_cpu_workers: 128`:
+
+```
+max_cpu_workers = min(128, hw_cpu-1 = 15) = 15  →  ×0.75  →  cpu_workers = 11
+vector_tile_workers = min(max_vector_tile_workers, cpu_workers//4 = 2, tiles) = 2
 ```
 
-Rationale, in order of expected value:
+`max_vector_tile_workers: 16` was inert because **`cpu_workers//4` binds first**,
+and that is pinned by the core count. The lesson generalises: after setting an
+override, check the `Execution plan:` block in the log. An override that is
+clamped away looks exactly like one that had no effect.
 
-1. **`max_vector_tile_workers` is the biggest available lever.** The vector
-   phase dominates a run and is currently capped at 4 processes regardless of
-   core count. Note `tile_workers = min(max_vector_tile_workers, cpu_workers//4,
-   tiles)`, so raising `max_cpu_workers` too is required for it to bite — and
-   it is also bounded by the number of tiles, so a small ortho will not use 24
-   either way.
-2. **`max_cpu_workers` at 32 wastes a 224-core machine** and silently neuters
-   `multi_gpu_cpu_workers: 48`.
-3. **Memory scales with workers.** Each vector tile worker holds a
-   `tile_inner_px`-sized array plus geometry; 24 workers × 4096 px tiles is
-   substantial. Watch RSS before pushing further.
+### What this does NOT tell you about a large node
 
-**Do not raise blindly.** Measured on this project, more workers has twice made
-things *worse*: a process pool in quantification was **10× slower** than serial
-because pickling dominated (fixed by switching to threads), and prediction
-batch 8 was a **36 % regression** versus batch 4 on CoreML. Change one value,
-measure with `benchmark/bench_orig_vs_changed.py`, keep it only if it helps.
+On 224 cores the arithmetic lands in a different regime —
+`cpu_workers ≈ 32` → `tile_workers = min(max_vector_tile_workers=4, 8) = 4` —
+so there `max_vector_tile_workers` **is** the binding cap and raising it may
+help. That is the one case worth testing, and it cannot be tested on a small
+machine. Measure it on the target hardware before adopting anything.
+
+### Two results that do generalise
+
+- **Inner parallelism loses.** One tile with 11 inner workers was 30 % slower
+  than two tiles with one each. Consistent with everything else measured in
+  this project: a process pool in quantification was 10× slower than serial,
+  and prediction batch 8 was a 36 % regression versus batch 4.
+- **`tile_inner_px` changes results** — 459 and 456 stems versus 458. It is not
+  a performance knob; it alters tiling and therefore seam handling.
 
 ## Results-changing vs performance-only
 
