@@ -506,3 +506,15 @@ mask, which is correct (a 0/1 mask must not be interpolated). This is the new
 GDAL-read path (rasterio out_shape + Resampling.bilinear / .nearest).
 
 
+### Model download links
+Downloading the onnx models should be optional. The released hdf5 models should be the source of truth, converting them locally could be better.
+
+
+### Clean up Root dir. 
+There are many scripts which seem weird. I.e. resources.py
+Plugin_upload.py seems to be unused
+there are many qgis related files which seem relevant to qgis only and could be in packaged away
+
+
+### QGIS Docker Container
+The current container is fixed on QGIS 3.28.2, which is a way too old (2022, no LTR(. I would suggest to use the latest LTR version of QGIS 3.44) and make it run on QGIS 4.2.0
