@@ -1,0 +1,102 @@
+# Blackwell-ready NVIDIA TensorFlow base
+FROM nvcr.io/nvidia/tensorflow:25.02-tf2-py3
+
+LABEL maintainer="stefan.reder@hnee.de"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONUNBUFFERED=1
+
+# System packages only; TensorFlow is already included in the base image
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      ca-certificates \
+      wget \
+      curl \
+      git && \
+    rm -rf /var/lib/apt/lists/*
+
+# Keep pip tooling fresh, but do NOT reinstall tensorflow
+RUN python -m pip install --upgrade pip setuptools wheel
+
+# Install WINMOL Python dependencies
+RUN python -m pip install \
+      Pillow==10.1.0 \
+      Shapely==2.0.2 \
+      geopandas==0.14.0 \
+      ipykernel==6.27.1 \
+      rasterio==1.3.9 \
+      scikit-image==0.22.0 \
+      scipy==1.11.3 \
+      matplotlib \
+      pyogrio
+
+# Optional GPU EDT backend (diameter_method='edt'): cupy-cuda12x >= 13.4.0
+# is the first release with CUDA 12.8 + Blackwell (sm_120) wheels. The
+# base image ships CUDA 12.8, so the cuda12x wheel matches. Verify inside
+# the container with:
+#   python -c "import cupy; cupy.show_config()"
+#   python benchmark/gpu_edt_parity.py
+RUN python -m pip install "cupy-cuda12x>=13.4.0"
+
+# Choose branch/tag at build time (default: main)
+ARG WINMOL_REF=main
+
+# Cache bust so rebuilds refetch git + models
+ARG CACHEBUST=1
+
+## TODO Why delete this here?
+RUN echo "CACHEBUST=${CACHEBUST}" && \
+    rm -rf /workspace/WINMOL-Analyzer && \
+    git clone --depth 1 --branch "${WINMOL_REF}" \
+      https://github.com/StefanReder/WINMOL_Analyzer.git \
+      /workspace/WINMOL-Analyzer && \
+    cd /workspace/WINMOL-Analyzer && \
+    git rev-parse HEAD
+
+WORKDIR /workspace/WINMOL-Analyzer
+
+# Download models listed in config.json into the image
+RUN python - <<'PY'
+import json, os, urllib.request, tempfile, shutil
+
+repo = "/workspace/WINMOL-Analyzer"
+cfg_path = os.path.join(repo, "config.json")
+model_dir = os.path.join(repo, "standalone", "model")
+os.makedirs(model_dir, exist_ok=True)
+
+with open(cfg_path, "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+def url_to_filename(url: str) -> str:
+    return url.split("/")[-1].split("?")[0]
+
+for model_name, url in cfg.items():
+    fn = url_to_filename(url)
+    out = os.path.join(model_dir, fn)
+
+    if os.path.exists(out) and os.path.getsize(out) > 0:
+        print(f"Already present: {model_name} -> {fn}")
+        continue
+
+    print(f"Downloading {model_name} -> {fn}")
+    tmp_fd, tmp_path = tempfile.mkstemp(prefix="dl_", suffix=".tmp", dir=model_dir)
+    os.close(tmp_fd)
+    try:
+        urllib.request.urlretrieve(url, tmp_path)
+        if os.path.getsize(tmp_path) == 0:
+            raise RuntimeError(f"Downloaded file is empty: {url}")
+        shutil.move(tmp_path, out)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+print("Model download finished.")
+PY
+
+# Optional: keep TensorBoard port
+EXPOSE 6006
+
+# FME-friendly default CLI
+ENTRYPOINT ["python", "-u"]
+CMD ["winmol_batch.py", "general"]

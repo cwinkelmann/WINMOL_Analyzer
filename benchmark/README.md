@@ -114,3 +114,18 @@ string-hashed objects in a per-process order and the stem count moves run to
 run. One run per side would silently attribute that variance to the code
 changes. Three is the practical minimum; the summary reports the median *and*
 the full spread so the variance stays visible rather than averaged away.
+
+## GPU EDT parity (`gpu_edt_parity.py`)
+
+Runs on a Linux CUDA box with `cupy-cuda12x` installed
+(`requirements/gpu-edt.txt`, preinstalled in `Dockerfile.blackwell`):
+
+```bash
+python benchmark/gpu_edt_parity.py            # golden stem-map fixture
+python benchmark/gpu_edt_parity.py --stem-map <your_stem_map.tif>
+```
+
+Checks cupyx-vs-scipy EDT on the raster, full `quantify_stems` parity
+between `edt_backend='cpu'` and `'gpu'`, and reports timings. Exit 0 =
+parity holds. This is the on-device half of `tests/test_gpu_dispatch.py`,
+which covers the same code path against a numpy fake on non-CUDA machines.

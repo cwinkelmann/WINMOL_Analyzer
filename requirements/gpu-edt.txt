@@ -1,0 +1,8 @@
+# Optional GPU backend for the EDT diameter path (diameter_method='edt',
+# edt_backend='auto'|'gpu'). Linux + CUDA 12 only; every other platform
+# falls back to the scipy CPU path automatically (utils/GpuDispatch.py).
+#
+# >= 13.4.0: first CuPy release with CUDA 12.8 + Blackwell (sm_120)
+# wheels (cupy/cupy#8903); the cupyx EDT API itself is much older.
+# Verify after install:  python -c "import cupy; cupy.show_config()"
+cupy-cuda12x>=13.4.0
