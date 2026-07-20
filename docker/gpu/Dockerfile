@@ -51,7 +51,15 @@ WORKDIR /opt/winmol
 COPY . /opt/winmol
 
 # Fail the build rather than ship an image that cannot import its own core.
-RUN python -c "import utils.IO, utils.onnx_runtime, classes.Config; print('compute core OK')"
+# This includes winmol_batch (the ENTRYPOINT) and every pipeline stage, not
+# just a sample: the first version checked only utils.IO/onnx_runtime/Config,
+# and it was an eager `from matplotlib import pyplot` inside utils.IO that broke
+# the build — matplotlib is intentionally absent here, since only save_image
+# needs it and it is now imported lazily.
+RUN python -c "\
+import utils.IO, utils.onnx_runtime, utils.Prediction, utils.Skeletonization, \
+       utils.Vectorization, utils.Quantification, classes.Config, winmol_batch; \
+print('compute core + CLI OK')"
 
 VOLUME ["/models", "/input", "/output"]
 

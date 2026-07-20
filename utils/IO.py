@@ -19,7 +19,6 @@ try:
 except Exception:
     pyogrio = None
     _HAVE_PYOGRIO = False
-from matplotlib import pyplot as plt
 from rasterio.enums import Resampling
 from shapely.geometry import LineString, Point, box
 from collections.abc import Mapping
@@ -866,6 +865,17 @@ def write_all_layers_to_gpkg(stems, profile, path_prefix):
 
 
 def save_image(data, output_name, size=(15, 15), dpi=300):
+    """Render an array to an image file.
+
+    matplotlib is imported HERE rather than at module scope because this is the
+    only thing in the whole compute path that needs it. An eager import made
+    matplotlib — plus its Qt/font/pillow dependency chain — a hard requirement
+    of every environment that merely imports utils.IO, including headless
+    containers that never draw anything. Importing it lazily keeps
+    `import utils.IO` working without it.
+    """
+    from matplotlib import pyplot as plt
+
     fig = plt.figure()
     fig.set_size_inches(size)
     ax = plt.Axes(fig, [0., 0., 1., 1.])
