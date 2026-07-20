@@ -70,20 +70,38 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # The image is built on a CPU runner, so CUDA cannot be exercised here.
-      # What CAN be checked is that it is not silently broken: the compute core
-      # imports, the CLI parses, and onnxruntime is the GPU build.
+      # The runner has no GPU, so CUDA execution cannot be exercised. But the
+      # most common failure IS checkable here: the CUDA provider's shared
+      # libraries failing to resolve. Loading them only exercises the linker.
+      #
+      # This check exists because an earlier version asserted only that
+      # `get_available_providers()` listed CUDAExecutionProvider — which merely
+      # reads a list and passed happily on an image where creating the provider
+      # died with "libcublasLt.so.12: cannot open shared object file", silently
+      # falling back to CPU on the target machine.
       - name: Smoke-test the image
         if: github.event_name != 'pull_request'
         run: |
           set -euo pipefail
           IMG="$(echo '${{ steps.meta.outputs.tags }}' | head -n1)"
           docker run --rm --entrypoint python "$IMG" -c \
-            "import utils.IO, utils.onnx_runtime, classes.Config; print('compute core OK')"
+            "import utils.IO, utils.onnx_runtime, utils.Prediction, utils.PredictWorkers, \
+                    classes.Config, winmol_batch; print('compute core + CLI OK')"
           docker run --rm "$IMG" --help > /dev/null && echo "CLI OK"
           docker run --rm --entrypoint python "$IMG" -c \
             "import onnxruntime as o; ps=o.get_available_providers(); print('providers:', ps); \
              assert 'CUDAExecutionProvider' in ps, 'GPU build missing CUDA provider'"
+          # The one that actually matters: can the provider's deps be loaded?
+          docker run --rm --entrypoint python "$IMG" -c \
+            "import ctypes; \
+             [ctypes.CDLL(n) for n in ('libcublasLt.so.12','libcublas.so.12','libcudnn.so.9')]; \
+             print('CUDA runtime libraries resolve')"
+          # And that onnxruntime's own CUDA provider .so links cleanly.
+          docker run --rm --entrypoint python "$IMG" -c \
+            "import ctypes, glob, onnxruntime, os; \
+             so = glob.glob(os.path.join(os.path.dirname(onnxruntime.__file__), \
+                            'capi', 'libonnxruntime_providers_cuda.so'))[0]; \
+             ctypes.CDLL(so); print('CUDA provider library links:', os.path.basename(so))"
 
       - name: Summary
         if: always()
