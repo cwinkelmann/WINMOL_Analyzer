@@ -43,6 +43,89 @@ gh release download models-onnx-v1 --repo cwinkelmann/WINMOL_Analyzer --dir ./mo
 
 `WINMOL_MODEL_DIR` is preset to `/models`; `--model-dir` overrides it.
 
+## Running it on a remote machine
+
+The image is published to GHCR **only on a tag push or a manual run** — pull
+request builds deliberately do not push, so a broken Dockerfile fails in review
+without publishing anything. If `docker pull` reports *not found*, nothing has
+been published yet. Publish one with:
+
+```bash
+# from anywhere with gh installed
+gh workflow run "GPU image" --repo cwinkelmann/WINMOL_Analyzer --ref <branch>
+# → ghcr.io/cwinkelmann/winmol-analyzer-gpu:sha-<short>
+```
+
+Then on the GPU machine:
+
+```bash
+# GHCR needs auth even for public images when pulling by digest/private pkg.
+echo "$GITHUB_TOKEN" | docker login ghcr.io -u <user> --password-stdin
+
+docker pull ghcr.io/cwinkelmann/winmol-analyzer-gpu:latest
+
+mkdir -p models input output
+gh release download models-onnx-v1 --repo cwinkelmann/WINMOL_Analyzer --dir models
+cp /path/to/ortho.tif input/
+
+docker run --rm --gpus all \
+  -v "$PWD/models:/models:ro" \
+  -v "$PWD/input:/input:ro" \
+  -v "$PWD/output:/output" \
+  ghcr.io/cwinkelmann/winmol-analyzer-gpu:latest General
+```
+
+Prerequisites on the host: an NVIDIA driver and
+[`nvidia-container-toolkit`](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
+Without the toolkit, `--gpus all` fails; without it *and* without `--gpus`, the
+container silently runs on CPU.
+
+## Comparing against the old TensorFlow image
+
+`benchmark/bench_containers.py` runs two images over the same orthomosaic N
+times each and reports the median — the containerised counterpart of
+`bench_orig_vs_changed.py`, which compares git refs instead.
+
+```bash
+# build the legacy image (clones upstream, TensorFlow, models baked in)
+docker build -f Dockerfile.blackwell -t winmol-blackwell .
+
+python benchmark/bench_containers.py \
+  --old-image winmol-blackwell --old-profile legacy --old-model general \
+  --new-image ghcr.io/cwinkelmann/winmol-analyzer-gpu:latest \
+  --new-profile gpu --new-model General \
+  --ortho /data/20220212_Barnekow_4.tiff \
+  --models /data/models \
+  --outdir benchmark/out/containers --repeats 3
+```
+
+The two images have **different interfaces**, which is why each side takes a
+profile:
+
+| | legacy | gpu |
+|---|---|---|
+| models | baked into the image | mounted at `/models` |
+| input/output | `<workdir>/standalone/{input,output}` | `/input`, `/output` |
+| entrypoint | `python -u` (script name passed) | `python -u winmol_batch.py` |
+| model name | `general` (lowercase, upstream) | `General` |
+
+Both sides run the **same weights** — `General.onnx` was converted from the
+GenDS `.hdf5` at 0.0000 % binary-mask disagreement — so any difference in stem
+count or volume is the pipeline, not the model.
+
+**Read the result carefully.** Wall time here is end-to-end old-stack versus
+new-stack: it includes TensorFlow → onnxruntime as well as the pipeline work,
+which is what a user experiences after upgrading, but is *not* an isolated
+measure of the pipeline changes. And check the `stems`/`deterministic` columns
+before the timing — the old stack has no `PYTHONHASHSEED` guard, so its stem
+count is expected to vary between runs while the new one should not.
+
+For reference, the macOS (CPU/CoreML) result on the same orthomosaic was
+**793 s → 67.8 s, 449 → 484 stems**, with the old side returning three
+different stem counts from three identical runs. The GPU ratio will differ:
+inference shrinks dramatically while the CPU-bound vector phase does not, so
+the profile changes shape, not just scale.
+
 ## Verify the GPU is actually being used
 
 **Do this before trusting any timing.** onnxruntime falls back to CPU
