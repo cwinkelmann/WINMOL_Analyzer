@@ -23,3 +23,19 @@ def test_find_segments_empty_mask_yields_no_parts(stem_map, pipeline_config):
     empty = np.zeros_like(pred)
     parts = Skel.find_segments(empty, pipeline_config, profile)
     assert len(parts) == 0
+
+
+def test_neighbors_from_bytes_matches_get_neighbors():
+    """The bytes-snapshot scan used by the trace walks must return exactly
+    what get_neighbors returns, in the same order, for every pixel
+    (including corners and edges)."""
+    import numpy as np
+    rng = np.random.default_rng(42)
+    skel = rng.random((13, 17)) < 0.4
+    skel = np.ascontiguousarray(skel)
+    h, w = skel.shape
+    flat = skel.tobytes()
+    for x in range(h):
+        for y in range(w):
+            assert Skel._neighbors_from_bytes(x, y, flat, h, w) == \
+                Skel.get_neighbors(x, y, skel)

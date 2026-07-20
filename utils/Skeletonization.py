@@ -233,9 +233,27 @@ def _build_part_from_path(path: List[Tuple[int, int]], min_length: int):
     return Part(start, stop, path, l_bound, u_bound)
 
 
-def _trace_chain(start: Tuple[int, int], neighbor:
-                 Tuple[int, int], skel: np.ndarray, node_set:
-                 set, visited_edges: set) -> List[Tuple[int, int]]:
+def _neighbors_from_bytes(x: int, y: int, flat: bytes, h: int,
+                          w: int) -> List[Tuple[int, int]]:
+    """get_neighbors against a C-order bytes snapshot of the skeleton.
+
+    The trace phase never mutates the skeleton, so find_skeleton_segments
+    freezes it once via tobytes(); indexing bytes yields a plain int with
+    none of numpy's per-element dispatch cost. Same offset scan order as
+    get_neighbors, so the returned neighbour order is unchanged.
+    """
+    neighbors = []
+    for dx, dy in _NEIGHBOR_OFFSETS:
+        nx = x + dx
+        ny = y + dy
+        if 0 <= nx < h and 0 <= ny < w and flat[nx * w + ny]:
+            neighbors.append((nx, ny))
+    return neighbors
+
+
+def _trace_chain(start: Tuple[int, int], neighbor: Tuple[int, int],
+                 flat: bytes, h: int, w: int, node_set: set,
+                 visited_edges: set) -> List[Tuple[int, int]]:
 
     path = [start, neighbor]
     visited_edges.add(_edge_key(start, neighbor))
@@ -245,14 +263,30 @@ def _trace_chain(start: Tuple[int, int], neighbor:
     while True:
         if curr in node_set and curr != start:
             break
-        nbrs = get_neighbors(curr[0], curr[1], skel)
-        nxts = [n for n in nbrs if n != prev]
-        if len(nxts) == 0:
+        # Inlined neighbour scan: nxt is the FIRST neighbour != prev in
+        # offset order (== nxts[0] of the old list build); a second one
+        # makes the interior ambiguous and stops the chain, exactly like
+        # the old len(nxts) > 1 test.
+        x, y = curr
+        nxt = None
+        ambiguous = False
+        for dx, dy in _NEIGHBOR_OFFSETS:
+            nx = x + dx
+            ny = y + dy
+            if 0 <= nx < h and 0 <= ny < w and flat[nx * w + ny]:
+                cand = (nx, ny)
+                if cand == prev:
+                    continue
+                if nxt is None:
+                    nxt = cand
+                else:
+                    ambiguous = True
+                    break
+        if nxt is None:
             break
-        if len(nxts) > 1:
+        if ambiguous:
             # ambiguous interior -> stop chain here
             break
-        nxt = nxts[0]
         ek = _edge_key(curr, nxt)
         if ek in visited_edges:
             break
@@ -265,10 +299,10 @@ def _trace_chain(start: Tuple[int, int], neighbor:
     return path
 
 
-def _trace_loop(seed: Tuple[int, int], skel:
-                np.ndarray, visited_edges: set) -> List[Tuple[int, int]]:
+def _trace_loop(seed: Tuple[int, int], flat: bytes, h: int, w: int,
+                visited_edges: set) -> List[Tuple[int, int]]:
 
-    nbrs = get_neighbors(seed[0], seed[1], skel)
+    nbrs = _neighbors_from_bytes(seed[0], seed[1], flat, h, w)
     if not nbrs:
         return []
     start = seed
@@ -278,11 +312,19 @@ def _trace_loop(seed: Tuple[int, int], skel:
     path = [start, curr]
 
     while True:
-        nbrs = get_neighbors(curr[0], curr[1], skel)
-        nxts = [n for n in nbrs if n != prev]
-        if not nxts:
+        # First neighbour != prev in offset order (== nxts[0] before).
+        x, y = curr
+        nxt = None
+        for dx, dy in _NEIGHBOR_OFFSETS:
+            nx = x + dx
+            ny = y + dy
+            if 0 <= nx < h and 0 <= ny < w and flat[nx * w + ny]:
+                cand = (nx, ny)
+                if cand != prev:
+                    nxt = cand
+                    break
+        if nxt is None:
             break
-        nxt = nxts[0]
         ek = _edge_key(curr, nxt)
         if ek in visited_edges:
             break
@@ -310,7 +352,7 @@ def find_skeleton_segments(
     print("Number of end nodes", len(end_nodes))
     print("Minimum length in pixel: ", min_length)
 
-    skel_bool = np.asarray(skel, dtype=bool)
+    skel_bool = np.ascontiguousarray(np.asarray(skel, dtype=bool))
     out_skel = np.zeros_like(skel_bool, dtype=bool)
     visited_edges = set()
     parts = []
@@ -320,13 +362,20 @@ def find_skeleton_segments(
     node_coords = [tuple(map(int, p)) for p in np.argwhere(node_mask)]
     node_set = set(node_coords)
 
+    # The trace phase reads the skeleton but never writes it: freeze it
+    # once as C-order bytes so the walks index plain ints instead of
+    # paying numpy scalar dispatch per pixel probe.
+    height, width = skel_bool.shape
+    flat = skel_bool.tobytes()
+
     for node in node_coords:
-        nbrs = get_neighbors(node[0], node[1], skel_bool)
+        nbrs = _neighbors_from_bytes(node[0], node[1], flat, height, width)
         for nb in nbrs:
             ek = _edge_key(node, nb)
             if ek in visited_edges:
                 continue
-            path = _trace_chain(node, nb, skel_bool, node_set, visited_edges)
+            path = _trace_chain(node, nb, flat, height, width,
+                                node_set, visited_edges)
             part = _build_part_from_path(path, min_length)
             if part is not None:
                 parts.append(part)
@@ -339,7 +388,7 @@ def find_skeleton_segments(
     for seed in remaining:
         if out_skel[seed]:
             continue
-        path = _trace_loop(seed, skel_bool, visited_edges)
+        path = _trace_loop(seed, flat, height, width, visited_edges)
         part = _build_part_from_path(path, min_length)
         if part is not None:
             parts.append(part)
