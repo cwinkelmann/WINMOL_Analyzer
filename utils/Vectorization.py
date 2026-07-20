@@ -105,12 +105,22 @@ def _remove_duplicates_against_base(
         return remaining, 0
     base = cycle_stems[base_idx]
     buffer_geom = base.path.buffer(0.3)
+    # Bounding-box prefilter (the counterpart of remove_duplicates'
+    # STRtree, without building a tree per merge): a geometry contained
+    # in the buffer necessarily has its bbox inside the buffer's bbox,
+    # so skipping the others cannot change the removed set.
+    minx, miny, maxx, maxy = buffer_geom.bounds
     to_remove = set()
     for idx in remaining:
         if idx == base_idx:
             continue
         try:
-            if buffer_geom.contains(cycle_stems[idx].path):
+            path = cycle_stems[idx].path
+            p_minx, p_miny, p_maxx, p_maxy = path.bounds
+            if (p_minx < minx or p_miny < miny
+                    or p_maxx > maxx or p_maxy > maxy):
+                continue
+            if buffer_geom.contains(path):
                 to_remove.add(idx)
         except Exception:
             continue
