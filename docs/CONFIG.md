@@ -31,6 +31,12 @@ plan.vector_inner_workers`. So the `cpu_workers 1` in the second block means
 `vector_tile_workers` to see the real parallelism: **4 tiles × 1 inner = 4
 processes**.
 
+Tile and inner workers COMPOSE: the planner picks `vector_tile_workers`
+(capped by `max_vector_tile_workers` and the estimated vector tile count,
+printed as `est_vector_tiles`) and gives each tile worker
+`cpu_workers // vector_tile_workers` inner workers, so
+`vector_tile_workers * vector_inner_workers <= cpu_workers` always holds.
+
 ## What is actually settable
 
 **Critical:** `cpu_workers` and `gpu_workers` are **outputs, not inputs**. The
@@ -44,7 +50,7 @@ below instead.
 | `max_gpu_workers` | 8 | Ceiling on GPU worker processes (one per GPU). |
 | `single_gpu_cpu_workers` | 24 | CPU workers requested when 1 GPU is present; clamped by `max_cpu_workers`. |
 | `multi_gpu_cpu_workers` | 48 | Same for >1 GPU. With the default ceiling of 32 this **never takes effect**. |
-| `max_vector_tile_workers` | 4 | Ceiling on tiles vectorised in parallel. The vector phase is ~73 % of a run, so this caps the slowest stage. |
+| `max_vector_tile_workers` | 4 | Ceiling on tiles vectorised in parallel. The vector phase is ~73 % of a run, so this caps the slowest stage. Remaining CPU budget becomes inner workers per tile (they compose). |
 | `prediction_batch_gpu` / `_multi_gpu` / `_max_gpu` | 4 / 12 / 16 | Tiles per inference batch. |
 | `prediction_producer_workers_*` | 1 / 6 / 6 | Threads reading + preparing tiles to feed the GPU. |
 | `tile_inner_px` | 4096 | Vector tile size. **Changes results** (measured) — see the sweep. Bigger = fewer seams, more RAM per worker; smaller = proportionally more halo recomputation. |
