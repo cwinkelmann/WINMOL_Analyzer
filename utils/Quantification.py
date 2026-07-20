@@ -137,7 +137,11 @@ def get_diameters(stems: List[Stem], pred, profile, config=None):
                 except Exception as error:
                     error_callback(error)
     else:
-        mask = None
+        # mask=foreground: shapes() then never polygonizes the ~90%
+        # background, which the raster_val == 1 filter below discarded
+        # anyway. Foreground polygons (holes included) are unchanged and
+        # calc_d takes an order-insensitive max over them.
+        mask = pred_bin.astype(bool)
         pred_shapes_ = (
             {'properties': {'raster_val': value}, 'geometry': geom}
             for geom, value in rasterio.features.shapes(
