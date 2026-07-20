@@ -1,6 +1,13 @@
 class Config(object):
     # execution / backend selection
     prediction_backend = "auto"          # auto | cpu | single_gpu | multi_gpu
+    # Vector phase strategy: 'tiled' cuts the stem map into tiles and merges
+    # (constant memory, but seam handling can split stems); 'untiled' runs the
+    # legacy whole-raster chain (reference-correct output, needs the full stem
+    # map in RAM); 'auto' picks 'untiled' only when the planner estimates the
+    # stem map comfortably fits in RAM (see ExecutionPlan._untiled_fits_in_ram)
+    # and falls back to 'tiled' when in doubt.
+    vector_processing = "auto"           # auto | tiled | untiled
 
     # tiled stream production pipeline
     tile_inner_px = 4096
