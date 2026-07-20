@@ -18,6 +18,7 @@ from shapely.geometry import LineString, Point
 
 from classes.Stem import Stem
 from classes.Timer import Timer
+from utils import GpuDispatch
 from utils.Geometry import create_vector
 
 # System epsilon
@@ -119,23 +120,9 @@ def get_diameters(stems: List[Stem], pred, profile, config=None):
     workers = min(_worker_count(config), max(len(stems), 1))
 
     if diameter_method == 'edt':
-        edt_map = _distance_transform_m(pred_bin, profile)
-        if workers <= 1 or len(stems) <= 1:
-            for stem in stems:
-                try:
-                    return_callback(
-                        calc_v_d_edt(stem, edt_map, profile, config=config))
-                except Exception as error:
-                    error_callback(error)
-        else:
-            # EDT array pickling can be expensive;
-            #  default to serial unless many stems
-            for stem in stems:
-                try:
-                    return_callback(
-                        calc_v_d_edt(stem, edt_map, profile, config=config))
-                except Exception as error:
-                    error_callback(error)
+        _get_diameters_edt(
+            stems, pred_bin, profile, config,
+            return_callback, error_callback)
     else:
         mask = None
         pred_shapes_ = (
@@ -175,6 +162,38 @@ def get_diameters(stems: List[Stem], pred, profile, config=None):
 
     print(diam_count, " measurements of diameters where conducted")
     return measured_stems
+
+
+def _get_diameters_edt(stems, pred_bin, profile, config,
+                       return_callback, error_callback):
+    """EDT branch of get_diameters: GPU when dispatched, scipy otherwise.
+
+    The GPU path (utils/GpuDispatch.py) is gated behind the user-set
+    diameter_method='edt' switch plus edt_backend, and any GPU failure
+    falls back to the unchanged scipy path at runtime.
+    """
+    backend, _reason = GpuDispatch.resolve_edt_backend(config)
+    if backend == 'gpu':
+        try:
+            for stem in _calc_v_d_edt_gpu_batched(
+                    stems, pred_bin, profile, config=config):
+                return_callback(stem)
+            return
+        except Exception as error:
+            print(
+                f'GPU EDT failed ({type(error).__name__}: {error}); '
+                f'falling back to scipy CPU EDT',
+                flush=True,
+            )
+
+    edt_map = _distance_transform_m(pred_bin, profile)
+    # EDT array pickling across processes is expensive; stay serial.
+    for stem in stems:
+        try:
+            return_callback(
+                calc_v_d_edt(stem, edt_map, profile, config=config))
+        except Exception as error:
+            error_callback(error)
 
 
 def quantify_stem(stem: Stem):
@@ -310,6 +329,74 @@ def calc_v_d_edt(stem, edt_map, profile, config=None):
         stem.vector.append(_measurement_vector(xy, normal, half_len))
         stem.segment_diameter_list.append(diameter)
     return stem
+
+
+def _gather_node_rowcols(stems, profile):
+    """All node coords of all stems -> (rows, cols, counts).
+
+    ONE (N, 2) coordinate array and ONE vectorized inverse-affine
+    application. Exactly replicates the per-node ``_xy_to_rowcol``
+    semantics: identical float ops in identical order, and ``np.rint``
+    is the same round-half-to-even that ``int(round())`` applies.
+    """
+    counts = [len(stem.path.coords) for stem in stems]
+    coords = np.concatenate(
+        [np.asarray(stem.path.coords, dtype=np.float64) for stem in stems])
+    inv = ~profile['transform']
+    cols, rows = inv * (coords[:, 0], coords[:, 1])
+    rows = np.rint(rows).astype(np.int64)
+    cols = np.rint(cols).astype(np.int64)
+    return rows, cols, counts
+
+
+def _calc_v_d_edt_gpu_batched(stems, pred_bin, profile, config=None):
+    """GPU EDT diameters for ALL stems of a tile in one shot.
+
+    One EDT on the device, one batched gather, one D2H copy of N radii —
+    no per-node GPU calls. Per-node semantics match ``calc_v_d_edt``:
+    out-of-bounds nodes -> radius 0.0, ``edt_clip_max_m`` clip, and
+    half_len = max(diameter_vector_half_length_m, radius).
+    """
+    if not stems:
+        return []
+    px, py = _pixel_size(profile)
+    rows, cols, counts = _gather_node_rowcols(stems, profile)
+    h, w = pred_bin.shape
+    in_bounds = (rows >= 0) & (rows < h) & (cols >= 0) & (cols < w)
+    radii = np.zeros(rows.shape[0], dtype=np.float64)
+    if bool(in_bounds.any()):
+        gathered = GpuDispatch.edt_gather(
+            pred_bin.astype(bool),
+            (py, px),
+            rows[in_bounds],
+            cols[in_bounds],
+        )
+        clip_max = getattr(config, 'edt_clip_max_m', None) \
+            if config is not None else None
+        if clip_max is not None:
+            gathered = np.minimum(gathered, float(clip_max))
+        radii[in_bounds] = gathered
+
+    default_half = \
+        float(getattr(config, 'diameter_vector_half_length_m', 1.0)) \
+        if config is not None else 1.0
+    out = []
+    pos = 0
+    for stem, count in zip(stems, counts):
+        coords = list(stem.path.coords)
+        stem.vector = []
+        stem.segment_diameter_list = []
+        for i in range(count):
+            radius = float(radii[pos + i])
+            diameter = max(0.0, 2.0 * radius)
+            normal = _local_normal(coords, i)
+            half_len = max(default_half, radius)
+            stem.vector.append(_measurement_vector(coords[i], normal,
+                                                   half_len))
+            stem.segment_diameter_list.append(diameter)
+        pos += count
+        out.append(stem)
+    return out
 
 
 # Backward-compatible name

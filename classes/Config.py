@@ -81,6 +81,11 @@ class Config(object):
     diameter_method = "contour"         # contour | edt
     diameter_vector_half_length_m = 1.0
     edt_clip_max_m = None                # optional clip for extreme EDT radii
+    # EDT compute backend, only consulted when diameter_method='edt':
+    # auto = CuPy/CUDA when available and process-safe, else scipy;
+    # cpu = always scipy; gpu = prefer CuPy, still falls back to scipy
+    # with a warning when unavailable. Performance-only knob.
+    edt_backend = "auto"                 # auto | cpu | gpu
 
     def __init__(self):
         pass

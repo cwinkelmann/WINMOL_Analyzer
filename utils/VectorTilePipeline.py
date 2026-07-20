@@ -10,6 +10,7 @@ import time
 import numpy as np
 
 from classes.Config import Config
+from utils import GpuDispatch
 from utils.IO import (
     load_stem_map,
     write_all_layers_to_gpkg,
@@ -18,6 +19,22 @@ from utils.IO import (
 import utils.Quantification as Quant
 import utils.Skeletonization as Skel
 import utils.Vectorization as Vec
+
+
+def _tile_pool_plan(config):
+    """Decide how the parallel tile pool must be created.
+
+    Returns (mp_context, use_gpu_edt). Plain ``mp`` (fork on Linux) is
+    the unchanged default. When the parent resolves GPU EDT as active
+    (diameter_method='edt' + CuPy/CUDA usable), the pool MUST use the
+    spawn context: on Linux fork()ed children inherit the CUDA state that
+    TF/onnxruntime initialized in the parent during prediction, and CUDA
+    cannot be re-initialized after fork. Spawn workers start clean and
+    are marked CUDA-safe via the GpuDispatch initializer.
+    """
+    if GpuDispatch.gpu_edt_wanted(config):
+        return mp.get_context('spawn'), True
+    return mp, False
 
 
 def _clone_config(config, **updates):
@@ -492,7 +509,16 @@ def process_prediction_tiles(
         )
         return results
 
-    with mp.Pool(tile_workers) as pool:
+    ctx, use_gpu_edt = _tile_pool_plan(config)
+    pool_kwargs = {}
+    if use_gpu_edt:
+        # One cross-process lock: at most one EDT workspace on the GPU
+        # at a time, shared with TF's retained memory pool.
+        pool_kwargs = dict(
+            initializer=GpuDispatch.mark_spawn_worker,
+            initargs=(ctx.Lock(),),
+        )
+    with ctx.Pool(tile_workers, **pool_kwargs) as pool:
         for idx, result in enumerate(
             pool.imap_unordered(_process_prediction_tile_star, tasks),
             start=1,
