@@ -40,6 +40,7 @@ below instead.
 
 | Key | Default | Meaning |
 |---|---|---|
+| `vector_processing` | auto | Vector-phase strategy: `tiled`, `untiled`, or `auto`. See the section below. |
 | `max_cpu_workers` | 32 | Hard ceiling on CPU workers, applied as `min(this, cores-1)`. **The main lever on a many-core box.** |
 | `max_gpu_workers` | 8 | Ceiling on GPU worker processes (one per GPU). |
 | `single_gpu_cpu_workers` | 24 | CPU workers requested when 1 GPU is present; clamped by `max_cpu_workers`. |
@@ -55,6 +56,30 @@ below instead.
 | `min_length` | 2.0 | Shortest stem kept (m). Also a results-changing knob. |
 | `measuring_point_spacing_m` | 0.5 | Diameter sampling interval along a stem. |
 | `diameter_method` | contour | `contour` or `edt`. |
+
+## `vector_processing` — tiled vs. un-tiled vector phase
+
+The tiled vector path does not reproduce the legacy whole-raster results:
+seam-split stems can survive the edge-buffer dedup and the order-sensitive
+`connect_stems` cascades (fixture: 60 vs 58 stems; full ortho: 755 vs 742).
+The un-tiled chain is the reference-correct output and, when the raster fits
+in RAM, ~2x faster (measured 64.9 s vs 120.3 s on a 14624x10088 stem map).
+
+- `untiled` — always run the legacy whole-raster chain
+  (`Skel.find_segments` → … → `Quant.quantify_stems`) and write the same
+  GeoPackage contract as the tiled merge (`stems`/`nodes`/`vectors` layers,
+  identical schema).
+- `tiled` — always tile + merge (constant memory; the pre-existing behavior).
+- `auto` (default) — pick `untiled` only when it is clearly safe:
+  estimated stem-map working set (prediction-grid pixels x ~48 bytes/pixel,
+  covering the uint8 map + skeletonize/labels/EDT copies with a 2x margin)
+  is at most **50 % of detected RAM**. Unknown RAM or a degenerate raster
+  falls back to `tiled`. Heuristic in
+  `classes/ExecutionPlan.py::_untiled_fits_in_ram`.
+
+On the golden fixture both paths produce byte-identical stem geometry
+(58 stems, same order-independent WKB hash), because the default
+`tile_inner_px=4096` puts the whole fixture in one tile.
 
 ## The GPU count is NOT configurable
 
