@@ -1,0 +1,33 @@
+# BuildKit picks this up automatically for docker/gpu/Dockerfile, so it does not
+# affect the CI image or any other build.
+#
+# Without it, `COPY . /opt/winmol` would ship the model files (118 MB each,
+# 475 MB for all four), the full git history, and any local orthomosaics — into
+# an image whose entire point is that models are MOUNTED, not baked.
+
+.git
+.github
+**/__pycache__
+**/*.pyc
+
+# Models: mounted at /models, never baked in.
+standalone/model
+standalone/model_onnx
+models
+
+# Local data and results.
+standalone/input
+standalone/output
+standalone/pred
+benchmark/out
+pytest-of-*
+*.gpkg
+*.tif
+*.tiff
+
+# Not needed at runtime.
+docs
+documentation
+tests/fixtures
+winmol_venv
+*.zip
