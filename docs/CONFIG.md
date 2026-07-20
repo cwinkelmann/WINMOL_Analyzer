@@ -55,6 +55,35 @@ below instead.
 | `min_length` | 2.0 | Shortest stem kept (m). Also a results-changing knob. |
 | `measuring_point_spacing_m` | 0.5 | Diameter sampling interval along a stem. |
 | `diameter_method` | contour | `contour` or `edt`. |
+| `edt_backend` | auto | Compute backend for the EDT path only: `auto` / `cpu` / `gpu`. Performance-only — see the GPU EDT section. |
+
+## GPU EDT (only when `diameter_method='edt'`)
+
+`edt_backend` selects how the distance transform inside the **edt** diameter
+path is computed: `auto` uses CuPy/CUDA when available (Linux + CUDA 12,
+`requirements/gpu-edt.txt`), `cpu` forces scipy, `gpu` prefers CuPy but still
+falls back to scipy with a warning. It never changes *which* diameters are
+defined — that is `diameter_method`, which stays a **results-changing**,
+user-set switch with `contour` as the default on every platform.
+
+Honest framing of the win: switching `contour` -> `edt` is where almost all
+of the quantify-stage speedup comes from, and that switch changes results
+(volumes differ; geometry does not). Within the edt method the GPU replaces
+a scipy EDT of a few hundred ms–seconds per tile plus per-node lookups with
+one device EDT + one batched gather + one D2H copy — a modest additional
+win that only pays on dense many-tile rasters.
+
+Safety plumbing (`utils/GpuDispatch.py`): CUDA cannot be re-initialized in a
+fork()ed child after TF/onnxruntime touched it in the parent, so when GPU
+EDT is active the vector tile pool switches to the **spawn** context and
+workers are marked CUDA-safe; a cross-process lock serializes EDT so at most
+one GPU workspace exists at a time next to TF's retained memory pool, and
+the CuPy pool is freed after every tile. In any unmarked child the dispatch
+resolves to scipy automatically.
+
+Validate on a CUDA box with `python benchmark/gpu_edt_parity.py` — it checks
+cupyx-vs-scipy EDT and full quantify parity (`float64_distances=True` is
+documented by CuPy to match SciPy) and reports timings.
 
 ## The GPU count is NOT configurable
 
@@ -129,7 +158,10 @@ machine. Measure it on the target hardware before adopting anything.
 Performance-only — safe to tune, output must not move:
 `max_cpu_workers`, `max_gpu_workers`, `*_cpu_workers`,
 `max_vector_tile_workers`, `prediction_batch_*`, `prediction_producer_*`,
-`producer_queue_batches`, `progress_interval_s*`, `compress_output`.
+`producer_queue_batches`, `progress_interval_s*`, `compress_output`,
+`edt_backend` (backend only — `diameter_method` itself stays
+results-changing; confirm GPU-vs-CPU parity with
+`benchmark/gpu_edt_parity.py` on the CUDA box).
 
 **Changes results** — the golden fixtures pin these, so a change invalidates
 comparisons against earlier runs: `stem_binary_threshold`, `min_length`,
