@@ -141,15 +141,13 @@ def remove_dense_skeleton_nodes(skel: np.ndarray) -> Tuple[ndarray, int]:
         np.pad(skel, 1),
         np.ones((2, 2))
     )[1:-1, 1:-1]
-    labeled_array, num_features = scipy.ndimage.measurements.label(dense_nodes)
-    centers = scipy.ndimage.measurements.center_of_mass(
-        dense_nodes,
-        labeled_array, [*range(1, num_features + 1)]
-    )
-    count = len(centers)
+    # Only the number of dense regions is needed; the old center_of_mass
+    # call computed one centroid per region (an O(image) weighted scan)
+    # just to take len() of the result, which equals num_features.
+    _, num_features = scipy.ndimage.measurements.label(dense_nodes)
 
     skel[np.where(dense_nodes.__eq__(True))] = False
-    return skel, count
+    return skel, int(num_features)
 
 
 def find_skeleton_nodes(
