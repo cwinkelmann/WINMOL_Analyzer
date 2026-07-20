@@ -16,7 +16,11 @@ from typing import Dict, List, Optional
 
 DEFAULT_INPUT_FOLDER = "./standalone/input"
 DEFAULT_OUTPUT_FOLDER = "./standalone/output"
-DEFAULT_MODEL_DIR = "./standalone/model"
+# config.json now names .onnx files, which live in standalone/model_onnx (where
+# scripts/convert_models_to_onnx.py writes them and every test looks).
+# standalone/model holds the legacy Keras .hdf5 originals, so the old default
+# pointed at a directory that no longer contains what config.json describes.
+DEFAULT_MODEL_DIR = "./standalone/model_onnx"
 DEFAULT_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 
 
@@ -105,6 +109,9 @@ def merge_results(
 
 
 def main(argv: List[str]) -> int:
+    # Only the KEYS are needed here (for `choices`), and those come from
+    # config.json, not from the model directory — so the default dir is fine
+    # for building the parser even when --model-dir overrides it below.
     model_paths = load_model_paths()
 
     parser = argparse.ArgumentParser(
@@ -130,6 +137,16 @@ def main(argv: List[str]) -> int:
     )
 
     parser.add_argument(
+        "--model-dir",
+        default=os.environ.get("WINMOL_MODEL_DIR", DEFAULT_MODEL_DIR),
+        help=(
+            "Directory holding the model files named in config.json "
+            f"(default: $WINMOL_MODEL_DIR or {DEFAULT_MODEL_DIR}). Set this "
+            "when the models live elsewhere — e.g. a directory mounted into a "
+            "container."
+        ),
+    )
+    parser.add_argument(
         "--merge",
         action="store_true",
         help=(
@@ -154,12 +171,17 @@ def main(argv: List[str]) -> int:
 
     args = parser.parse_args(argv)
 
+    # Re-resolve against the chosen directory now that --model-dir is known.
+    model_paths = load_model_paths(model_dir=args.model_dir)
     model_path = model_paths[args.model]
     if not os.path.exists(model_path):
         print(
-            "ERROR: Model file not found: "
-            f"{model_path}. Did you download models into standalone/model?\n"
-            "Models should be downloaded automatically during build."
+            f"ERROR: Model file not found: {model_path}\n"
+            f"Looked in: {args.model_dir}\n"
+            "Point --model-dir (or $WINMOL_MODEL_DIR) at the directory holding "
+            "the models named in config.json, or fetch them with:\n"
+            "  gh release download models-onnx-v1 "
+            "--repo cwinkelmann/WINMOL_Analyzer --dir <dir>"
         )
         return 2
 
