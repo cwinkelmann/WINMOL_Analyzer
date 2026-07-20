@@ -47,7 +47,7 @@ below instead.
 | `max_vector_tile_workers` | 4 | Ceiling on tiles vectorised in parallel. The vector phase is ~73 % of a run, so this caps the slowest stage. |
 | `prediction_batch_gpu` / `_multi_gpu` / `_max_gpu` | 4 / 12 / 16 | Tiles per inference batch. |
 | `prediction_producer_workers_*` | 1 / 6 / 6 | Threads reading + preparing tiles to feed the GPU. |
-| `tile_inner_px` | 4096 | Vector tile size. Bigger = fewer seams, more RAM per worker. |
+| `tile_inner_px` | 4096 | Vector tile size. **Changes results** (measured) — see the sweep. Bigger = fewer seams, more RAM per worker; smaller = proportionally more halo recomputation. |
 | `tile_overlap_m` | 12.0 | Halo between vector tiles; also the merge de-duplication buffer. |
 | `gpu_memory_fraction` | 0.9 | Fraction of GPU memory a worker may use. |
 | `prediction_batch_autotune` | False | Off because it re-runs every prediction, costing minutes on CoreML/Metal for ~1 % throughput. |
@@ -134,7 +134,12 @@ Performance-only — safe to tune, output must not move:
 **Changes results** — the golden fixtures pin these, so a change invalidates
 comparisons against earlier runs: `stem_binary_threshold`, `min_length`,
 `max_distance`, `tolerance_angle`, `measuring_point_spacing_m`,
-`diameter_method`, `max_tree_height`, `tile_overlap_m`, `img_width`/`img_height`.
+`diameter_method`, `max_tree_height`, `tile_overlap_m`, **`tile_inner_px`**,
+`img_width`/`img_height`.
+
+`tile_inner_px` is in this group on measured evidence, not on principle: the
+sweep above produced 459 and 456 stems against a baseline of 458 purely by
+changing it. It looks like a performance knob and is not one.
 
 After tuning anything in the first group, confirm the stem count is unchanged.
 A faster run that finds a different number of stems is not a faster run.
