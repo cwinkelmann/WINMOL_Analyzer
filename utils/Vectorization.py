@@ -105,6 +105,13 @@ def _remove_duplicates_against_base(
         return remaining, 0
     base = cycle_stems[base_idx]
     buffer_geom = base.path.buffer(0.3)
+    if buffer_geom.is_empty:
+        # An empty base path (not producible by the current pipeline,
+        # every path has >= 2 coords) buffers to an empty polygon whose
+        # .bounds is (), and unpacking would ValueError. The historical
+        # per-candidate contains() loop silently matched nothing here;
+        # keep that no-op contract.
+        return remaining, 0
     # Bounding-box prefilter (the counterpart of remove_duplicates'
     # STRtree, without building a tree per merge): a geometry contained
     # in the buffer necessarily has its bbox inside the buffer's bbox,

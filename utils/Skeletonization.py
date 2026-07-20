@@ -81,6 +81,16 @@ def find_segments(pred, config, profile) -> (List[Part], List[Tuple[int]]):
         'constant',
         constant_values=False
     )
+    # Decision note: when padding < _REFINE_MARGIN (GSD coarser than
+    # ~max_tree_height/4 m/px, i.e. >= 10 m/px at the default 40 m —
+    # far beyond any real orthomosaic), coord_offset goes negative. The
+    # emitted frame coordinates stay consistent (frame = window +
+    # coord_offset maps real-tile pixel (r, c) to (r + padding,
+    # c + padding) exactly as before), but the refine windows diverge
+    # from the historical code, which produced negative slice starts
+    # (Python wraparound = effectively broken windows) in that regime.
+    # We deliberately keep the valid windows rather than clamping with
+    # max(coord_offset, 0) to reproduce the historical bug.
     coord_offset = padding - _REFINE_MARGIN
 
     pred = _as_binary_mask(pred)
@@ -94,7 +104,7 @@ def find_segments(pred, config, profile) -> (List[Part], List[Tuple[int]]):
     end_nodes, skel = get_nodes(skel)
     segments, skel = find_skeleton_segments(
         skel, end_nodes, math.floor(min_length / 4),
-        padding, config=config, coord_offset=coord_offset
+        config=config, coord_offset=coord_offset
     )
     measuring_point_spacing = math.floor(
         min(config.min_length, config.measuring_point_spacing_m) / px_size)
@@ -374,7 +384,6 @@ def find_skeleton_segments(
         skel: np.ndarray,
         end_nodes: List[Tuple[int]],
         min_length: int,
-        padding: int,
         config=None,
         coord_offset: int = 0
 ) -> (List[Part], np.ndarray):

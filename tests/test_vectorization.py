@@ -113,17 +113,46 @@ def test_score_then_build_prepends_collinear_leader():
 
 
 def test_score_connectivity_identical_stem_scores_none():
-    base = _mk_stem([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)])
-    twin = _mk_stem([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)])
+    """The stem == stems0 early-out must be the ONLY thing rejecting a
+    value-equal twin. A collinear twin is also rejected by the buffer
+    gates (start/stop 4 m apart > max_distance 3), which would let this
+    test pass with the early-out deleted. This loop-back path (>= 8
+    coords, so _stem_end_lines uses distinct segments) passes every
+    geometric gate: the control stem — identical geometry, different crs,
+    so Stem.__eq__ is False — scores a vote, while the true twin must
+    not."""
+    coords = [(0, 0), (10, 0), (0, 0.5), (1, 0.5), (2, 0.5),
+              (3, 0.5), (16, 0), (5, 0.5), (1, 0)]
+    base = _mk_stem(coords)
+    twin = _mk_stem(coords)
+    control = _mk_stem(coords)
+    control.crs = "not-the-base"
     line_start, line_stop, start_buffer, end_buffer = _vote_inputs(base)
-    assert Vec._score_connectivity(
-        base, line_start, line_stop, start_buffer, end_buffer,
-        3.0, 40.0, 5.0, twin) is None
+    args = (base, line_start, line_stop, start_buffer, end_buffer,
+            3.0, 40.0, 30.0)
 
-    changed, vote, cand, slave = Vec.calc_connectivity_votes(
-        base, line_start, line_stop, start_buffer, end_buffer,
-        3.0, 40.0, 5.0, twin)
+    # The control proves the geometric gates pass for this layout...
+    assert twin == base and control != base
+    assert Vec._score_connectivity(*args, control) is not None
+    # ...so only the identity early-out can reject the twin.
+    assert Vec._score_connectivity(*args, twin) is None
+
+    changed, vote, cand, slave = Vec.calc_connectivity_votes(*args, twin)
     assert changed is False and cand is None and slave is None
+
+
+def test_remove_duplicates_against_base_empty_path_is_noop():
+    """An empty base path (not producible by the current pipeline) must
+    be a silent no-op, as the historical per-candidate contains() loop
+    was — not a ValueError from unpacking an empty geometry's bounds."""
+    from shapely.geometry import LineString, Point
+
+    from classes.Stem import Stem
+    base = Stem(Point(0, 0), Point(0, 0), LineString(), [], [], [], [])
+    other = _mk_stem([(0, 0), (1, 0)])
+    remaining, removed = Vec._remove_duplicates_against_base(
+        [base, other], {0, 1}, 0)
+    assert remaining == {0, 1} and removed == 0
 
 
 def test_score_connectivity_rejects_far_candidate():
