@@ -85,8 +85,29 @@ def detect_gpu_count() -> int:
     return 0
 
 
+def _with_cpu_budget(overrides_json: str, cpu_budget: int) -> str:
+    """Add a max_cpu_workers budget to WINMOL_CONFIG_OVERRIDES_JSON.
+
+    An explicit user-set max_cpu_workers wins. Unparsable JSON is passed
+    through untouched — the child reports the real error.
+    """
+    raw = (overrides_json or "").strip()
+    overrides = {}
+    if raw:
+        try:
+            overrides = json.loads(raw)
+        except Exception:
+            return overrides_json
+        if not isinstance(overrides, dict):
+            return overrides_json
+    if "max_cpu_workers" not in overrides:
+        overrides["max_cpu_workers"] = int(cpu_budget)
+    return json.dumps(overrides)
+
+
 def run_winmol(input_image: str, model_path: str, output_folder: str,
-               gpu_id: Optional[int] = None) -> None:
+               gpu_id: Optional[int] = None,
+               cpu_budget: Optional[int] = None) -> None:
     base_name = os.path.splitext(os.path.basename(input_image))[0]
     output_stem_map = os.path.join(output_folder, f"{base_name}_stem_map.tif")
     output_prefix = os.path.join(output_folder, base_name)
@@ -110,6 +131,12 @@ def run_winmol(input_image: str, model_path: str, output_folder: str,
         # the well-tested path — instead of every concurrent job trying to
         # spread itself across all of them and contending.
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    if cpu_budget is not None:
+        # Each child plans against the FULL machine; with N jobs the
+        # CPU-bound vector phases would oversubscribe the cores N-fold.
+        # Give every job an equal share via the standard override knob.
+        env["WINMOL_CONFIG_OVERRIDES_JSON"] = _with_cpu_budget(
+            env.get("WINMOL_CONFIG_OVERRIDES_JSON", ""), cpu_budget)
 
     tag = f"[gpu {gpu_id}] " if gpu_id is not None else ""
     print(f"{tag}Processing {input_image} "
@@ -169,14 +196,18 @@ def process_orthos(orthos, model_path, output_folder, jobs=1):
     for i in range(jobs):
         slots.put(i % gpus if gpus else None)
 
+    cpu_budget = max(1, (os.cpu_count() or 1) // jobs)
+
     print(f"Processing {len(orthos)} orthomosaics, {jobs} at a time"
-          + (f" across {gpus} GPU(s)" if gpus else " (no GPU detected)"),
+          + (f" across {gpus} GPU(s)" if gpus else " (no GPU detected)")
+          + f" | {cpu_budget} CPU workers per job",
           flush=True)
 
     def _one(ortho):
         slot = slots.get()
         try:
-            run_winmol(ortho, model_path, output_folder, gpu_id=slot)
+            run_winmol(ortho, model_path, output_folder, gpu_id=slot,
+                       cpu_budget=cpu_budget)
             return ortho, None
         except subprocess.CalledProcessError as e:
             return ortho, str(e)
