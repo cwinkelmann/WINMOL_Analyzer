@@ -3,6 +3,90 @@
 TensorFlow-free GPU image for the analyzer: ONNX via `onnxruntime-gpu`, models
 mounted at runtime.
 
+---
+
+## Quick start: get the image onto a GPU box
+
+### 0. Make sure an image exists
+
+**The image is published only on a tag push or a manual workflow run.** Pull
+request builds deliberately do *not* push, so a green PR build means the
+Dockerfile is sound, **not** that anything was published. If `docker pull` says
+*not found*, this is why.
+
+```bash
+gh workflow run "GPU image" --repo cwinkelmann/WINMOL_Analyzer --ref <branch>
+gh run watch --repo cwinkelmann/WINMOL_Analyzer          # wait for it
+```
+
+That publishes `ghcr.io/cwinkelmann/winmol-analyzer-gpu:sha-<short>`. A tag push
+(`git tag v0.7.0 && git push --tags`) publishes `:v0.7.0` **and** `:latest`.
+
+### 1. Authenticate — new GHCR packages are PRIVATE by default
+
+A freshly published package is private, so `docker pull` fails with
+`denied`/`not found` until you either make it public or log in. Pick one:
+
+**Option A — make it public** (then no login is needed, ever):
+GitHub → your profile → *Packages* → `winmol-analyzer-gpu` → *Package settings*
+→ *Change visibility* → Public.
+
+**Option B — log in on the GPU box.** Note `GITHUB_TOKEN` only exists inside
+Actions; on a real machine you need a token with `read:packages`:
+
+```bash
+# easiest: reuse the gh CLI's token, after adding the scope
+gh auth refresh -h github.com -s read:packages
+gh auth token | docker login ghcr.io -u YOUR_GITHUB_USERNAME --password-stdin
+```
+
+Or with a classic PAT (`read:packages` scope) from
+<https://github.com/settings/tokens>:
+
+```bash
+echo "ghp_xxx" | docker login ghcr.io -u YOUR_GITHUB_USERNAME --password-stdin
+```
+
+### 2. Pull
+
+```bash
+docker pull ghcr.io/cwinkelmann/winmol-analyzer-gpu:latest
+```
+
+### 3. Check the GPU is really there — before anything else
+
+```bash
+docker run --rm --gpus all --entrypoint python \
+  ghcr.io/cwinkelmann/winmol-analyzer-gpu:latest -c \
+  "import onnxruntime as o; print(o.get_available_providers())"
+```
+
+Must print a list containing **`CUDAExecutionProvider`**. If it does not, stop
+and see *Troubleshooting* — onnxruntime falls back to CPU silently, and every
+timing you take afterwards will be wrong.
+
+If `--gpus all` itself errors, the host is missing
+[`nvidia-container-toolkit`](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
+
+### 4. Fetch models and run
+
+```bash
+mkdir -p models input output
+gh release download models-onnx-v1 --repo cwinkelmann/WINMOL_Analyzer --dir models
+cp /path/to/ortho.tif input/
+
+docker run --rm --gpus all \
+  -v "$PWD/models:/models:ro" \
+  -v "$PWD/input:/input:ro" \
+  -v "$PWD/output:/output" \
+  ghcr.io/cwinkelmann/winmol-analyzer-gpu:latest General
+```
+
+Results land in `output/`. Model names are `General`, `Beech`, `Spruce`,
+`Spruce_Deadwood` (case-insensitive).
+
+---
+
 It does **not** replace the machine-specific Dockerfiles in the repo root
 (`Dockerfile.blackwell`, `Dockerfile_carrot`, `Dockerfile_olive`,
 `Dockerfile-1`), which are kept as-is. Those predate the ONNX migration: they
@@ -42,43 +126,6 @@ gh release download models-onnx-v1 --repo cwinkelmann/WINMOL_Analyzer --dir ./mo
 ```
 
 `WINMOL_MODEL_DIR` is preset to `/models`; `--model-dir` overrides it.
-
-## Running it on a remote machine
-
-The image is published to GHCR **only on a tag push or a manual run** — pull
-request builds deliberately do not push, so a broken Dockerfile fails in review
-without publishing anything. If `docker pull` reports *not found*, nothing has
-been published yet. Publish one with:
-
-```bash
-# from anywhere with gh installed
-gh workflow run "GPU image" --repo cwinkelmann/WINMOL_Analyzer --ref <branch>
-# → ghcr.io/cwinkelmann/winmol-analyzer-gpu:sha-<short>
-```
-
-Then on the GPU machine:
-
-```bash
-# GHCR needs auth even for public images when pulling by digest/private pkg.
-echo "$GITHUB_TOKEN" | docker login ghcr.io -u <user> --password-stdin
-
-docker pull ghcr.io/cwinkelmann/winmol-analyzer-gpu:latest
-
-mkdir -p models input output
-gh release download models-onnx-v1 --repo cwinkelmann/WINMOL_Analyzer --dir models
-cp /path/to/ortho.tif input/
-
-docker run --rm --gpus all \
-  -v "$PWD/models:/models:ro" \
-  -v "$PWD/input:/input:ro" \
-  -v "$PWD/output:/output" \
-  ghcr.io/cwinkelmann/winmol-analyzer-gpu:latest General
-```
-
-Prerequisites on the host: an NVIDIA driver and
-[`nvidia-container-toolkit`](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
-Without the toolkit, `--gpus all` fails; without it *and* without `--gpus`, the
-container silently runs on CPU.
 
 ## Comparing against the old TensorFlow image
 
