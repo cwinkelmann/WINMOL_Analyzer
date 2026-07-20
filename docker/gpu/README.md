@@ -55,6 +55,28 @@ Must print a list containing **`CUDAExecutionProvider`**. If it does not, stop
 and see *Troubleshooting* — onnxruntime falls back to CPU silently, and every
 timing you take afterwards will be wrong.
 
+Confirmed working on an NVIDIA box (2026-07-20):
+
+```
+['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
+```
+
+Two things this does **not** prove. It reports what onnxruntime can *load*, not
+that a model *executed* on the GPU — kernels can still fail at session
+creation, which is the thing to watch for on Blackwell (sm_120). And it says
+nothing about correctness: do a real run and check the stem count before
+believing any timing.
+
+**TensorRT is also available.** It can beat the CUDA provider on sustained
+inference, but it builds an optimised engine on first use, which can add
+minutes of warm-up per session — quite possibly a net loss on a single
+orthomosaic. Treat it as an experiment to measure, not a default; provider
+precedence already selects CUDA on its own.
+
+```bash
+-e WINMOL_ONNX_PROVIDERS=TensorrtExecutionProvider
+```
+
 If `--gpus all` itself errors, the host is missing
 [`nvidia-container-toolkit`](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
 
