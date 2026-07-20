@@ -94,6 +94,13 @@ docker run --rm --gpus all \
   ghcr.io/cwinkelmann/winmol-analyzer-gpu:latest General
 ```
 
+The mount points come from `WINMOL_INPUT_DIR` / `WINMOL_OUTPUT_DIR` /
+`WINMOL_MODEL_DIR`, baked into the image as **ENV** rather than CMD — so
+`docker run <image> Spruce_Deadwood` keeps working. (Had they been CMD
+arguments, passing any model name would replace the whole CMD and silently drop
+them, sending the run looking in `./standalone/input`.) `--input`/`--output`
+still override.
+
 Results land in `output/`. Model names are `General`, `Beech`, `Spruce`,
 `Spruce_Deadwood` (case-insensitive).
 
