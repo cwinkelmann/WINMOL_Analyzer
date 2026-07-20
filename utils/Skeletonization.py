@@ -20,6 +20,12 @@ from utils.Geometry import ang
 # System epsilon
 epsilon = np.finfo(float).eps
 
+# refine_skeleton_segments slices a window extending 5 px beyond each
+# part's bounding box. Padding the raster by exactly this margin keeps
+# every window a plain in-bounds view (identical shape and content to the
+# old full-padding windows, whose extra area was constant False anyway).
+_REFINE_MARGIN = 5
+
 
 def _as_binary_mask(pred):
     arr = np.asarray(pred)
@@ -59,12 +65,23 @@ def find_segments(pred, config, profile) -> (List[Part], List[Tuple[int]]):
     px_size = abs(profile['transform'][0])
     min_length = math.floor((config.min_length / 4) / px_size)
     padding = int(config.max_tree_height / px_size) + 1
+    # The historical max_tree_height pad (~801 px per side at 5 cm GSD) was
+    # constant False: no raster operation ever needed the pixels, they only
+    # shifted coordinates by `padding`, which restore_geoinformation
+    # subtracts again (docs/CODE_REVIEW_2.md C-1). Pad physically by just
+    # the 5 px refine-window margin and keep the remaining
+    # (padding - _REFINE_MARGIN) as a pure coordinate offset, applied when
+    # parts are built -- emitted coordinates stay in the exact frame the
+    # old code produced, so downstream (and the coordinate-hash-driven
+    # set iteration orders) are bit-identical, while skeletonize and node
+    # finding run on 2-6x less area.
     pred = np.pad(
         pred,
-        ((padding, padding), (padding, padding)),
+        ((_REFINE_MARGIN, _REFINE_MARGIN), (_REFINE_MARGIN, _REFINE_MARGIN)),
         'constant',
         constant_values=False
     )
+    coord_offset = padding - _REFINE_MARGIN
 
     pred = _as_binary_mask(pred)
 
@@ -77,7 +94,7 @@ def find_segments(pred, config, profile) -> (List[Part], List[Tuple[int]]):
     end_nodes, skel = get_nodes(skel)
     segments, skel = find_skeleton_segments(
         skel, end_nodes, math.floor(min_length / 4),
-        padding, config=config
+        padding, config=config, coord_offset=coord_offset
     )
     measuring_point_spacing = math.floor(
         min(config.min_length, config.measuring_point_spacing_m) / px_size)
@@ -85,7 +102,7 @@ def find_segments(pred, config, profile) -> (List[Part], List[Tuple[int]]):
     segments = refine_skeleton_segments(
         segments, skel,
         measuring_point_spacing,
-        min_length, config=config
+        min_length, config=config, coord_offset=coord_offset
     )
 
     return segments
@@ -233,6 +250,24 @@ def _build_part_from_path(path: List[Tuple[int, int]], min_length: int):
     return Part(start, stop, path, l_bound, u_bound)
 
 
+def _shift_part(part: Part, off: int) -> Part:
+    """Translate a Part from array coordinates into the historical
+    full-padding frame (all coordinates + off, both axes).
+
+    Part hashes -- and with them the iteration order of the part sets that
+    drive refine and stem connection -- derive from these coordinates, so
+    the shift must happen before any set is materialized.
+    """
+    if off == 0:
+        return part
+    part.start = (part.start[0] + off, part.start[1] + off)
+    part.stop = (part.stop[0] + off, part.stop[1] + off)
+    part.path = [(r + off, c + off) for r, c in part.path]
+    part.l_bound = (part.l_bound[0] + off, part.l_bound[1] + off)
+    part.u_bound = (part.u_bound[0] + off, part.u_bound[1] + off)
+    return part
+
+
 def _neighbors_from_bytes(x: int, y: int, flat: bytes, h: int,
                           w: int) -> List[Tuple[int, int]]:
     """get_neighbors against a C-order bytes snapshot of the skeleton.
@@ -342,7 +377,8 @@ def find_skeleton_segments(
         end_nodes: List[Tuple[int]],
         min_length: int,
         padding: int,
-        config=None
+        config=None,
+        coord_offset: int = 0
 ) -> (List[Part], np.ndarray):
     t = Timer()
     t.start()
@@ -378,9 +414,9 @@ def find_skeleton_segments(
                                 node_set, visited_edges)
             part = _build_part_from_path(path, min_length)
             if part is not None:
-                parts.append(part)
                 for rr, cc in part.path:
                     out_skel[rr, cc] = True
+                parts.append(_shift_part(part, coord_offset))
 
     # handle loops or isolated remnants without degree!=2 nodes
     remaining = [tuple(map(int, p))
@@ -391,9 +427,9 @@ def find_skeleton_segments(
         path = _trace_loop(seed, flat, height, width, visited_edges)
         part = _build_part_from_path(path, min_length)
         if part is not None:
-            parts.append(part)
             for rr, cc in part.path:
                 out_skel[rr, cc] = True
+            parts.append(_shift_part(part, coord_offset))
 
     skeleton_parts = set(parts)
     print("Detected skeleton segments: ", len(skeleton_parts))
@@ -407,7 +443,8 @@ def find_skeleton_segments(
 # Find stem parts between nodes using the connectivity in the skeleton.
 def refine_skeleton_segments(parts: List[Part], skel: np.ndarray,
                              measuring_point_spacing: int, min_length: int,
-                             config=None) -> (List[Part], np.ndarray):
+                             config=None,
+                             coord_offset: int = 0) -> (List[Part], np.ndarray):
     t = Timer()
     t.start()
     split = 0
@@ -433,14 +470,21 @@ def refine_skeleton_segments(parts: List[Part], skel: np.ndarray,
     print("Initial length of skeleton: ", np.count_nonzero(skel))
     print("Number of initial skeleton segments", len(parts))
 
+    # Part bounds live in the historical full-padding frame; the skeleton
+    # array is padded by only _REFINE_MARGIN. coord_offset maps between
+    # the two: window rows/cols = frame coordinate - coord_offset. Window
+    # origin (low_bounds) stays a frame coordinate, so
+    # refine_skeleton_segment and every emitted coordinate are unchanged.
     workers = min(_worker_count(config), max(len(parts), 1))
     if workers <= 1 or len(parts) <= 1:
         for part in parts:
             low_bounds = (part.l_bound[0] - 5, part.l_bound[1] - 5)
             up_bounds = (part.u_bound[0] + 5, part.u_bound[1] + 5)
             sub_skel = skel[
-                low_bounds[0]:up_bounds[0] + 1,
-                low_bounds[1]:up_bounds[1] + 1
+                low_bounds[0] - coord_offset:
+                up_bounds[0] - coord_offset + 1,
+                low_bounds[1] - coord_offset:
+                up_bounds[1] - coord_offset + 1
             ]
             return_callback(refine_skeleton_segment(
                 part, low_bounds, up_bounds, sub_skel,
@@ -453,8 +497,10 @@ def refine_skeleton_segments(parts: List[Part], skel: np.ndarray,
                 low_bounds = (part.l_bound[0] - 5, part.l_bound[1] - 5)
                 up_bounds = (part.u_bound[0] + 5, part.u_bound[1] + 5)
                 sub_skel = skel[
-                    low_bounds[0]:up_bounds[0] + 1,
-                    low_bounds[1]:up_bounds[1] + 1
+                    low_bounds[0] - coord_offset:
+                    up_bounds[0] - coord_offset + 1,
+                    low_bounds[1] - coord_offset:
+                    up_bounds[1] - coord_offset + 1
                 ]
                 r.append(pool.apply_async(refine_skeleton_segment, args=(
                     part, low_bounds, up_bounds, sub_skel,

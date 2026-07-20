@@ -25,6 +25,38 @@ def test_find_segments_empty_mask_yields_no_parts(stem_map, pipeline_config):
     assert len(parts) == 0
 
 
+def test_find_segments_border_stem_stays_in_padded_frame(stem_map,
+                                                         pipeline_config):
+    """A stem touching the raster edge must survive find_segments and its
+    coordinates must come back in the historical full-padding frame:
+    coordinate - padding lies inside the (border-inclusive) raster.
+
+    This exercises the refine windows whose 5-px margin extends past the
+    raster into the physical safety pad."""
+    import math
+
+    import numpy as np
+
+    pred, profile = stem_map
+    h, w = pred.shape
+    mask = np.zeros_like(pred)
+    # 3-px-wide horizontal bar hugging the top edge, running from the
+    # left border into the interior
+    mask[0:3, 0:w // 2] = 1
+
+    px_size = abs(profile['transform'][0])
+    padding = int(pipeline_config.max_tree_height / px_size) + 1
+    min_len_px = math.floor((pipeline_config.min_length / 4) / px_size)
+    assert w // 2 > min_len_px, "fixture too small for the bar to survive"
+
+    parts = Skel.find_segments(mask, pipeline_config, profile)
+    assert len(parts) >= 1
+    for part in parts:
+        for r, c in [part.start, part.stop] + list(part.path):
+            assert 0 <= r - padding < h
+            assert 0 <= c - padding < w
+
+
 def test_neighbors_from_bytes_matches_get_neighbors():
     """The bytes-snapshot scan used by the trace walks must return exactly
     what get_neighbors returns, in the same order, for every pixel
