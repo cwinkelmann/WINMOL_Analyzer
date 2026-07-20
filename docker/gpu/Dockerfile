@@ -48,6 +48,44 @@ COPY requirements/geo.txt requirements/gpu.txt /tmp/req/
 RUN pip install --no-cache-dir -r /tmp/req/gpu.txt \
  && rm -rf /tmp/req
 
+# Put the pip-installed CUDA libraries on the dynamic loader path.
+#
+# onnxruntime-gpu[cuda,cudnn] drops them under site-packages/nvidia/*/lib/,
+# which ld.so does not search. Without this, onnxruntime still ADVERTISES
+# CUDAExecutionProvider — get_available_providers() only reads a list — but
+# creating it fails at runtime with:
+#
+#   Failed to load library .../libonnxruntime_providers_cuda.so with error:
+#   libcublasLt.so.12: cannot open shared object file
+#
+# and onnxruntime falls back to CPU, which looks like "the GPU is slow".
+# ldconfig is used rather than LD_LIBRARY_PATH so child processes inherit it —
+# the multi-GPU path spawns workers, and an env var set only in the parent
+# would not reliably reach them.
+RUN python - <<'PY' > /etc/ld.so.conf.d/nvidia-pip.conf \
+ && ldconfig \
+ && echo "registered CUDA library paths:" && cat /etc/ld.so.conf.d/nvidia-pip.conf
+import glob
+import os
+import site
+roots = set(site.getsitepackages() + [site.getusersitepackages()])
+seen = []
+for root in roots:
+    for d in sorted(glob.glob(os.path.join(root, "nvidia", "*", "lib"))):
+        if d not in seen:
+            seen.append(d)
+            print(d)
+PY
+
+# Fail the build if the CUDA provider's own dependencies cannot be resolved.
+# This needs no GPU: loading the shared objects only exercises the linker, so
+# it works on a CPU-only CI runner — which is precisely where the missing
+# libcublasLt would otherwise go unnoticed.
+RUN python -c "\
+import ctypes; \
+[ctypes.CDLL(n) for n in ('libcublasLt.so.12', 'libcublas.so.12', 'libcudnn.so.9')]; \
+print('CUDA runtime libraries resolve')"
+
 # The repo is COPYed from the build context, not git-cloned: the image then
 # contains the code being tested rather than whatever upstream main happens to
 # be. (The old Dockerfiles cloned StefanReder/WINMOL_Analyzer, so they could
