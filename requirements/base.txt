@@ -1,12 +1,11 @@
-Pillow==10.1.0
-Shapely==2.0.2
-geopandas==0.14.0
+# The geo stack, shared with gpu.txt …
+-r geo.txt
+# … plus the notebook/plotting extras the standalone walkthrough uses. These
+# are NOT imported by the compute path; the GPU image deliberately omits them.
 ipykernel==6.27.1
-rasterio>=1.4,<1.5
-scikit-image==0.22.0
-scipy==1.11.3
-pyogrio>=0.9
 matplotlib
 # Inference runtime: models are ONNX, loaded via utils/onnx_runtime.py.
 # No TensorFlow — it is only needed to CONVERT models (requirements/convert.txt).
+# CUDA containers use requirements/gpu.txt instead, which swaps this for
+# onnxruntime-gpu (the two cannot be co-installed).
 onnxruntime>=1.17

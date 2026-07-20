@@ -1,0 +1,22 @@
+# CUDA compute environment (docker/gpu/Dockerfile).
+#
+# Same geo stack as base.txt, but onnxruntime-gpu in place of onnxruntime —
+# they both provide the `onnxruntime` module and MUST NOT be co-installed, so
+# never combine this file with base.txt, plugin.txt or ci.txt.
+#
+# The notebook/plotting extras in base.txt (ipykernel, matplotlib) are
+# deliberately omitted: nothing on the compute path imports them, and they drag
+# in ipython, jupyter_client, pyzmq, debugpy and tornado.
+-r geo.txt
+
+# The [cuda,cudnn] extras pull the CUDA userspace in as wheels, so the image
+# does not need an nvidia/cuda base and cannot mismatch one. The host driver
+# plus nvidia-container-toolkit supply the rest.
+#
+# VERSION PINNING IS DELIBERATE AND HARDWARE-DEPENDENT. onnxruntime-gpu 1.27
+# moved its extras to CUDA 13 (nvidia-*-cu13); earlier releases use cu12. If the
+# target machine's driver is too old for CUDA 13, pin a cu12-era release here
+# instead. Blackwell (sm_120) in particular needs a recent CUDA — verify on the
+# hardware with the provider check in docker/gpu/README.md before trusting any
+# timing.
+onnxruntime-gpu[cuda,cudnn]
