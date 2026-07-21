@@ -24,23 +24,6 @@
 #################################################
 
 
-#Add iso code for any locales you want to support here (space separated)
-# default is no locales
-# LOCALES = af
-LOCALES =
-
-# If locales are enabled, set the name of the lrelease binary on your system. If
-# you have trouble compiling the translations, you may have to specify the full path to
-# lrelease
-#LRELEASE = lrelease
-#LRELEASE = lrelease-qt4
-
-
-# translation
-SOURCES = \
-	__init__.py \
-	winmol_analyzer.py winmol_analyzer_dialog.py
-
 PLUGINNAME = WINMOL_Analyzer
 
 # The plugin GUI (QGIS side) AND the compute core it shells out to: winmol_run.py
@@ -81,44 +64,32 @@ endif
 # Normally you would not need to edit below here
 #################################################
 
-HELP = help/build/html
-
 RESOURCE_SRC=$(shell grep '^ *<file' resources.qrc | sed 's@</file>@@g;s/.*>//g' | tr '\n' ' ')
 
-.PHONY: default
+.PHONY: default compile test deploy dclean derase zip package clean pep8
+
 default:
-	@echo While you can use make to build and deploy your plugin, pb_tool
-	@echo is a much better solution.
-	@echo A Python script, pb_tool provides platform independent management of
-	@echo your plugins and runs anywhere.
-	@echo You can install pb_tool using: pip install pb_tool
-	@echo See https://g-sherman.github.io/plugin_build_tool/ for info.
+	@echo "Targets:"
+	@echo "  compile  - rebuild resources.py from resources.qrc (pyrcc5)"
+	@echo "  deploy   - install the plugin into your local QGIS profile"
+	@echo "  package  - build the installable zip (scripts/build_plugin_zip.sh)"
+	@echo "  test     - run the pytest suite"
+	@echo "  pep8     - style check"
 
 compile: $(COMPILED_RESOURCE_FILES)
 
 %.py : %.qrc $(RESOURCES_SRC)
 	pyrcc5 -o $*.py  $<
 
-%.qm : %.ts
-	$(LRELEASE) $<
-
-test: compile transcompile
+# The suite is QGIS-free and runs on the standalone interpreter. PYTHONHASHSEED
+# is pinned because the golden-master fixtures depend on set-iteration order
+# (tests/conftest.py re-executes pytest otherwise).
+test:
 	@echo
 	@echo "----------------------"
 	@echo "Regression Test Suite"
 	@echo "----------------------"
-
-	@# Preceding dash means that make will continue in case of errors
-	@-export PYTHONPATH=`pwd`:$(PYTHONPATH); \
-		export QGIS_DEBUG=0; \
-		export QGIS_LOG_FILE=/dev/null; \
-		nosetests -v --with-id --with-coverage --cover-package=. \
-		3>&1 1>&2 2>&3 3>&- || true
-	@echo "----------------------"
-	@echo "If you get a 'no module named qgis.core error, try sourcing"
-	@echo "the helper script we have provided first then run make test."
-	@echo "e.g. source run-env-linux.sh <path to qgis install>; make test"
-	@echo "----------------------"
+	PYTHONHASHSEED=0 TF_USE_LEGACY_KERAS=1 python -m pytest tests/ -q
 
 deploy: compile
 	@echo
@@ -177,55 +148,12 @@ package: compile
 	@echo "------------------------------------"
 	bash scripts/build_plugin_zip.sh $(VERSION) $(PLUGINNAME).zip
 
-transup:
-	@echo
-	@echo "------------------------------------------------"
-	@echo "Updating translation files with any new strings."
-	@echo "------------------------------------------------"
-	@chmod +x scripts/update-strings.sh
-	@scripts/update-strings.sh $(LOCALES)
-
-transcompile:
-	@echo
-	@echo "----------------------------------------"
-	@echo "Compiled translation files to .qm files."
-	@echo "----------------------------------------"
-	@chmod +x scripts/compile-strings.sh
-	@scripts/compile-strings.sh $(LRELEASE) $(LOCALES)
-
-transclean:
-	@echo
-	@echo "------------------------------------"
-	@echo "Removing compiled translation files."
-	@echo "------------------------------------"
-	rm -f i18n/*.qm
-
 clean:
 	@echo
 	@echo "------------------------------------"
-	@echo "Removing uic and rcc generated files"
+	@echo "Removing rcc generated files"
 	@echo "------------------------------------"
-	rm $(COMPILED_UI_FILES) $(COMPILED_RESOURCE_FILES)
-
-doc:
-	@echo
-	@echo "------------------------------------"
-	@echo "Building documentation using sphinx."
-	@echo "------------------------------------"
-	cd help; make html
-
-pylint:
-	@echo
-	@echo "-----------------"
-	@echo "Pylint violations"
-	@echo "-----------------"
-	@pylint --reports=n --rcfile=pylintrc . || true
-	@echo
-	@echo "----------------------"
-	@echo "If you get a 'no module named qgis.core' error, try sourcing"
-	@echo "the helper script we have provided first then run make pylint."
-	@echo "e.g. source run-env-linux.sh <path to qgis install>; make pylint"
-	@echo "----------------------"
+	rm -f $(COMPILED_RESOURCE_FILES)
 
 
 # Run pep8 style checking
