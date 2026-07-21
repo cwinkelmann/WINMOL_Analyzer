@@ -224,8 +224,8 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
 
         self.model_comboBox.addItem("Custom", "Custom")
 
-        # Default to the registry's gui_default (Spruce_Deadwood), then
-        # fall back to General.
+        # Default to the registry's declared default (its family row),
+        # then fall back to General.
         if default_id is not None:
             idx = self.model_comboBox.findData(default_id)
             if idx >= 0:
@@ -236,20 +236,53 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         except Exception:
             pass
 
+        # Preselect the precision the registry considers the effective
+        # default on THIS machine, so what the user sees is what runs.
+        # It is an ordinary selection: changing it overrides the rule.
+        combo = getattr(self, "variant_comboBox", None)
+        if combo is not None and self.registry is not None:
+            try:
+                idx = combo.findData(self._default_variant_value())
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+            except Exception:
+                pass
+
         self.handle_model_combo_box_change()
 
     def _registry_combo_items(self):
         """(items, default_id) for the model combo from self.registry.
 
-        Schema v2: one (label, entry_id) per family default, registry
-        order, plus any family-less visible entries. v1: the sorted flat
-        keys, exactly as before the registry existed.
+        Schema v2: one (label, entry_id) per family default. The
+        families behind the registry's ranked ``recommended`` list come
+        first (so the shipped default is row 0 and the documented
+        runner-up row 1), then the rest in registry order, then any
+        family-less visible entries. v1: the sorted flat keys, exactly
+        as before the registry existed.
+
+        ``default_id`` is a combo id, i.e. a FAMILY default entry: the
+        registry's declared default may be an optimised variant
+        (Spruce_Deadwood_int8), which the combo represents by its family
+        row; the concrete precision comes from the variant selector,
+        preset in :meth:`_default_variant_value`.
         """
         reg = self.registry
         items = []
         if reg.schema >= 2:
-            listed = set()
+            ranked, seen = [], set()
+            for mid in reg.recommended:
+                entry = reg.entries.get(mid)
+                fam = reg.families.get(entry.family) if entry else None
+                if fam is not None and fam.id not in seen:
+                    ranked.append(fam)
+                    seen.add(fam.id)
             for fam in reg.families.values():
+                if fam.id not in seen:
+                    ranked.append(fam)
+                    seen.add(fam.id)
+
+            listed = set()
+            for fam in ranked:
                 entry = reg.entries[fam.default]
                 if not entry.hidden:
                     items.append((entry.label, entry.id))
@@ -260,7 +293,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
                 if (entry.id not in listed
                         and entry.family not in reg.families):
                     items.append((entry.label, entry.id))
-            defaults = (reg.gui_default, "General")
+            defaults = (self._default_combo_id(), "General")
         else:
             names = sorted((e.id for e in reg.visible()), key=str.lower)
             items = [(name, name) for name in names]
@@ -269,6 +302,35 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             if _default and _default in reg.entries:
                 return items, _default
         return items, None
+
+    def _default_combo_id(self):
+        """The combo id (family default entry) for the registry's
+        declared default, or None."""
+        reg = self.registry
+        mid = reg.gui_default
+        entry = reg.entries.get(mid) if mid else None
+        if entry is None:
+            return None
+        fam = reg.families.get(entry.family)
+        return fam.default if fam is not None else entry.id
+
+    def _default_variant_value(self):
+        """The variant to preselect so the GUI opens on exactly the
+        entry the registry calls the effective default for this machine
+        (int8 on CPU, fp16 on GPU). 'auto' when the registry has no
+        opinion — auto's lossless-only gate would otherwise silently
+        downgrade a declared int8 default to fp32."""
+        reg = self.registry
+        if reg is None or reg.schema < 2:
+            return "auto"
+        try:
+            from .plugin_utils import model_registry
+            entry = reg.default_entry(
+                device=model_registry.detect_device())
+        except Exception:
+            return "auto"
+        return {"int8": "int8", "fp16": "fp16"}.get(
+            entry.precision, "auto")
 
     def handle_model_combo_box_change(self):
         selected_text = self.model_comboBox.currentText()
