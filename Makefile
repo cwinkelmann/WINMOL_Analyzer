@@ -26,6 +26,10 @@
 
 PLUGINNAME = WINMOL_Analyzer
 
+# Interpreter used by `make test`. Override on the command line to select the
+# environment that has the runtime dependencies installed.
+PYTHON = python3
+
 # The plugin GUI (QGIS side) AND the compute core it shells out to: winmol_run.py
 # needs classes/, utils/, plugin_utils/, config.json and requirements/ to run.
 PY_FILES = \
@@ -83,13 +87,15 @@ compile: $(COMPILED_RESOURCE_FILES)
 
 # The suite is QGIS-free and runs on the standalone interpreter. PYTHONHASHSEED
 # is pinned because the golden-master fixtures depend on set-iteration order
-# (tests/conftest.py re-executes pytest otherwise).
+# (tests/conftest.py re-executes pytest otherwise). Override PYTHON to point
+# at the interpreter that has the runtime deps, e.g.
+#   make test PYTHON=~/opt/anaconda3/envs/WINMOL_Analyzer/bin/python
 test:
 	@echo
 	@echo "----------------------"
 	@echo "Regression Test Suite"
 	@echo "----------------------"
-	PYTHONHASHSEED=0 TF_USE_LEGACY_KERAS=1 python -m pytest tests/ -q
+	PYTHONHASHSEED=0 TF_USE_LEGACY_KERAS=1 $(PYTHON) -m pytest tests/ -q
 
 deploy: compile
 	@echo
