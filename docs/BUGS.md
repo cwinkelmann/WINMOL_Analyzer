@@ -586,5 +586,19 @@ Download missing models from the release page. The plugin should be able to down
 https://github.com/cwinkelmann/WINMOL_segmentor_pt/releases 
 Spruce Deadwood as INT8 should be default, A SpecDS INT8 W05 would be second best
 
+⚠️ NAMING — verified against the `models-v1` manifest, 2026-07-21:
+- 1st choice exists as asked: **`model_UNet_SpecDS_Spruce_Deadwood_512_int8.onnx`**
+  (31.4 MB, CPU static int8, domain-calibrated; the int8 of the classic
+  Spruce_Deadwood model).
+- 2nd choice **"SpecDS INT8 W05" does not exist** — there is no SpecDS×W05
+  build. `w05` belongs to the *PyTorch UNet* family, not the Keras SpecDS one.
+  The closest real asset is **`unet_w05_int8_cpu.onnx`** (7.9 MB, ~10x faster
+  on CPU via AVX-VNNI, TestDS **F1 0.760**, lossless vs its fp32).
+  Worth noting it is both **4x smaller** and **higher-scoring** than the
+  SpecDS Keras line (the R/Keras beech retrain is F1 0.738), so "second best"
+  may understate it — it is arguably the better default for CPU users, with
+  Spruce_Deadwood int8 the better *domain-specific* pick. Defaults implemented
+  as requested (Spruce_Deadwood int8 first); say the word to flip.
+
 ### Add a setup tab to the plugin
 There env setup, deletion and model download can be combined. Don't do that in that single tab "Detect stems from UAV images"
