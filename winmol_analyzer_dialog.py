@@ -117,6 +117,12 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
 
         self.set_connections()
         self.output_log.setReadOnly(True)
+        # A verbose env build streams thousands of pip lines through here;
+        # cap the scrollback so the widget can't grow without bound.
+        try:
+            self.output_log.setMaximumBlockCount(5000)
+        except Exception:
+            pass
         self.env = env or {}
         self.python_exe = self.env.get("python")
         # models live next to the plugin. Derive from this file's location --
@@ -1079,38 +1085,37 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self._pip_install_into(exe)
 
     def _pip_install_into(self, exe):
-        import subprocess
-        req = str(installer.plugin_requirements_path())
-        self.update_output_log(f"Installing dependencies into {exe} …")
-        r = subprocess.run([exe, "-m", "pip", "install", "-r", req],
-                           capture_output=True, text=True, timeout=3600,
-                           env=installer.child_env())
-        if r.returncode == 0 and installer._has_compute_deps(exe):
-            self._set_python(exe)
-            self.update_output_log("Dependencies installed; interpreter ready.")
-        else:
-            self.update_output_log(
-                "Dependency install failed:\n" + (r.stderr or r.stdout)[-800:])
+        """Install the deps into a user-picked interpreter — on the worker
+        thread. Running pip inline here froze QGIS (no repaint, 'not
+        responding') for the whole multi-minute install."""
+        self._start_env_worker(
+            f"Installing dependencies into {exe}. This can take several "
+            "minutes; progress appears below…", target_exe=exe)
 
     def _create_environment(self):
         """Build the compute environment (download Python 3.11 if needed, make
         the venv, pip-install deps) on a background thread so QGIS stays
         responsive. Progress streams to the log."""
+        self._start_env_worker(
+            "Setting up the WINMOL environment (Python 3.11 + onnxruntime + "
+            "geo libraries). First run downloads a few hundred MB and can "
+            "take several minutes; progress appears below…")
+
+    def _start_env_worker(self, banner, target_exe=None):
+        """Run an environment build on a QThread, streaming progress into the
+        same log panel the prediction run writes to."""
         if self._env_thread is not None:
             self.update_output_log("Environment setup is already running…")
             return
         plugin_dir = os.path.dirname(os.path.abspath(__file__))
-        self.update_output_log(
-            "Setting up the WINMOL environment (Python 3.11 + onnxruntime + "
-            "geo libraries). First run downloads ~30 MB and can take a few "
-            "minutes…")
+        self.update_output_log(banner)
         try:
             self.log_widget.setCurrentIndex(1)   # show the log tab
         except Exception:
             pass
         from .tasks_threads import EnvSetupWorker
         self._env_thread = QThread()
-        self._env_worker = EnvSetupWorker(plugin_dir)
+        self._env_worker = EnvSetupWorker(plugin_dir, target_exe=target_exe)
         self._env_worker.moveToThread(self._env_thread)
         self._env_thread.started.connect(self._env_worker.run)
         self._env_worker.log.connect(self.update_output_log)

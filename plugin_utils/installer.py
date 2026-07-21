@@ -19,12 +19,22 @@ Design notes (fixing the old flaky installer):
 - Never bricks the plugin: setup returns a status; callers handle it and offer a
   retry action instead of raising out of classFactory.
 - No pkg_resources, no ``sudo apt``/``brew``; the get-pip fallback is fixed.
+- Verbose by design: the build takes minutes, so every step streams its child
+  process output line by line through the optional ``progress`` callback (the
+  dialog wires it to the same log panel the prediction run writes to) and a
+  heartbeat proves liveness while a single step is quiet. ``progress=None``
+  stays the default, so batch/CLI/headless callers are unaffected.
 """
+import collections
 import hashlib
 import json
 import os
+import queue
+import re
 import subprocess
 import sys
+import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -219,61 +229,307 @@ def _write_marker(venv_path) -> None:
                    "requirements": str(plugin_requirements_path())}, f)
 
 
+# --- progress reporting -----------------------------------------------------
+
+# Longest line pushed into the log widget; pip can emit very long paths.
+_MAX_LINE = 300
+# How many lines of child output are kept for the failure message.
+_TAIL_LINES = 80
+
+
+class _Progress:
+    """Timestamped status sink.
+
+    Wraps the caller's ``progress`` callable (or nothing at all) so every call
+    site can report unconditionally. Messages are prefixed with the seconds
+    since the build started, which is what turns "it looks stuck" into "it is
+    120 s in and still downloading". A sink that raises (a Qt widget destroyed
+    mid-build) is ignored: reporting must never fail the install.
+    """
+
+    def __init__(self, sink=None):
+        self._sink = sink
+        self._t0 = time.monotonic()
+        self._phase_t0 = self._t0
+
+    def elapsed(self) -> float:
+        return time.monotonic() - self._t0
+
+    def phase_elapsed(self) -> float:
+        return time.monotonic() - self._phase_t0
+
+    def phase(self, message) -> None:
+        """Start a new phase (resets the per-phase clock) and announce it."""
+        self._phase_t0 = time.monotonic()
+        self(message)
+
+    def __call__(self, message) -> None:
+        if self._sink is None:
+            return
+        try:
+            self._sink(f"[{self.elapsed():>4.0f}s] {message}")
+        except Exception:
+            pass
+
+
+def _as_progress(progress) -> _Progress:
+    """Normalise a callback / None / an existing _Progress into a _Progress."""
+    if isinstance(progress, _Progress):
+        return progress
+    return _Progress(progress)
+
+
+def _clean_line(line) -> str:
+    """One printable line: drop the trailing newline and keep only the last
+    carriage-return segment (progress bars redraw with \\r)."""
+    return line.rstrip("\r\n").split("\r")[-1].rstrip()
+
+
+def _run_streamed(cmd, progress=None, label="command", timeout=3600,
+                  heartbeat=15.0, line_filter=None) -> None:
+    """Run ``cmd``, streaming its output through ``progress`` as it arrives.
+
+    stderr is merged into stdout: it avoids the two-pipe deadlock and, more
+    importantly, pip writes most resolution/build failure detail to STDOUT, so
+    a stderr-only tail is usually empty. A daemon reader thread feeds a queue
+    so the main loop can wake on ``heartbeat`` and prove liveness instead of
+    blocking in readline. ``timeout`` is enforced as a hard deadline (the
+    child is killed), so this can never hang longer than the old
+    ``subprocess.run(timeout=...)`` did.
+
+    Raises RuntimeError with the tail of the real output on failure.
+    """
+    progress = _as_progress(progress)
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1, env=child_env({"PYTHONUNBUFFERED": "1"}))
+    lines = queue.Queue()
+    tail = collections.deque(maxlen=_TAIL_LINES)
+
+    def _pump(stream):
+        try:
+            for raw in stream:
+                lines.put(raw)
+        except Exception:
+            pass
+        finally:
+            lines.put(None)
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    reader = threading.Thread(target=_pump, args=(proc.stdout,), daemon=True)
+    reader.start()
+
+    deadline = time.monotonic() + timeout
+    started = time.monotonic()
+    while True:
+        if time.monotonic() > deadline:
+            _kill(proc)
+            raise RuntimeError(
+                f"{label} timed out after {timeout:.0f}s and was stopped."
+                + _tail_text(tail))
+        try:
+            raw = lines.get(timeout=heartbeat)
+        except queue.Empty:
+            progress(f"{label} — still working "
+                     f"({time.monotonic() - started:.0f}s)…")
+            continue
+        if raw is None:
+            break
+        text = _clean_line(raw)
+        if not text:
+            continue
+        tail.append(text)
+        shown = line_filter(text) if line_filter else text
+        if shown:
+            progress(shown[:_MAX_LINE])
+
+    try:
+        rc = proc.wait(timeout=30)
+    except Exception:
+        _kill(proc)
+        rc = proc.poll() or 1
+    if rc != 0:
+        # Push the tail to the log too: the dialog may truncate the exception.
+        for line in tail:
+            progress(line[:_MAX_LINE])
+        raise RuntimeError(f"{label} failed (exit {rc})." + _tail_text(tail))
+
+
+def _kill(proc) -> None:
+    try:
+        proc.kill()
+    except Exception:
+        pass
+
+
+def _tail_text(tail) -> str:
+    return ("\n" + "\n".join(tail)) if tail else ""
+
+
+def _requirement_names(path) -> list:
+    """Package names in a requirements file, following ``-r`` includes.
+
+    Purely cosmetic (it feeds the "N of M" counter), so anything unparseable
+    is skipped rather than raised on.
+    """
+    names, seen = [], set()
+
+    def _walk(current):
+        current = Path(current)
+        key = str(current)
+        if key in seen:
+            return
+        seen.add(key)
+        try:
+            content = current.read_text()
+        except OSError:
+            return
+        for raw in content.splitlines():
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            if line.startswith(("-r", "--requirement")):
+                ref = line[2:] if line.startswith("-r") else line[13:]
+                ref = ref.lstrip("=").strip()
+                if ref:
+                    _walk(current.parent / ref)
+                continue
+            if line.startswith("-"):
+                continue
+            name = re.split(r"[\s<>=!~;\[]", line, 1)[0].strip()
+            if name and name not in names:
+                names.append(name)
+
+    _walk(path)
+    return names
+
+
+def _pip_line_filter(total):
+    """Rewrite pip's ``Collecting <pkg>`` into ``Installing <pkg> (k of M)``.
+
+    Cosmetic only — unrecognised lines pass through verbatim, and nothing here
+    influences control flow or the exit-code check.
+    """
+    state = {"n": 0}
+
+    def _filter(line):
+        if line.startswith("Collecting "):
+            state["n"] += 1
+            pkg = line[len("Collecting "):].strip()
+            if total:
+                return f"Installing {pkg} ({state['n']} of {total})"
+            return f"Installing {pkg}"
+        return line
+
+    return _filter
+
+
 # --- venv creation + install -----------------------------------------------
 
-def create_venv(venv_path, base_python=None) -> None:
+def create_venv(venv_path, base_python=None, progress=None) -> None:
     base_python = base_python or choose_base_python()
+    progress = _as_progress(progress)
+    progress.phase(f"Creating the virtual environment with {base_python} …")
     # No --copies: the macOS Command Line Tools python (3.9) cannot create
     # venvs without symlinks ("This build of python cannot create venvs without
     # using symlinks"). The symlinked default works on all platforms.
     # env=child_env() is load-bearing: with QGIS's PYTHONHOME inherited, this
     # exact call is what died on Windows with "could not import runpy module"
     # (-m is handled by runpy, which cannot load from a foreign stdlib).
-    r = subprocess.run([base_python, "-m", "venv", venv_path],
-                       capture_output=True, text=True, timeout=300,
-                       env=child_env())
-    if r.returncode != 0:
+    try:
+        _run_streamed([base_python, "-m", "venv", venv_path],
+                      progress=progress, label="venv creation", timeout=300,
+                      heartbeat=10.0)
+    except RuntimeError as exc:
         raise RuntimeError(
-            f"venv creation failed with {base_python} (exit {r.returncode}): "
-            f"{(r.stderr or r.stdout).strip()[:600]}")
+            f"venv creation failed with {base_python}: {exc}") from exc
+    progress(f"Virtual environment created in "
+             f"{progress.phase_elapsed():.0f}s.")
 
 
-def ensure_pip(venv_path) -> None:
+def ensure_pip(venv_path, progress=None) -> None:
     py = get_venv_python_path(venv_path)
+    progress = _as_progress(progress)
+    progress.phase("Checking pip …")
     if subprocess.run([py, "-I", "-c", "import pip"], capture_output=True,
                       timeout=120, env=child_env()).returncode == 0:
+        progress("pip is available.")
         return
-    if subprocess.run([py, "-m", "ensurepip", "--upgrade"],
-                      capture_output=True, timeout=300,
-                      env=child_env()).returncode == 0:
+    progress("pip missing — bootstrapping it with ensurepip …")
+    try:
+        _run_streamed([py, "-m", "ensurepip", "--upgrade"], progress=progress,
+                      label="ensurepip", timeout=300, heartbeat=10.0)
         return
+    except RuntimeError as exc:
+        progress(f"ensurepip failed ({exc}); falling back to get-pip.py …")
     # last resort: bootstrap pip from the network
     get_pip = Path(_PLUGIN_DIR, "plugin_utils", "get-pip.py")
     if not get_pip.exists():
+        progress("Downloading get-pip.py …")
         urllib.request.urlretrieve(
             "https://bootstrap.pypa.io/get-pip.py", str(get_pip))
-    r = subprocess.run([py, str(get_pip)], capture_output=True, timeout=600,
-                       env=child_env())
-    if r.returncode != 0:
+    try:
+        _run_streamed([py, str(get_pip)], progress=progress, label="get-pip",
+                      timeout=600, heartbeat=10.0)
+    except RuntimeError as exc:
         raise RuntimeError(
             "Could not bootstrap pip in the WINMOL venv. On Debian/Ubuntu "
             "install the 'python3-venv' package for your Python; then retry. "
-            f"pip error: {r.stderr.decode(errors='replace')[:500]}")
+            f"pip error: {exc}") from exc
 
 
-def install_requirements(venv_path) -> None:
-    py = get_venv_python_path(venv_path)
+def install_requirements(venv_path, progress=None) -> None:
+    install_requirements_into(get_venv_python_path(venv_path),
+                              progress=progress)
+
+
+def install_requirements_into(python_exe, progress=None) -> None:
+    """pip-install requirements/plugin.txt into an arbitrary interpreter.
+
+    Used both for the managed venv and for an interpreter the user picked in
+    the dialog. Streams pip's own output so a multi-minute install visibly
+    progresses; ``--no-input`` prevents a hidden prompt that would be
+    indistinguishable from a hang, and ``--progress-bar off`` stops the \\r
+    bar spam that a QPlainTextEdit cannot render usefully.
+    """
+    progress = _as_progress(progress)
     req = str(plugin_requirements_path())
-    r = subprocess.run(
-        [py, "-m", "pip", "install", "--upgrade", "-r", req],
-        capture_output=True, timeout=3600, env=child_env())
-    if r.returncode != 0:
-        raise RuntimeError(
-            f"pip failed installing {req} (exit {r.returncode}). "
-            f"{r.stderr.decode(errors='replace')[-800:]}")
+    total = len(_requirement_names(req))
+    progress.phase(
+        f"Installing {total} packages from {os.path.basename(req)} into "
+        f"{python_exe} — the first run downloads a few hundred MB and can "
+        "take several minutes …")
+    _run_streamed(
+        [python_exe, "-u", "-m", "pip", "install", "--upgrade", "--no-input",
+         "--progress-bar", "off", "-r", req],
+        progress=progress, label=f"pip install -r {os.path.basename(req)}",
+        timeout=3600, line_filter=_pip_line_filter(total))
+    progress(f"Dependencies installed in {progress.phase_elapsed():.0f}s.")
 
 
-def download_models(plugin_dir, config_path=None) -> list:
+def _model_reporthook(progress, label):
+    """urlretrieve reporthook throttled to ~1 message/s or every 5 MB, so a
+    fast link cannot flood the log widget."""
+    state = {"at": 0.0, "mb": -5}
+
+    def _hook(blocks, block_size, total_size):
+        read_mb = (blocks * block_size) // (1 << 20)
+        now = time.monotonic()
+        if now - state["at"] < 1.0 and read_mb - state["mb"] < 5:
+            return
+        state["at"], state["mb"] = now, read_mb
+        if total_size and total_size > 0:
+            progress(f"{label} — {read_mb}/{total_size // (1 << 20)} MB")
+        else:
+            progress(f"{label} — {read_mb} MB")
+
+    return _hook
+
+
+def download_models(plugin_dir, config_path=None, progress=None) -> list:
     """Download configured models into <plugin>/models. Tolerant: skips files
     that exist, and returns the list of models that could NOT be fetched
     (missing URL / download error) instead of raising, so a hosting gap never
@@ -281,13 +537,17 @@ def download_models(plugin_dir, config_path=None) -> list:
     models_dir = os.path.join(plugin_dir, MODELS_PATH)
     os.makedirs(models_dir, exist_ok=True)
     config_path = config_path or os.path.join(plugin_dir, "config.json")
+    progress = _as_progress(progress)
     missing = []
     try:
         with open(config_path) as f:
             entries = json.load(f)
     except Exception:
         return missing
-    for name, url in entries.items():
+    total = len(entries)
+    if total:
+        progress.phase(f"Downloading {total} model file(s) …")
+    for index, (name, url) in enumerate(entries.items(), start=1):
         if not isinstance(url, str) or not url.lower().startswith("http"):
             missing.append(name)
             continue
@@ -295,12 +555,19 @@ def download_models(plugin_dir, config_path=None) -> list:
             os.path.splitext(url.split("?")[0])[1] or ".onnx"
         dest = os.path.join(models_dir, f"{name}{ext}")
         if os.path.exists(dest) and os.path.getsize(dest) > 0:
+            progress(f"Model {name} ({index} of {total}) already present.")
             continue
+        label = f"Downloading model {name} ({index} of {total})"
+        progress.phase(label + " …")
         try:
-            urllib.request.urlretrieve(url, dest)
-        except (urllib.error.URLError, OSError):
+            urllib.request.urlretrieve(
+                url, dest, reporthook=_model_reporthook(progress, label))
+            progress(f"Model {name} downloaded in "
+                     f"{progress.phase_elapsed():.0f}s.")
+        except (urllib.error.URLError, OSError) as exc:
             if os.path.exists(dest):
                 os.remove(dest)   # drop truncated file
+            progress(f"Model {name} could not be downloaded: {exc}")
             missing.append(name)
     return missing
 
@@ -337,19 +604,24 @@ def setup_environment(venv_path, base_python=None, download=True,
     steps to the UI."""
     if plugin_dir is None:
         plugin_dir = os.path.dirname(venv_path)
+    report = _as_progress(progress)
     if not is_ready(venv_path):
+        report.phase("Setting up the WINMOL environment …")
         if not os.path.exists(get_venv_python_path(venv_path)):
+            report("Locating a Python 3.11 interpreter …")
             base = base_python or managed_base_python(plugin_dir,
-                                                      progress=progress)
-            if progress:
-                progress("Creating the WINMOL environment…")
-            create_venv(venv_path, base)
-        ensure_pip(venv_path)
-        if progress:
-            progress("Installing dependencies (onnxruntime + geo stack)…")
-        install_requirements(venv_path)
+                                                      progress=report)
+            create_venv(venv_path, base, progress=report)
+        ensure_pip(venv_path, progress=report)
+        install_requirements(venv_path, progress=report)
         _write_marker(venv_path)
-    missing = download_models(plugin_dir) if download else []
+    else:
+        report("WINMOL environment already built; checking models …")
+    missing = download_models(plugin_dir, progress=report) if download else []
+    report(f"Environment ready in {report.elapsed():.0f}s: "
+           f"{get_venv_python_path(venv_path)}")
+    if missing:
+        report(installed_message(missing))
     return {"python": get_venv_python_path(venv_path),
             "missing_models": missing}
 
