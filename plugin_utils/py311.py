@@ -179,7 +179,7 @@ def ensure_python311(dest_dir, progress=None):
         raise RuntimeError(
             "No prebuilt Python 3.11 is available for this platform "
             f"({platform.system()}/{platform.machine()}). Install Python 3.11 "
-            "yourself and point WINMOL at it via the Environment button.")
+            "yourself and point WINMOL at it from the plugin's Setup tab.")
 
     os.makedirs(dest_dir, exist_ok=True)
     name = asset_name(triple)

@@ -616,3 +616,140 @@ def test_registry_import_safety():
                          capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == ""
+
+
+# --- on-disk state, verification, removal (the Setup tab's model half) -------
+
+def test_installed_state_missing_and_zero_byte(tmp_path):
+    entry = _entry(tmp_path)
+    assert mr.installed_state(entry, str(tmp_path)) == "missing"
+    (tmp_path / entry.file).write_bytes(b"")
+    assert mr.installed_state(entry, str(tmp_path)) == "missing"
+
+
+def test_installed_state_present_then_verified(tmp_path):
+    entry = _entry(tmp_path, data=b"DATA")
+    (tmp_path / entry.file).write_bytes(b"DATA")
+    # stat-only: a file nobody has hashed yet is 'present', never
+    # 'verified' — the tree must not claim a guarantee it has not checked
+    assert mr.installed_state(entry, str(tmp_path)) == "present"
+    assert mr.verify_entry(entry, str(tmp_path)) is True
+    assert mr.installed_state(entry, str(tmp_path)) == "verified"
+
+
+def test_installed_state_unpinned_is_not_verified(tmp_path):
+    entry = _entry(tmp_path, checksum=False)
+    (tmp_path / entry.file).write_bytes(b"whatever")
+    assert mr.installed_state(entry, str(tmp_path)) == "unpinned"
+    # verify_file() would say True for it; the state must not
+    assert mr.verify_file(str(tmp_path / entry.file)) is True
+
+
+def test_installed_state_corrupt_after_a_failed_verify(tmp_path):
+    entry = _entry(tmp_path, data=b"DATA")
+    (tmp_path / entry.file).write_bytes(b"TRUNCATED")
+    assert mr.verify_entry(entry, str(tmp_path)) is False
+    assert mr.installed_state(entry, str(tmp_path)) == "corrupt"
+    # and a failure memo can never be mistaken for a pass
+    assert mr.verify_file(str(tmp_path / entry.file),
+                          sha256=entry.sha256,
+                          cache_dir=str(tmp_path)) is False
+
+
+def test_installed_state_forgets_a_replaced_file(tmp_path):
+    entry = _entry(tmp_path, data=b"DATA")
+    (tmp_path / entry.file).write_bytes(b"TRUNCATED")
+    mr.verify_entry(entry, str(tmp_path))
+    assert mr.installed_state(entry, str(tmp_path)) == "corrupt"
+    os.utime(str(tmp_path / entry.file), (1, 1))
+    (tmp_path / entry.file).write_bytes(b"DATA")
+    # different size/mtime -> the stale verdict must not stick
+    assert mr.installed_state(entry, str(tmp_path)) == "present"
+
+
+def test_verify_entry_reports_byte_progress(tmp_path):
+    data = b"D" * (3 * mr._CHUNK_BYTES + 17)
+    entry = _entry(tmp_path, data=data)
+    (tmp_path / entry.file).write_bytes(data)
+    seen = []
+    assert mr.verify_entry(entry, str(tmp_path),
+                           progress=lambda d, t: seen.append((d, t))) is True
+    assert seen[-1] == (len(data), len(data))
+    assert len(seen) >= 4 and all(t == len(data) for _d, t in seen)
+
+
+def test_verify_entry_without_a_digest_is_vacuously_true(tmp_path):
+    entry = _entry(tmp_path, checksum=False)
+    (tmp_path / entry.file).write_bytes(b"x")
+    assert mr.verify_entry(entry, str(tmp_path)) is True
+    # ...and writes no memo that could later read as 'verified'
+    assert mr.installed_state(entry, str(tmp_path)) == "unpinned"
+
+
+def test_verify_entry_on_a_missing_file(tmp_path):
+    assert mr.verify_entry(_entry(tmp_path), str(tmp_path)) is False
+
+
+def test_remove_model_takes_the_part_file_and_the_memo(tmp_path):
+    entry = _entry(tmp_path, data=b"DATA")
+    (tmp_path / entry.file).write_bytes(b"DATA")
+    (tmp_path / (entry.file + ".part")).write_bytes(b"XX")
+    mr.verify_entry(entry, str(tmp_path))
+    assert entry.file in mr._cache_load(str(tmp_path))
+
+    freed = mr.remove_model(entry, str(tmp_path))
+    assert freed == 6
+    assert not (tmp_path / entry.file).exists()
+    assert not (tmp_path / (entry.file + ".part")).exists()
+    # nothing else in the tree prunes this cache; a re-download of a
+    # same-sized file would otherwise inherit the old verdict
+    assert entry.file not in mr._cache_load(str(tmp_path))
+    assert mr.installed_state(entry, str(tmp_path)) == "missing"
+
+
+def test_remove_model_prunes_the_memo_under_the_key_verify_file_wrote(
+        tmp_path):
+    """verify_file() keys the memo by basename(local_path); remove_model()
+    keyed it by entry.file. Those coincide for every entry shipped today
+    and diverge silently the moment an entry.file carries a subdirectory —
+    leaving a stale "verified" verdict behind for the next download."""
+    entry = _entry(tmp_path, data=b"DATA", file=os.path.join("sub",
+                                                             "x.onnx"))
+    (tmp_path / "sub").mkdir()
+    (tmp_path / entry.file).write_bytes(b"DATA")
+    mr.verify_entry(entry, str(tmp_path))
+    assert "x.onnx" in mr._cache_load(str(tmp_path))
+
+    mr.remove_model(entry, str(tmp_path))
+    assert "x.onnx" not in mr._cache_load(str(tmp_path)), (
+        "the memo survived the deletion under its real key")
+
+
+def test_remove_model_absent_is_zero_not_an_error(tmp_path):
+    assert mr.remove_model(_entry(tmp_path), str(tmp_path)) == 0
+
+
+def test_remove_all(tmp_path):
+    reg = mr.load_registry(SHIPPED_CONFIG)
+    models = tmp_path / "models"
+    models.mkdir()
+    first, second = list(reg.entries.values())[:2]
+    (models / first.file).write_bytes(b"a" * 100)
+    (models / second.file).write_bytes(b"b" * 50)
+    (models / (second.file + ".part")).write_bytes(b"b" * 5)
+    stranger = models / "my_own_model.onnx"
+    stranger.write_bytes(b"keep me")
+
+    dry = mr.remove_all(reg, str(models), dry_run=True)
+    assert dry["freed_bytes"] == 155
+    assert dry["removed"] == []
+    assert (models / first.file).exists()
+
+    done = mr.remove_all(reg, str(models))
+    assert done["freed_bytes"] == 155
+    assert not (models / first.file).exists()
+    assert not (models / (second.file + ".part")).exists()
+    assert done["failed"] == []
+    # a file the registry does not know about is never touched
+    assert stranger.exists()
+    assert not (models / mr.VERIFIED_CACHE).exists()

@@ -451,15 +451,33 @@ def _cache_load(cache_dir) -> dict:
         return {}
 
 
-def _cache_store(cache_dir, filename, size, mtime, algo, digest):
-    data = _cache_load(cache_dir)
-    data[filename] = {"size": size, "mtime": mtime,
-                      "algo": algo, "digest": digest}
+def _cache_write(cache_dir, data):
     try:
         with open(os.path.join(cache_dir, VERIFIED_CACHE), "w") as f:
             json.dump(data, f, indent=1, sort_keys=True)
     except OSError:
         pass    # cache is an optimization only
+
+
+def _cache_store(cache_dir, filename, size, mtime, algo, digest, ok=True):
+    """Memoize the outcome of a digest check.
+
+    ``ok=False`` records a FAILED check, which is what lets
+    :func:`installed_state` report "corrupt" without re-hashing a 374 MB
+    file on every repaint. A failure record must never be mistaken for a
+    pass — :func:`verify_file` checks the flag.
+    """
+    data = _cache_load(cache_dir)
+    data[filename] = {"size": size, "mtime": mtime,
+                      "algo": algo, "digest": digest, "ok": bool(ok)}
+    _cache_write(cache_dir, data)
+
+
+def _cache_forget(cache_dir, filename) -> None:
+    """Drop a file's memo (it is being deleted or replaced)."""
+    data = _cache_load(cache_dir)
+    if data.pop(filename, None) is not None:
+        _cache_write(cache_dir, data)
 
 
 def verify_file(path, sha256=None, md5=None, cache_dir=None) -> bool:
@@ -478,16 +496,159 @@ def verify_file(path, sha256=None, md5=None, cache_dir=None) -> bool:
     st = os.stat(path)
     cache_dir = cache_dir or os.path.dirname(path) or "."
     rec = _cache_load(cache_dir).get(os.path.basename(path))
-    if (rec and rec.get("size") == st.st_size
-            and rec.get("mtime") == st.st_mtime
-            and rec.get("algo") == algo
-            and rec.get("digest") == expected):
-        return True
+    if _rec_matches(rec, st, algo, expected):
+        return bool(rec.get("ok", True))
     ok = _hash_file(path, algo) == expected
     if ok:
         _cache_store(cache_dir, os.path.basename(path),
                      st.st_size, st.st_mtime, algo, expected)
     return ok
+
+
+def _rec_matches(rec, st, algo, expected) -> bool:
+    """True when a cache record describes exactly this file+expectation."""
+    return bool(rec
+                and rec.get("size") == st.st_size
+                and rec.get("mtime") == st.st_mtime
+                and rec.get("algo") == algo
+                and rec.get("digest") == expected)
+
+
+# --- on-disk state (stat + memo only; never hashes) --------------------------
+
+#: The five states a registry model can be in on disk.
+STATE_MISSING = "missing"
+STATE_UNPINNED = "unpinned"
+STATE_PRESENT = "present"
+STATE_VERIFIED = "verified"
+STATE_CORRUPT = "corrupt"
+
+
+def installed_state(entry, model_dir) -> str:
+    """One of ``missing`` / ``unpinned`` / ``present`` / ``verified`` /
+    ``corrupt`` for ``entry`` in ``model_dir``.
+
+    stat() and the memo only — SAFE ON THE GUI THREAD. ``unpinned`` is
+    deliberately distinct from ``verified``: :func:`verify_file` returns
+    True unconditionally for an entry with no published digest, and
+    rendering that as a green "verified" would teach users to ignore a
+    real "corrupt".
+    """
+    path = local_path(entry, model_dir)
+    try:
+        st = os.stat(path)
+    except OSError:
+        return STATE_MISSING
+    if st.st_size <= 0:
+        return STATE_MISSING
+    algo, expected = _expected_digest(entry)
+    if expected is None:
+        return STATE_UNPINNED
+    rec = _cache_load(model_dir).get(os.path.basename(path))
+    if _rec_matches(rec, st, algo, expected):
+        return STATE_VERIFIED if rec.get("ok", True) else STATE_CORRUPT
+    return STATE_PRESENT
+
+
+def verify_entry(entry, model_dir, progress=None) -> bool:
+    """Hash the on-disk file and compare it with the entry's digest.
+
+    ``progress`` is called as ``progress(bytes_done, total)``. This reads
+    up to 374 MB and MUST NOT run on the GUI thread — the dialog drives it
+    through ModelMaintenanceWorker. The outcome (pass AND fail) is
+    memoised so :func:`installed_state` can report it without re-hashing.
+    """
+    path = local_path(entry, model_dir)
+    algo, expected = _expected_digest(entry)
+    if expected is None:
+        return True                     # nothing is published to check
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    hasher = hashlib.new(algo)
+    done = 0
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(_CHUNK_BYTES)
+            if not chunk:
+                break
+            hasher.update(chunk)
+            done += len(chunk)
+            if progress is not None:
+                progress(done, st.st_size)
+    ok = hasher.hexdigest().lower() == expected
+    _cache_store(model_dir, os.path.basename(path), st.st_size,
+                 st.st_mtime, algo, expected, ok=ok)
+    return ok
+
+
+def remove_model(entry, model_dir) -> int:
+    """Delete one model file, returning the bytes freed (0 if absent).
+
+    Also removes a stale ``<file>.part`` left by an interrupted download
+    and prunes the entry from the verified-digest memo — nothing else in
+    the tree prunes that cache, so a re-download of a same-sized file
+    could otherwise inherit a stale verdict.
+    """
+    path = local_path(entry, model_dir)
+    freed = 0
+    for candidate in (path, path + ".part"):
+        try:
+            freed += os.path.getsize(candidate)
+            os.remove(candidate)
+        except OSError:
+            pass
+    # Key the memo the way verify_file() writes it — basename(local_path),
+    # not entry.file. They coincide for every entry shipped today, but an
+    # entry.file carrying a subdirectory would silently leave the stale
+    # verdict behind, and a re-download of a same-sized file would inherit
+    # it.
+    _cache_forget(model_dir, os.path.basename(path))
+    return freed
+
+
+def remove_all(registry, model_dir, dry_run=False) -> dict:
+    """Delete every registry-known model file in ``model_dir``.
+
+    Same dict shape as ``installer.remove_environment`` — and with
+    ``dry_run=True`` the same shape again, computed by this very
+    function, so the confirmation's byte figure cannot drift from what is
+    actually deleted. Files the registry does not know about (a user's
+    own .onnx dropped into the folder) are never touched.
+    """
+    result = {"planned": [], "removed": [], "failed": [], "freed_bytes": 0}
+    for entry in registry.entries.values():
+        path = local_path(entry, model_dir)
+        for candidate in (path, path + ".part"):
+            try:
+                size = os.path.getsize(candidate)
+            except OSError:
+                continue
+            result["planned"].append((candidate, size))
+            if dry_run:
+                result["freed_bytes"] += size
+                continue
+            try:
+                os.remove(candidate)
+                result["removed"].append(candidate)
+                result["freed_bytes"] += size
+            except OSError as exc:
+                result["failed"].append((candidate, str(exc)))
+        if not dry_run:
+            # basename(local_path), the key verify_file() writes — see
+            # remove_model(). (The whole cache file goes below anyway;
+            # keeping the key rule identical stops the two drifting.)
+            _cache_forget(model_dir,
+                          os.path.basename(local_path(entry, model_dir)))
+    cache = os.path.join(model_dir, VERIFIED_CACHE)
+    if not dry_run and os.path.exists(cache):
+        try:
+            os.remove(cache)
+            result["removed"].append(cache)
+        except OSError as exc:
+            result["failed"].append((cache, str(exc)))
+    return result
 
 
 # --- download ---------------------------------------------------------------

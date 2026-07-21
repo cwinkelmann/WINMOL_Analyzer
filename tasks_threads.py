@@ -132,8 +132,13 @@ class EnvSetupWorker(QObject):
                 self.done.emit(self.target_exe)
                 return
             venv = installer.venv_location(self.plugin_dir)
+            # download=False: the Setup tab owns every byte of model
+            # traffic. Bundling a model fetch into the environment build
+            # is what used to end a first-ever setup with a download
+            # failure the user could neither retry nor understand.
             info = installer.setup_environment(
-                venv, plugin_dir=self.plugin_dir, progress=self._emit)
+                venv, plugin_dir=self.plugin_dir, download=False,
+                progress=self._emit)
             self.done.emit(info.get("python") or "")
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -183,3 +188,171 @@ class ModelDownloadWorker(QObject):
             self.done.emit(path)
         except Exception as exc:
             self.failed.emit(str(exc))
+
+
+class EnvRemoveWorker(QObject):
+    """Deletes the managed environment off the GUI thread.
+
+    An rmtree over a 2 GB venv on a network home directory takes seconds
+    to minutes, and on Windows it may block on a file another process
+    still holds — exactly the shape of freeze this whole change exists to
+    remove. Signals mirror EnvSetupWorker so the dialog's existing
+    quit/wait/park teardown covers it unchanged; ``done`` carries
+    installer.remove_environment's result dict, NOT an interpreter path,
+    which is why the dialog connects terminal slots per worker instance
+    rather than per thread pair.
+    """
+
+    log = pyqtSignal(str)
+    status = pyqtSignal(str)
+    progress = pyqtSignal(int)
+    done = pyqtSignal(object)   # the remove_environment result dict
+    failed = pyqtSignal(str)
+
+    def __init__(self, plugin_dir, remove_venv=True, remove_runtime=False,
+                 remove_models=False, configured_exe=None, dry_run=False):
+        super().__init__()
+        self.plugin_dir = plugin_dir
+        self.remove_venv = remove_venv
+        self.remove_runtime = remove_runtime
+        self.remove_models = remove_models
+        self.configured_exe = configured_exe
+        # Pricing a deletion is a full directory walk over a 2 GB tree —
+        # seconds on a network home directory. The confirmation dialog's
+        # "frees N GB" figure therefore comes back through this worker
+        # too, not from a walk on the GUI thread.
+        self.dry_run = dry_run
+        self._cancelled = False
+
+    def cancel(self):
+        """Best-effort flag. A single rmtree is not interruptible, but it
+        is bounded, so teardown can wait it out."""
+        self._cancelled = True
+
+    def _emit(self, message):
+        self.log.emit(str(message))
+
+    def run(self):
+        try:
+            from .plugin_utils import installer
+            result = installer.remove_environment(
+                self.plugin_dir,
+                remove_venv=self.remove_venv,
+                remove_runtime=self.remove_runtime,
+                remove_models=self.remove_models,
+                configured_exe=self.configured_exe,
+                dry_run=self.dry_run,
+                progress=self._emit)
+            result["dry_run"] = self.dry_run
+            self.done.emit(result)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class EnvProbeWorker(QObject):
+    """Measures the compute environment off the GUI thread.
+
+    ``setup_state.env_info`` spawns interpreters (a version probe and an
+    ``import onnxruntime, rasterio, geopandas`` that costs over a second
+    warm, and up to 60 s cold) and ``installer.directory_size`` walks a
+    2 GB tree. Doing that inline is what re-froze the dialog on open and
+    on every Rescan, so the whole measurement lives here and the dialog
+    paints a cheap ``setup_state.env_seed`` until the result arrives.
+
+    Read-only by construction: it creates, deletes and writes nothing, so
+    unlike the other workers it does NOT take part in the one-job-at-a-
+    time interlock and never disables a button. ``token`` is echoed back
+    so the dialog can drop a result that a later change superseded.
+    """
+
+    log = pyqtSignal(str)
+    progress = pyqtSignal(int)
+    done = pyqtSignal(object)   # {'token','info','usage'}
+    failed = pyqtSignal(str)
+
+    def __init__(self, plugin_dir, configured_exe=None, token=0):
+        super().__init__()
+        self.plugin_dir = plugin_dir
+        self.configured_exe = configured_exe
+        self.token = token
+        self._cancelled = False
+
+    def cancel(self):
+        """Best-effort flag. Every step is timeout-bounded (30 s / 60 s
+        subprocess timeouts, a bounded walk), so teardown can wait it
+        out."""
+        self._cancelled = True
+
+    def run(self):
+        try:
+            from .plugin_utils import installer, setup_state
+            info = setup_state.env_info(self.plugin_dir, self.configured_exe)
+            usage = {
+                "venv": installer.directory_size(info.venv_path),
+                "runtime": installer.directory_size(info.runtime_path),
+            }
+            self.done.emit({"token": self.token, "info": info,
+                            "usage": usage})
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class ModelMaintenanceWorker(QObject):
+    """Verifies or deletes ONE model file off the GUI thread.
+
+    Hashing a 374 MB file is seconds of solid CPU, and an unlink on an
+    SMB home directory or a Windows-locked file blocks; neither belongs
+    on the thread that paints the dialog. Rides the same thread pair as
+    ModelDownloadWorker, so only one model operation runs at a time.
+    """
+
+    log = pyqtSignal(str)
+    status = pyqtSignal(str)
+    progress = pyqtSignal(int)
+    done = pyqtSignal(object)   # {'action','entry_id','ok','freed'}
+    failed = pyqtSignal(str)
+
+    def __init__(self, action, entry, models_dir):
+        super().__init__()
+        self.action = action        # "verify" | "delete"
+        self.entry = entry
+        self.models_dir = models_dir
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        try:
+            from .plugin_utils import model_registry
+            if self.action == "verify":
+                self.done.emit(self._verify(model_registry))
+            elif self.action == "delete":
+                self.done.emit(self._delete(model_registry))
+            else:
+                self.failed.emit(f"Unknown action {self.action!r}.")
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+    def _verify(self, model_registry):
+        self.log.emit(f"Verifying {self.entry.file} …")
+
+        def _cb(done_bytes, total):
+            if total:
+                self.progress.emit(min(99, int(done_bytes * 100 / total)))
+
+        ok = model_registry.verify_entry(self.entry, self.models_dir,
+                                         progress=_cb)
+        self.progress.emit(100)
+        self.log.emit(
+            f"{self.entry.file}: checksum {'OK' if ok else 'MISMATCH'}.")
+        return {"action": "verify", "entry_id": self.entry.id,
+                "ok": ok, "freed": 0}
+
+    def _delete(self, model_registry):
+        self.log.emit(f"Deleting {self.entry.file} …")
+        freed = model_registry.remove_model(self.entry, self.models_dir)
+        self.progress.emit(100)
+        self.log.emit(f"Deleted {self.entry.file} ({freed} bytes freed).")
+        return {"action": "delete", "entry_id": self.entry.id,
+                "ok": True, "freed": freed}

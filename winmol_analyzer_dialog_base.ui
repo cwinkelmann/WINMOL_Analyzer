@@ -33,9 +33,63 @@
      </property>
      <widget class="QWidget" name="tab">
       <attribute name="title">
-       <string>Parameters</string>
+       <string>Detection</string>
       </attribute>
       <layout class="QVBoxLayout" name="verticalLayout_4">
+       <item>
+        <widget class="QWidget" name="setup_banner_widget" native="true">
+         <property name="visible">
+          <bool>false</bool>
+         </property>
+         <layout class="QHBoxLayout" name="horizontalLayout_setup_banner">
+          <property name="leftMargin">
+           <number>0</number>
+          </property>
+          <property name="topMargin">
+           <number>0</number>
+          </property>
+          <property name="rightMargin">
+           <number>0</number>
+          </property>
+          <property name="bottomMargin">
+           <number>0</number>
+          </property>
+          <item>
+           <widget class="QLabel" name="setup_banner_label">
+            <property name="styleSheet">
+             <string notr="true">color: rgb(200, 90, 0);</string>
+            </property>
+            <property name="text">
+             <string/>
+            </property>
+            <property name="wordWrap">
+             <bool>true</bool>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <spacer name="horizontalSpacer_setup_banner">
+            <property name="orientation">
+             <enum>Qt::Horizontal</enum>
+            </property>
+            <property name="sizeHint" stdset="0">
+             <size>
+              <width>20</width>
+              <height>20</height>
+             </size>
+            </property>
+           </spacer>
+          </item>
+          <item>
+           <widget class="QPushButton" name="setup_banner_button">
+            <property name="text">
+             <string>Open Setup</string>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </widget>
+       </item>
        <item>
         <layout class="QGridLayout" name="gridLayout">
          <item row="0" column="1" colspan="2">
@@ -176,6 +230,31 @@
             </widget>
            </item>
           </layout>
+         </item>
+         <item>
+          <widget class="QWidget" name="model_variant_widget" native="true">
+           <layout class="QHBoxLayout" name="horizontalLayout_variant">
+            <property name="leftMargin">
+             <number>0</number>
+            </property>
+            <property name="topMargin">
+             <number>0</number>
+            </property>
+            <property name="rightMargin">
+             <number>0</number>
+            </property>
+            <property name="bottomMargin">
+             <number>0</number>
+            </property>
+            <item>
+             <widget class="QLabel" name="variant_label">
+              <property name="text">
+               <string>Variant:</string>
+              </property>
+             </widget>
+            </item>
+           </layout>
+          </widget>
          </item>
         </layout>
        </item>
@@ -562,6 +641,407 @@
           </widget>
          </item>
         </layout>
+       </item>
+      </layout>
+     </widget>
+     <widget class="QWidget" name="tab_setup">
+      <attribute name="title">
+       <string>Setup</string>
+      </attribute>
+      <layout class="QVBoxLayout" name="verticalLayout_setup">
+       <item>
+        <widget class="QLabel" name="setup_intro_label">
+         <property name="styleSheet">
+          <string notr="true">color: gray;</string>
+         </property>
+         <property name="text">
+          <string>One-time setup. Nothing here runs during a detection.</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QGroupBox" name="setup_env_group">
+         <property name="title">
+          <string>1 — Python environment</string>
+         </property>
+         <layout class="QGridLayout" name="gridLayout_setup_env">
+          <item row="0" column="0" colspan="5">
+           <widget class="QLabel" name="env_state_label">
+            <property name="font">
+             <font>
+              <weight>75</weight>
+              <bold>true</bold>
+             </font>
+            </property>
+            <property name="text">
+             <string>Not set up</string>
+            </property>
+           </widget>
+          </item>
+          <item row="1" column="0" colspan="5">
+           <widget class="QLabel" name="env_path_label">
+            <property name="styleSheet">
+             <string notr="true">color: gray;</string>
+            </property>
+            <property name="text">
+             <string/>
+            </property>
+            <property name="wordWrap">
+             <bool>true</bool>
+            </property>
+            <property name="textInteractionFlags">
+             <set>Qt::TextSelectableByMouse</set>
+            </property>
+           </widget>
+          </item>
+          <item row="2" column="0" colspan="5">
+           <widget class="QLabel" name="env_detail_label">
+            <property name="styleSheet">
+             <string notr="true">color: gray;</string>
+            </property>
+            <property name="text">
+             <string/>
+            </property>
+            <property name="wordWrap">
+             <bool>true</bool>
+            </property>
+           </widget>
+          </item>
+          <item row="3" column="0">
+           <widget class="QPushButton" name="env_create_button">
+            <property name="text">
+             <string>Create environment for me</string>
+            </property>
+            <property name="default">
+             <bool>true</bool>
+            </property>
+           </widget>
+          </item>
+          <item row="3" column="1">
+           <widget class="QPushButton" name="env_choose_button">
+            <property name="text">
+             <string>Choose interpreter…</string>
+            </property>
+           </widget>
+          </item>
+          <item row="3" column="2">
+           <widget class="QPushButton" name="env_repair_button">
+            <property name="text">
+             <string>Reinstall dependencies</string>
+            </property>
+           </widget>
+          </item>
+          <item row="3" column="3">
+           <spacer name="horizontalSpacer_setup_env">
+            <property name="orientation">
+             <enum>Qt::Horizontal</enum>
+            </property>
+            <property name="sizeHint" stdset="0">
+             <size>
+              <width>20</width>
+              <height>20</height>
+             </size>
+            </property>
+           </spacer>
+          </item>
+          <item row="3" column="4">
+           <widget class="QPushButton" name="env_delete_button">
+            <property name="text">
+             <string>Delete environment…</string>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <widget class="QGroupBox" name="setup_model_group">
+         <property name="title">
+          <string>2 — Models</string>
+         </property>
+         <layout class="QVBoxLayout" name="verticalLayout_setup_models">
+          <item>
+           <widget class="QLabel" name="models_summary_label">
+            <property name="font">
+             <font>
+              <weight>75</weight>
+              <bold>true</bold>
+             </font>
+            </property>
+            <property name="text">
+             <string>Models on disk: 0 of 0 — 0 bytes</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QLabel" name="models_dir_label">
+            <property name="styleSheet">
+             <string notr="true">color: gray;</string>
+            </property>
+            <property name="text">
+             <string/>
+            </property>
+            <property name="wordWrap">
+             <bool>true</bool>
+            </property>
+            <property name="textInteractionFlags">
+             <set>Qt::TextSelectableByMouse</set>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <layout class="QHBoxLayout" name="horizontalLayout_models_filter">
+            <item>
+             <widget class="QCheckBox" name="models_variants_checkBox">
+              <property name="text">
+               <string>Show all precision variants</string>
+              </property>
+              <property name="checked">
+               <bool>false</bool>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <spacer name="horizontalSpacer_models_filter">
+              <property name="orientation">
+               <enum>Qt::Horizontal</enum>
+              </property>
+              <property name="sizeHint" stdset="0">
+               <size>
+                <width>20</width>
+                <height>20</height>
+               </size>
+              </property>
+             </spacer>
+            </item>
+            <item>
+             <widget class="QPushButton" name="models_refresh_button">
+              <property name="text">
+               <string>Rescan</string>
+              </property>
+             </widget>
+            </item>
+           </layout>
+          </item>
+          <item>
+           <widget class="QTreeWidget" name="models_treeWidget">
+            <property name="minimumSize">
+             <size>
+              <width>0</width>
+              <height>180</height>
+             </size>
+            </property>
+            <property name="styleSheet">
+             <string notr="true">background-color: rgb(255, 255, 255)</string>
+            </property>
+            <property name="alternatingRowColors">
+             <bool>false</bool>
+            </property>
+            <property name="selectionMode">
+             <enum>QAbstractItemView::SingleSelection</enum>
+            </property>
+            <property name="selectionBehavior">
+             <enum>QAbstractItemView::SelectRows</enum>
+            </property>
+            <property name="rootIsDecorated">
+             <bool>true</bool>
+            </property>
+            <property name="uniformRowHeights">
+             <bool>true</bool>
+            </property>
+            <column>
+             <property name="text">
+              <string>Model</string>
+             </property>
+            </column>
+            <column>
+             <property name="text">
+              <string>Precision</string>
+             </property>
+            </column>
+            <column>
+             <property name="text">
+              <string>Size</string>
+             </property>
+            </column>
+            <column>
+             <property name="text">
+              <string>Status</string>
+             </property>
+            </column>
+           </widget>
+          </item>
+          <item>
+           <layout class="QHBoxLayout" name="horizontalLayout_models_buttons">
+            <item>
+             <widget class="QPushButton" name="models_download_button">
+              <property name="text">
+               <string>Download</string>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QPushButton" name="models_download_default_button">
+              <property name="text">
+               <string>Download recommended</string>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QPushButton" name="models_verify_button">
+              <property name="text">
+               <string>Verify</string>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QPushButton" name="models_delete_button">
+              <property name="text">
+               <string>Delete…</string>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <spacer name="horizontalSpacer_models_buttons">
+              <property name="orientation">
+               <enum>Qt::Horizontal</enum>
+              </property>
+              <property name="sizeHint" stdset="0">
+               <size>
+                <width>20</width>
+                <height>20</height>
+               </size>
+              </property>
+             </spacer>
+            </item>
+            <item>
+             <widget class="QPushButton" name="models_open_folder_button">
+              <property name="text">
+               <string>Open folder</string>
+              </property>
+             </widget>
+            </item>
+           </layout>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <widget class="QGroupBox" name="setup_ready_group">
+         <property name="title">
+          <string>3 — Ready</string>
+         </property>
+         <layout class="QHBoxLayout" name="horizontalLayout_setup_ready">
+          <item>
+           <widget class="QLabel" name="setup_ready_label">
+            <property name="text">
+             <string/>
+            </property>
+            <property name="wordWrap">
+             <bool>true</bool>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <spacer name="horizontalSpacer_setup_ready">
+            <property name="orientation">
+             <enum>Qt::Horizontal</enum>
+            </property>
+            <property name="sizeHint" stdset="0">
+             <size>
+              <width>20</width>
+              <height>20</height>
+             </size>
+            </property>
+           </spacer>
+          </item>
+          <item>
+           <widget class="QPushButton" name="setup_go_detect_button">
+            <property name="enabled">
+             <bool>false</bool>
+            </property>
+            <property name="text">
+             <string>Go to detection</string>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <widget class="QGroupBox" name="setup_activity_group">
+         <property name="title">
+          <string>Activity</string>
+         </property>
+         <layout class="QVBoxLayout" name="verticalLayout_setup_activity">
+          <item>
+           <widget class="QLabel" name="setup_status_label">
+            <property name="text">
+             <string>Idle.</string>
+            </property>
+            <property name="wordWrap">
+             <bool>true</bool>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QProgressBar" name="setup_progress_bar">
+            <property name="value">
+             <number>0</number>
+            </property>
+            <property name="textVisible">
+             <bool>true</bool>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QPlainTextEdit" name="setup_detail_log">
+            <property name="maximumSize">
+             <size>
+              <width>16777215</width>
+              <height>140</height>
+             </size>
+            </property>
+            <property name="styleSheet">
+             <string notr="true">background-color: rgb(255, 255, 255)</string>
+            </property>
+            <property name="readOnly">
+             <bool>true</bool>
+            </property>
+            <property name="maximumBlockCount">
+             <number>500</number>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <layout class="QHBoxLayout" name="horizontalLayout_setup_activity_buttons">
+            <item>
+             <spacer name="horizontalSpacer_setup_activity">
+              <property name="orientation">
+               <enum>Qt::Horizontal</enum>
+              </property>
+              <property name="sizeHint" stdset="0">
+               <size>
+                <width>20</width>
+                <height>20</height>
+               </size>
+              </property>
+             </spacer>
+            </item>
+            <item>
+             <widget class="QPushButton" name="setup_open_log_button">
+              <property name="text">
+               <string>Open full log</string>
+              </property>
+             </widget>
+            </item>
+           </layout>
+          </item>
+         </layout>
+        </widget>
        </item>
       </layout>
      </widget>
