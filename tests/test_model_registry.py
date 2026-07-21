@@ -27,53 +27,29 @@ import winmol_batch as wb                       # noqa: E402
 SHIPPED_CONFIG = os.path.join(REPO, "config.json")
 
 # Ground truth: SHA256SUMS of the models-v1 release of
-# github.com/cwinkelmann/WINMOL_segmentor_pt (22 assets).
-ZOO_SHA256 = {
-    "unet_fp32.onnx":
-        "e12653e519914dd4cea73517eb414c49061973589c271f0d47696702aea29cc6",
-    "unet_w05_int8_cpu.onnx":
-        "74c1bd1d8ed31988df5756c9ca7fc4c300de804a1733dc13df5a0bd8fceaaabd",
-    "unet_w05_fp16_gpu.onnx":
-        "71c47dda22b27c6918aaebd5edd06058e085f75e541c47ca1a60ebe4ec9e1825",
-    "unet_rkeras_beech_512.onnx":
-        "510bbd31e190d8b8836761f8b8b5af95acca73974585b0a27217ec3c47b5594e",
-    "unet_rkeras_beech_512_fp16.onnx":
-        "3529db039eb190113a1991fa699531bed48f1021be2efa764e212cdb3b9d5a4d",
-    "unet_rkeras_beech_512_int8.onnx":
-        "573bd0e09dac0aee0c48c4bf76b93b175d28a8b937e09c39d07e6b9f54559478",
-    "deeplabv3plus_fp32.onnx":
-        "6e37d38208d46b12d295f1c7c082b289a15455be19b1d85724a35e2a5d46ce4d",
-    "deeplabv3plus_fp16_gpu.onnx":
-        "af1c296d82b8f9b2bbce467b8030a3136733b304e13330182c1ade76fa339b15",
-    "hrnet_fp32.onnx":
-        "403b43d1ed793f0aabbad132c268104db4a7b574ebe7f4b39d6dc4b9c85976a9",
-    "hrnet_fp16_gpu.onnx":
-        "5e16ad145ab97642a4f0d981249fd3a2ca57fadee9a0fcbf23b784e4d4d1a752",
-    "model_UNet_GenDS_512.onnx":
-        "fa192f96eef750a9ebdc261983b74e0353b2b3f1f746a026655cabbe8f44e0f0",
-    "model_UNet_GenDS_512_fp16.onnx":
-        "8d8f2d303ff425983102d83dcac860f627c7a6898f0ab46804aa95cd2faf3dd5",
-    "model_UNet_GenDS_512_int8.onnx":
-        "507bb3da447de288d7a55a86c322fe6e547a28fdb7aca1cd3768745ef1e2060d",
-    "model_UNet_SpecDS_Beech_512.onnx":
-        "91497501aa4c303838569d17d62875dc1e6e1fa18dcb6086dfd9647e3dc34ca4",
-    "model_UNet_SpecDS_Beech_512_fp16.onnx":
-        "42b8e369769052c48e16e4d305be15fe7fa211ec6d09f5b0f4fcbdedf21eb310",
-    "model_UNet_SpecDS_Beech_512_int8.onnx":
-        "a19501ea98e04e695d89cad55590f99225c927c749b6b3df610ca95f02ab8289",
-    "model_UNet_SpecDS_Spruce_512.onnx":
-        "26546a66b64247961c8f2df07019d846297b1296f223755e405709c111c855fd",
-    "model_UNet_SpecDS_Spruce_512_fp16.onnx":
-        "2f25fdc70b23e23d87ddf56f8f3a481c8db3d4d046491a27d6e4ab2a2cb5824a",
-    "model_UNet_SpecDS_Spruce_512_int8.onnx":
-        "e6d22f398977b14b43e8ee5ae8468d378489d6c4d181468c9777eeece1cf733b",
-    "model_UNet_SpecDS_Spruce_Deadwood_512.onnx":
-        "88028ece8e24a64f7b08727267f933e3d62e12dfbf76d6667d35fa76cfaf83f1",
-    "model_UNet_SpecDS_Spruce_Deadwood_512_fp16.onnx":
-        "cadee59388d161e6bc64477cc7c91ef8211c3c6c5186b7747aca88dbc28f1e9d",
-    "model_UNet_SpecDS_Spruce_Deadwood_512_int8.onnx":
-        "e95e7876b38dd356faa789a0be1ae59280a42279db5bb507552771540cd13f46",
-}
+# github.com/cwinkelmann/WINMOL_segmentor_pt (22 assets), vendored
+# verbatim at tests/fixtures/models_v1_SHA256SUMS so this file never
+# drifts from the release again (the 2026-07-21 asset rename made every
+# hardcoded name here stale while the digests stayed valid).
+ZOO_SUMS_FIXTURE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "fixtures", "models_v1_SHA256SUMS")
+
+
+def _parse_sha256sums(path):
+    """Parse a coreutils SHA256SUMS file -> {filename: sha256}."""
+    out = {}
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            digest, name = line.split(None, 1)
+            out[name.strip().lstrip("*")] = digest
+    return out
+
+
+ZOO_SHA256 = _parse_sha256sums(ZOO_SUMS_FIXTURE)
 
 # Ground truth: md5 of the four original Keras models, Zenodo record
 # 15907576 (DOI 10.5281/zenodo.15907576).
@@ -92,10 +68,10 @@ CLASSIC = ("General", "Beech", "Spruce", "Spruce_Deadwood")
 
 #: models-v1 assets the classic ids were repointed onto, same order.
 CLASSIC_ASSETS = (
-    "model_UNet_GenDS_512.onnx",
-    "model_UNet_SpecDS_Beech_512.onnx",
-    "model_UNet_SpecDS_Spruce_512.onnx",
-    "model_UNet_SpecDS_Spruce_Deadwood_512.onnx",
+    "model_UNet_GenDS_512_2023-02-27_211141.onnx",
+    "model_UNet_SpecDS_Beech_512_2023-02-28_042751.onnx",
+    "model_UNet_SpecDS_Spruce_512_2023-02-27_061925.onnx",
+    "model_UNet_SpecDS_Spruce_Deadwood_512_2024-12-19_194758.onnx",
 )
 
 
@@ -256,15 +232,17 @@ def test_recommended_ranking_shipped():
     first, second = reg.recommended_entries()
     # 1st: INT8 Spruce + deadwood (SpecDS), from the models-v1 release
     assert first.id == "Spruce_Deadwood_int8"
-    assert first.file == "model_UNet_SpecDS_Spruce_Deadwood_512_int8.onnx"
+    assert first.file == ("model_UNet_SpecDS_Spruce_Deadwood_512"
+                          "_2024-12-19_194758_int8.onnx")
     assert first.precision == "int8"
     assert first.size_mb == 31.4
     assert first.sha256 == ZOO_SHA256[first.file]
     # 2nd: the PyTorch UNet w05 int8 — the real asset behind the
-    # "SpecDS INT8 W05" misnomer; label/description must be explicit
-    # that w05 is the PyTorch family, not SpecDS.
+    # "SpecDS INT8 W05" shorthand; label/description must be explicit
+    # that w05 is the PyTorch retrain, not a classic Keras variant.
     assert second.id == "UNet_PT_int8"
-    assert second.file == "unet_w05_int8_cpu.onnx"
+    assert second.file == ("model_UNet_SpecDS_Beech_512"
+                           "_pytorch_w05_int8.onnx")
     assert second.size_mb == 7.9
     assert second.f1 == 0.76
     assert "w05" in second.label.lower()
@@ -362,7 +340,7 @@ def test_resolve_explicit_id_never_rewritten():
     for device in ("cpu", "gpu"):
         e = reg.resolve("General", device=device)
         assert e.id == "General"
-        assert e.file == "model_UNet_GenDS_512.onnx"
+        assert e.file == CLASSIC_ASSETS[0]
     # explicit variant ids resolve to themselves too
     assert reg.resolve("UNet_PT_int8", device="gpu").id == "UNet_PT_int8"
 
@@ -522,8 +500,8 @@ def test_installer_v2_no_startup_network(tmp_path, monkeypatch):
         "preload": [],
         "models": {"UNet_PT_int8": {
             "label": "UNet PT int8",
-            "url": "https://example.invalid/unet_w05_int8_cpu.onnx",
-            "file": "unet_w05_int8_cpu.onnx",
+            "url": "https://example.invalid/uw05_int8.onnx",
+            "file": "uw05_int8.onnx",
         }},
     }))
     # preload=[] -> zero network I/O at startup, nothing missing
@@ -534,8 +512,8 @@ def test_installer_v2_no_startup_network(tmp_path, monkeypatch):
         "preload": ["UNet_PT_int8"],
         "models": {"UNet_PT_int8": {
             "label": "UNet PT int8",
-            "url": "https://example.invalid/unet_w05_int8_cpu.onnx",
-            "file": "unet_w05_int8_cpu.onnx",
+            "url": "https://example.invalid/uw05_int8.onnx",
+            "file": "uw05_int8.onnx",
         }},
     }))
     # a failing fetch is reported, not raised (tolerant contract, v2 too)
@@ -553,7 +531,8 @@ def test_batch_resolution_shipped_v2(tmp_path):
         assert paths[name] == str(tmp_path / asset)
     # zoo ids resolve to the release asset basenames
     assert (paths["UNet_PT_int8"]
-            == str(tmp_path / "unet_w05_int8_cpu.onnx"))
+            == str(tmp_path / "model_UNet_SpecDS_Beech_512"
+                              "_pytorch_w05_int8.onnx"))
     # hdf5 originals are addressable from the CLI (TF users)
     assert (paths["Spruce_Deadwood_hdf5"]
             == str(tmp_path
@@ -582,7 +561,7 @@ def test_batch_no_download_missing_exits_2(tmp_path, capsys):
     out = capsys.readouterr().out
     # source-specific manual hint for a zoo asset
     assert "WINMOL_segmentor_pt" in out
-    assert "unet_w05_int8_cpu.onnx" in out
+    assert "model_UNet_SpecDS_Beech_512_pytorch_w05_int8.onnx" in out
 
 
 def test_batch_lowercase_general_still_resolves(tmp_path, capsys):
@@ -592,7 +571,7 @@ def test_batch_lowercase_general_still_resolves(tmp_path, capsys):
                   "--input", str(tmp_path)])
     assert rc == 2          # file missing, but the NAME resolved
     out = capsys.readouterr().out
-    assert "model_UNet_GenDS_512.onnx" in out
+    assert "model_UNet_GenDS_512_2023-02-27_211141.onnx" in out
     assert "WINMOL_segmentor_pt" in out   # repointed onto the zoo release
 
 

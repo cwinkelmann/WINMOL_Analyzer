@@ -32,13 +32,24 @@ build if an unpinned entry is added. Getting there required repointing the
 four classic ids (2026-07-21) from the older `models-onnx-v1` release of
 this repo — for which no checksums were ever published — onto the
 `models-v1` assets `model_UNet_{GenDS,SpecDS_Beech,SpecDS_Spruce,
-SpecDS_Spruce_Deadwood}_512.onnx`, which the zoo manifest states are
-conversions of the *same* upstream Keras HDF5 and numerically identical.
+SpecDS_Spruce_Deadwood}_512_<upstream timestamp>.onnx`, which the zoo
+manifest states are conversions of the *same* upstream Keras HDF5 and
+numerically identical.
 **Consequence:** the on-disk names changed (`General.onnx` →
-`model_UNet_GenDS_512.onnx`, etc.), so a previously downloaded classic
-model is no longer recognized and is re-fetched once (124.6 MB each). The
-old release is untouched and still downloadable, but it is no longer
-referenced by the registry.
+`model_UNet_GenDS_512_2023-02-27_211141.onnx`, etc.), so a previously
+downloaded classic model is no longer recognized and is re-fetched once
+(124.6 MB each). The old release is untouched and still downloadable, but
+it is no longer referenced by the registry.
+
+**Asset names are checked, not trusted.** The `models-v1` release renamed
+every asset once already (2026-07-21) to the scheme
+`model_<Arch>_<Flavour>_512[_<timestamp>][_<qualifier>][_fp16|_int8].onnx`,
+which 404'd all 22 URLs in a shipped release before anything caught it.
+Two guards now exist: `tests/test_model_urls.py` checks offline that each
+entry's `file` equals its URL basename and that every sha256 appears in the
+vendored `tests/fixtures/models_v1_SHA256SUMS`, and — with
+`WINMOL_NET_TESTS=1` — that every registry URL is anonymously reachable.
+Run the latter before cutting a release; it stays skipped in CI.
 
 **Defaults are ranked and device-aware.** `recommended` is an explicit
 ranked list, best first, and `recommended[0]` must equal `gui_default` (the
@@ -46,7 +57,8 @@ loader rejects a registry where they disagree). Shipped ranking:
 
 1. `Spruce_Deadwood_int8` — INT8 Spruce + standing deadwood (SpecDS),
    31.4 MB, the default.
-2. `UNet_PT_int8` — `unet_w05_int8_cpu.onnx`, 7.9 MB, TestDS F1 0.760.
+2. `UNet_PT_int8` — `model_UNet_SpecDS_Beech_512_pytorch_w05_int8.onnx`,
+   7.9 MB, TestDS F1 0.760.
 
 `Registry.default_entry(device)` computes the **effective** default: it
 keeps `recommended[0]`'s family (the domain choice) and takes that family's
@@ -67,11 +79,15 @@ the matching variant, so what is displayed is what runs.
 > product decision (31.4 MB, fast on CPU), not a measured-equivalence
 > claim. On a GPU host the effective default is the lossless fp16 variant.
 
-> **Naming, to stop a recurring mix-up:** there is no "SpecDS INT8 W05"
-> build. `w05` belongs only to the **PyTorch UNet** family (beech), asset
-> `unet_w05_int8_cpu.onnx` (entry `UNet_PT_int8`); `SpecDS` names the
-> classic per-species **Keras** models, which have no `w05` variant. The
-> runner-up above is the PyTorch `w05` asset.
+> **Naming, to stop a recurring mix-up (corrected 2026-07-21):** `w05`
+> (width-0.5) belongs only to the **PyTorch UNet** family, asset
+> `model_UNet_SpecDS_Beech_512_pytorch_w05_int8.onnx` (entry
+> `UNet_PT_int8`). The `models-v1` rename settled its provenance: it *is*
+> trained on SpecDS beech data, so the earlier claim here that `SpecDS`
+> names only the classic Keras models was wrong. What still must not be
+> conflated is the lineage — the classic converted-Keras entries
+> (`General`, `Beech`, `Spruce`, `Spruce_Deadwood`) have no `w05` variant;
+> only the `_pytorch` family does.
 
 **Families and variants.** A family groups the precision variants of one
 trained model: `default` (fp32 reference), `cpu` (int8), `gpu` (fp16).
