@@ -536,9 +536,47 @@ There are many scripts which seem weird. I.e. resources.py
 Plugin_upload.py seems to be unused
 there are many qgis related files which seem relevant to qgis only and could be in packaged away
 
+✅ FIXED (deletions) / ⚠️ PROPOSED (the move) — `fix/rr-root-dir-cleanup`.
+`plugin_upload.py` **was** dead: nothing imported it and its only caller was
+the Makefile `upload` target, which is itself dead — deleted, along with
+`pylintrc` (nothing runs pylint; CI is flake8-only) and the `upload` /
+`transup` / `transcompile` / `transclean` targets that referenced nothing.
+**`resources.py` is NOT weird and stays** — it is *generated* from
+`resources.qrc` by `pyrcc5` (`make compile`) and is genuinely loaded at
+runtime for the `:/plugins/...` icon paths; deleting it breaks the toolbar
+icon. The "package the QGIS files away" idea is deliberately NOT done here:
+QGIS loads a plugin from a fixed directory layout keyed on the folder name,
+so moving `winmol_analyzer*.py` / `metadata.txt` risks breaking installs in a
+way nothing in CI can catch. The evidence-backed migration proposal (what may
+move, what must stay at the root, and why) is in **`docs/root-layout.md`** —
+needs a live-QGIS validation pass before anyone acts on it.
+New guard: `tests/test_plugin_package.py` pins the shipped zip manifest, so a
+future deletion cannot silently drop a packaged file.
+
 
 ### QGIS Docker Container
 The current container is fixed on QGIS 3.28.2, which is a way too old (2022, no LTR(. I would suggest to use the latest LTR version of QGIS 3.44) and make it run on QGIS 4.2.0
+
+✅ FIXED (the bump) / 🐛 OPEN (QGIS 4) — `fix/rr-qgis-container-version`.
+Tags verified against the Docker Hub API (441 tags, real digests, 2026-07-21)
+rather than assumed — and **QGIS 4.2.0 does exist** (`4.2.0`, `4.2`,
+`4.2.0-questing`, `4.2.0-trixie`, `stable`). Base bumped
+`final-3_28_13` (2023-11-24, 2.7 GB) → **`3.44.12-noble`**, parameterised as
+`ARG QGIS_TAG` before `FROM`, so trialling QGIS 4 is
+`QGIS_TAG=4.2.0-trixie ./startDocker.sh` with no file edit; the image name now
+embeds the tag so a 3.44 and a 4.2 image coexist instead of clobbering each
+other. Two *latent build breakers* fixed on the way: `apt install
+python3.10-venv` only resolves on jammy (any newer base would have failed with
+"Unable to locate package"), and `ln -s` aborts if the base already ships
+`/usr/bin/python` (now `ln -sf`). All qgis/qgis tags are amd64-only — noted in
+`docs/CONTAINERS.md`.
+**Still open — "make it run on QGIS 4.2.0" is NOT delivered.** 4.2.0 is not the
+default and `metadata.txt` is untouched, because raising `qgisMaximumVersion`
+ships an *unvalidated* Qt6-compatibility claim to end users; QGIS derives the
+default max from `qgisMinimumVersion[0]` (verified in
+`pyplugin_installer/installer_data.py`). A test goes red the moment the default
+is bumped to 4.x without the metadata change. Validating Qt6 needs a live
+QGIS 4 session — see `docs/CONTAINERS.md` for the one-command trial.
 
 ---
 
@@ -572,9 +610,60 @@ finding: what you did, what you expected, what happened, logs verbatim.
 I created a demo release https://github.com/cwinkelmann/WINMOL_Analyzer/releases/tag/v0.0.0-demo1
 #### the zip installed, but creating and python environment looks stuck. Nothing happens for a while, making it more verbose would be nice. 
 
+✅ FIXED — `fix/rr-installer-verbosity`. The log channel already ran end-to-end
+(`installer.setup_environment(progress=)` → `EnvSetupWorker.log` →
+`update_output_log` → the same widget prediction uses); the defect was
+**granularity and buffering**, so nothing was plumbed, it was made to speak.
+Now: timestamped phase lines (`[  12s] …`), pip run as `-u` with
+`PYTHONUNBUFFERED=1` and **stderr merged into stdout** (pip writes failure
+detail to *stdout*, and `capture_output` kept the streams apart — which is why
+the previously-surfaced error tail was usually empty), line-by-line streaming,
+a heartbeat (`… still working (Ns)`) so a long silent step still shows life,
+per-model download progress, and a final `Environment ready in Xs`.
+`progress=None` (batch/CLI/headless) is byte-for-byte unaffected.
+**Second, worse bug found and fixed while in there:** `_pip_install_into` ran
+pip *synchronously on the GUI thread*, so "Choose interpreter… → install deps"
+genuinely froze QGIS (the reported path was merely mute). It now goes through
+the same worker thread. 16 new tests in `tests/test_installer_progress.py`,
+all with a stubbed `Popen` — plus one verification against a real subprocess,
+since stubs cannot prove streaming actually streams.
+*Still wants a GUI pass:* fresh machine, no `winmol_venv`, hit Environment and
+confirm lines appear within a couple of seconds and keep coming.
+
 #### The zip had no semantic versioning number.
 
+✅ FIXED — `fix/rr-release-zip-version`. Confirmed at the source: the
+`v0.0.0-demo1` asset was literally `WINMOL_Analyzer_QGIS_Plugin.zip`, with the
+name hardcoded twice in `on-push-tags.yml`; `metadata.txt` was already stamped
+correctly. New `scripts/plugin_version.py` derives the version (one leading
+`v` stripped; `v0.6.0.2` and `v0.0.0-demo1` both valid; a non-numeric lead like
+`models-onnx-v1` rejected) and the artifact is now
+**`WINMOL_Analyzer-<version>.zip`**.
+⚠️ **Judgement call worth your eye:** `documentation/index.html` links
+`releases/latest/download/WINMOL_Analyzer_QGIS_Plugin.zip` in **five** places,
+and that GitHub permalink requires a *fixed* asset name (no wildcard) — a plain
+rename silently breaks every Download button on the public site. So the
+workflow uploads the identical archive under **both** names: the versioned one
+(primary) and the old name as a stable alias. Cost: one redundant ~1.8 MB asset
+per release. The alternative was rewriting those five links on every release.
+Note a suffixed version like `0.0.0-demo1` sorts *below* `0.6.0` in QGIS's
+installer, so demo tags never present themselves as upgrades.
+
 #### Per default all 3 products should be enabled in the plugin
+
+✅ FIXED — `fix/rr-default-all-products`. Your premise was right, and here is
+what they are: three `QCheckBox`es in `winmol_analyzer_dialog_base.ui` —
+`output_checkBox_stem` (was checked), `output_checkBox_trees` (**was false**),
+`output_checkBox_nodes` (**was false**) — so a default run produced the stem
+map only. All three now default to checked.
+Worth knowing: they collapse to ONE `process_type` via a strict ladder
+(nodes → `Nodes`, elif trees → `Trees`, else `Stems`), and a single
+`winmol_run.py` invocation with `Nodes` **already writes all three products**
+(prediction writes the raster; `write_all_layers_to_gpkg` emits the
+stems + vectors + nodes layers). So this was a UI-defaults bug, not a
+missing-feature one — no extra subprocesses were added. Selection logic
+extracted to `plugin_utils/output_selection.py` and covered by
+`tests/test_plugin_output_defaults.py`.
 
 The plugin should be capable of downloading more models in a dialogue. For now we should pin them against a github release
 
