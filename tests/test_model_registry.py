@@ -90,6 +90,14 @@ ZENODO_MD5 = {
 
 CLASSIC = ("General", "Beech", "Spruce", "Spruce_Deadwood")
 
+#: models-v1 assets the classic ids were repointed onto, same order.
+CLASSIC_ASSETS = (
+    "model_UNet_GenDS_512.onnx",
+    "model_UNet_SpecDS_Beech_512.onnx",
+    "model_UNet_SpecDS_Spruce_512.onnx",
+    "model_UNet_SpecDS_Spruce_Deadwood_512.onnx",
+)
+
 
 def _entry(tmp_path, data=b"DATA", checksum=True, **kw):
     """A minimal ModelEntry whose sha256 matches `data` (or has none)."""
@@ -124,15 +132,18 @@ def test_load_registry_v2_shipped():
     assert len(reg.entries) == 26
     assert reg.preload == []
     assert "Custom" not in reg.entries
-    assert reg.gui_default == "Spruce_Deadwood"
+    assert reg.gui_default == "Spruce_Deadwood_int8"
 
-    # The four classic public ids are unchanged: same on-disk names, same
-    # models-onnx-v1 release URLs — existing caches stay valid.
-    for name in CLASSIC:
+    # The four classic public IDS are unchanged (stable API), but their
+    # assets were repointed from the unchecksummed models-onnx-v1
+    # release to the sha256-pinned, numerically-identical models-v1
+    # conversions of the same Keras weights.
+    for name, asset in zip(CLASSIC, CLASSIC_ASSETS):
         e = reg.entries[name]
-        assert e.file == f"{name}.onnx"
-        assert "models-onnx-v1" in e.url
-        assert e.url.endswith(f"/{name}.onnx")
+        assert e.file == asset
+        assert "models-v1" in e.url and "models-onnx-v1" not in e.url
+        assert e.url.endswith(f"/{asset}")
+        assert e.sha256 == ZOO_SHA256[asset]
 
     # Every family reference resolves to a real entry.
     for fam in reg.families.values():
@@ -143,7 +154,7 @@ def test_load_registry_v2_shipped():
     # Zoo assets carry the ground-truth sha256 from SHA256SUMS.
     zoo = [e for e in reg.entries.values()
            if "WINMOL_segmentor_pt" in e.url]
-    assert len(zoo) >= 14
+    assert len(zoo) == 22
     for e in zoo:
         assert e.sha256 == ZOO_SHA256[e.file], e.id
 
@@ -198,6 +209,152 @@ def test_reserved_custom(tmp_path):
         mr.load_registry(str(cfg))
 
 
+# --- integrity: no unverifiable download ------------------------------------
+
+def test_every_entry_has_a_digest():
+    """REGRESSION GUARD. Every downloadable entry in the shipped
+    registry must carry a sha256 (zoo assets) or md5 (Zenodo hdf5), so
+    no model can ever be installed without integrity verification.
+    Adding an entry without one fails here."""
+    reg = mr.load_registry(SHIPPED_CONFIG)
+    unpinned = reg.unpinned()
+    assert unpinned == [], (
+        "unverifiable model download(s): "
+        + ", ".join(f"{e.id} ({e.url})" for e in unpinned))
+    # and the digests are real hex of the right width
+    for e in reg.entries.values():
+        algo, digest = mr._expected_digest(e)
+        assert algo in ("sha256", "md5"), e.id
+        assert len(digest) == (64 if algo == "sha256" else 32), e.id
+        int(digest, 16)          # raises unless pure hex
+
+
+def test_digest_is_actually_enforced_for_md5_entries(tmp_path):
+    """md5 (not just sha256) must really be verified — the Zenodo
+    originals are md5-only."""
+    entry = mr.ModelEntry(
+        id="H", label="hdf5", url="https://example.invalid/m.hdf5",
+        file="m.hdf5", md5=hashlib.md5(b"GOOD").hexdigest())
+    path = mr.ensure_model(entry, str(tmp_path), fetcher=_writer(b"GOOD"))
+    assert open(path, "rb").read() == b"GOOD"
+    os.remove(path)
+    with pytest.raises(mr.ModelDownloadError) as exc:
+        mr.ensure_model(entry, str(tmp_path), fetcher=_writer(b"BAD"))
+    assert "checksum mismatch" in str(exc.value)
+    assert "md5" in str(exc.value)
+    assert not os.path.exists(path)          # nothing left behind
+
+
+# --- recommended ranking / device-aware default ------------------------------
+
+def test_recommended_ranking_shipped():
+    """The default and its runner-up are explicit and ordered, not
+    implied by dict order."""
+    reg = mr.load_registry(SHIPPED_CONFIG)
+    assert reg.recommended == ["Spruce_Deadwood_int8", "UNet_PT_int8"]
+    assert reg.recommended[0] == reg.gui_default
+    first, second = reg.recommended_entries()
+    # 1st: INT8 Spruce + deadwood (SpecDS), from the models-v1 release
+    assert first.id == "Spruce_Deadwood_int8"
+    assert first.file == "model_UNet_SpecDS_Spruce_Deadwood_512_int8.onnx"
+    assert first.precision == "int8"
+    assert first.size_mb == 31.4
+    assert first.sha256 == ZOO_SHA256[first.file]
+    # 2nd: the PyTorch UNet w05 int8 — the real asset behind the
+    # "SpecDS INT8 W05" misnomer; label/description must be explicit
+    # that w05 is the PyTorch family, not SpecDS.
+    assert second.id == "UNet_PT_int8"
+    assert second.file == "unet_w05_int8_cpu.onnx"
+    assert second.size_mb == 7.9
+    assert second.f1 == 0.76
+    assert "w05" in second.label.lower()
+    assert "specds" in second.description.lower()   # names the confusion
+    assert second.family == "unet_pt" and first.family != second.family
+
+
+def test_default_entry_is_device_aware(monkeypatch):
+    """int8 on CPU, fp16 on GPU — the Spruce+Deadwood domain (the
+    user's declared first choice) is preserved either way."""
+    reg = mr.load_registry(SHIPPED_CONFIG)
+
+    monkeypatch.setattr(mr, "detect_device", lambda: "cpu")
+    e = reg.default_entry()                  # device="auto" -> stub
+    assert e.id == "Spruce_Deadwood_int8"
+    assert e.precision == "int8"
+    assert e.family == "classic_spruce_deadwood"
+
+    monkeypatch.setattr(mr, "detect_device", lambda: "gpu")
+    e = reg.default_entry()
+    assert e.id == "Spruce_Deadwood_fp16"
+    assert e.precision == "fp16"
+    assert e.family == "classic_spruce_deadwood"
+
+    # explicit device argument wins over detection
+    monkeypatch.setattr(mr, "detect_device", _boom)
+    assert reg.default_entry(device="cpu").id == "Spruce_Deadwood_int8"
+    assert reg.default_entry(device="gpu").id == "Spruce_Deadwood_fp16"
+
+
+def test_default_entry_never_downloads_or_hits_network(monkeypatch,
+                                                       tmp_path):
+    """Resolving the default must not fetch anything, and must not
+    shell out to nvidia-smi when the device is given."""
+    reg = mr.load_registry(SHIPPED_CONFIG)
+    monkeypatch.setattr(mr, "_DEFAULT_FETCHER", _boom)
+    monkeypatch.setattr(subprocess, "run", _boom)
+    for device in ("cpu", "gpu"):
+        e = reg.default_entry(device=device)
+        assert not os.path.exists(mr.local_path(e, str(tmp_path)))
+    # WINMOL_DEVICE short-circuits the probe too (still no subprocess)
+    monkeypatch.setenv("WINMOL_DEVICE", "gpu")
+    mr._DEVICE_PROBE_CACHE.pop("probe", None)
+    assert reg.default_entry().id == "Spruce_Deadwood_fp16"
+    monkeypatch.setenv("WINMOL_DEVICE", "cpu")
+    assert reg.default_entry().id == "Spruce_Deadwood_int8"
+
+
+def test_explicit_selection_overrides_device_default(monkeypatch):
+    """The device rule applies to the DEFAULT only: an explicit entry
+    id or a forced variant is never rewritten."""
+    reg = mr.load_registry(SHIPPED_CONFIG)
+    monkeypatch.setattr(mr, "detect_device", lambda: "gpu")
+    assert reg.default_entry().id == "Spruce_Deadwood_fp16"
+    # user explicitly asks for the fp32 classic -> untouched
+    assert reg.resolve("Spruce_Deadwood").id == "Spruce_Deadwood"
+    # ...or for int8 on that GPU box -> honoured
+    assert (reg.resolve("classic_spruce_deadwood", device="gpu",
+                        variant="int8").id == "Spruce_Deadwood_int8")
+    # ...or a different family entirely
+    assert reg.resolve("HRNet_Beech").id == "HRNet_Beech"
+
+
+def test_recommended_validation(tmp_path):
+    """A registry whose ranking disagrees with gui_default, or names an
+    unknown id, is rejected at load time."""
+    base = json.load(open(SHIPPED_CONFIG))
+
+    bad = dict(base, recommended=["UNet_PT_int8", "Spruce_Deadwood_int8"])
+    cfg = tmp_path / "disagree.json"
+    cfg.write_text(json.dumps(bad))
+    with pytest.raises(ValueError) as exc:
+        mr.load_registry(str(cfg))
+    assert "gui_default" in str(exc.value)
+
+    bad = dict(base, recommended=["NoSuchModel"], gui_default="NoSuchModel")
+    cfg = tmp_path / "unknown.json"
+    cfg.write_text(json.dumps(bad))
+    with pytest.raises(ValueError):
+        mr.load_registry(str(cfg))
+
+    # absent 'recommended' -> gui_default is the ranking (back-compat)
+    ok = {k: v for k, v in base.items() if k != "recommended"}
+    cfg = tmp_path / "norec.json"
+    cfg.write_text(json.dumps(ok))
+    reg = mr.load_registry(str(cfg))
+    assert reg.recommended == ["Spruce_Deadwood_int8"]
+    assert reg.default_entry(device="cpu").id == "Spruce_Deadwood_int8"
+
+
 # --- resolution --------------------------------------------------------------
 
 def test_resolve_explicit_id_never_rewritten():
@@ -205,7 +362,7 @@ def test_resolve_explicit_id_never_rewritten():
     for device in ("cpu", "gpu"):
         e = reg.resolve("General", device=device)
         assert e.id == "General"
-        assert e.file == "General.onnx"
+        assert e.file == "model_UNet_GenDS_512.onnx"
     # explicit variant ids resolve to themselves too
     assert reg.resolve("UNet_PT_int8", device="gpu").id == "UNet_PT_int8"
 
@@ -390,9 +547,10 @@ def test_installer_v2_no_startup_network(tmp_path, monkeypatch):
 def test_batch_resolution_shipped_v2(tmp_path):
     paths = wb.load_model_paths(config_path=SHIPPED_CONFIG,
                                 model_dir=str(tmp_path))
-    # classic ids keep today's on-disk names
-    for name in CLASSIC:
-        assert paths[name] == str(tmp_path / f"{name}.onnx")
+    # classic ids keep working; they now resolve to the models-v1
+    # asset basenames they were repointed onto
+    for name, asset in zip(CLASSIC, CLASSIC_ASSETS):
+        assert paths[name] == str(tmp_path / asset)
     # zoo ids resolve to the release asset basenames
     assert (paths["UNet_PT_int8"]
             == str(tmp_path / "unet_w05_int8_cpu.onnx"))
@@ -434,8 +592,8 @@ def test_batch_lowercase_general_still_resolves(tmp_path, capsys):
                   "--input", str(tmp_path)])
     assert rc == 2          # file missing, but the NAME resolved
     out = capsys.readouterr().out
-    assert "General.onnx" in out
-    assert "models-onnx-v1" in out   # classic hint, not the zoo hint
+    assert "model_UNet_GenDS_512.onnx" in out
+    assert "WINMOL_segmentor_pt" in out   # repointed onto the zoo release
 
 
 def test_batch_download_on_demand(tmp_path, monkeypatch, capsys):

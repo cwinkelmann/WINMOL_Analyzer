@@ -17,21 +17,68 @@ wants the old shape — but external scripts that `json.load` the file and
 iterate `.items()` must migrate.
 
 What an entry carries: stable `id` (the four classic ids **General, Beech,
-Spruce, Spruce_Deadwood are unchanged**, same URLs, same on-disk file names —
-existing caches stay valid), a human-readable `label`/`description`, the
-download `url`, the mandatory on-disk `file` name (always the URL basename;
-one naming rule for the plugin's `models/` dir *and* the batch CLI's
-`--model-dir`, ending the old key-vs-basename split), a checksum (`sha256`
-for the model-zoo assets, `md5` for the Zenodo HDF5 originals, `null` = skip
-verification), and metadata (`family`, `backend`, `precision`, `f1`,
-`size_mb`, `lossless`, `hidden`).
+Spruce, Spruce_Deadwood are unchanged**), a human-readable
+`label`/`description`, the download `url`, the mandatory on-disk `file` name
+(always the URL basename; one naming rule for the plugin's `models/` dir
+*and* the batch CLI's `--model-dir`, ending the old key-vs-basename split),
+a checksum (`sha256` for the model-zoo assets, `md5` for the Zenodo HDF5
+originals), and metadata (`family`, `backend`, `precision`, `f1`, `size_mb`,
+`lossless`, `hidden`).
+
+**Every downloadable entry is digest-pinned.** There is no unverifiable
+download left in the registry, and
+`tests/test_model_registry.py::test_every_entry_has_a_digest` fails the
+build if an unpinned entry is added. Getting there required repointing the
+four classic ids (2026-07-21) from the older `models-onnx-v1` release of
+this repo — for which no checksums were ever published — onto the
+`models-v1` assets `model_UNet_{GenDS,SpecDS_Beech,SpecDS_Spruce,
+SpecDS_Spruce_Deadwood}_512.onnx`, which the zoo manifest states are
+conversions of the *same* upstream Keras HDF5 and numerically identical.
+**Consequence:** the on-disk names changed (`General.onnx` →
+`model_UNet_GenDS_512.onnx`, etc.), so a previously downloaded classic
+model is no longer recognized and is re-fetched once (124.6 MB each). The
+old release is untouched and still downloadable, but it is no longer
+referenced by the registry.
+
+**Defaults are ranked and device-aware.** `recommended` is an explicit
+ranked list, best first, and `recommended[0]` must equal `gui_default` (the
+loader rejects a registry where they disagree). Shipped ranking:
+
+1. `Spruce_Deadwood_int8` — INT8 Spruce + standing deadwood (SpecDS),
+   31.4 MB, the default.
+2. `UNet_PT_int8` — `unet_w05_int8_cpu.onnx`, 7.9 MB, TestDS F1 0.760.
+
+`Registry.default_entry(device)` computes the **effective** default: it
+keeps `recommended[0]`'s family (the domain choice) and takes that family's
+`cpu` (int8) variant on a CPU host or its `gpu` (fp16) variant on a GPU
+host. It never downloads and never touches the network beyond the local
+`detect_device()` probe. It deliberately bypasses `resolve`'s lossless-only
+gate, because here the registry has *itself* nominated an optimised entry —
+honouring the device is the declared intent, not a silent substitution. Any
+explicit selection (a GUI entry, `winmol_batch <MODEL>`, `--variant`)
+overrides it. The GUI lists the recommended families first and preselects
+the matching variant, so what is displayed is what runs.
+
+> **Caveat, stated honestly:** the classic `_int8` builds (including the
+> default) are described in the zoo manifest as "post-training static int8,
+> domain-calibrated" — they are **not** certified lossless there, and carry
+> `"lossless": false` here. Only the `_fp16` variants, and the PyTorch UNet
+> w05 int8, are certified lossless. The int8 Spruce+Deadwood default is a
+> product decision (31.4 MB, fast on CPU), not a measured-equivalence
+> claim. On a GPU host the effective default is the lossless fp16 variant.
+
+> **Naming, to stop a recurring mix-up:** there is no "SpecDS INT8 W05"
+> build. `w05` belongs only to the **PyTorch UNet** family (beech), asset
+> `unet_w05_int8_cpu.onnx` (entry `UNet_PT_int8`); `SpecDS` names the
+> classic per-species **Keras** models, which have no `w05` variant. The
+> runner-up above is the PyTorch `w05` asset.
 
 **Families and variants.** A family groups the precision variants of one
 trained model: `default` (fp32 reference), `cpu` (int8), `gpu` (fp16).
 Resolution rules (`Registry.resolve`):
 
 - An **explicit model id is never rewritten** — `General` always means the
-  fp32 `General.onnx`, on every device, under every `--variant`.
+  fp32 GenDS model, on every device, under every `--variant`.
 - A **family id** (`unet_pt`, `classic_spruce`, `hrnet`, …) picks the family
   default; with variant `auto` the device variant is substituted **only when
   it is certified `lossless`** (the classic int8s are domain-calibrated, not
@@ -42,11 +89,10 @@ Resolution rules (`Registry.resolve`):
   `nvidia-smi` probe. Apple-Silicon/CoreML machines report `cpu`; use
   `WINMOL_DEVICE`/`WINMOL_ONNX_PROVIDERS` to steer if needed.
 
-**Sources.** Classic four: the `models-onnx-v1` release of this repo (their
-`sha256` is still `null` — TODO: compute and fill; until then they verify
-like before, by existence only). Zoo: the `models-v1` release of
-`cwinkelmann/WINMOL_segmentor_pt` (22 ONNX assets, sha256 from its
-SHA256SUMS; all share one contract — NCHW `[b,3,512,512]` float32 in [0,1] →
+**Sources.** All 22 ONNX entries (the classic four included, since the
+repoint above) come from the `models-v1` release of
+`cwinkelmann/WINMOL_segmentor_pt`, sha256-pinned from its
+SHA256SUMS (all share one contract — NCHW `[b,3,512,512]` float32 in [0,1] →
 `[b,1,512,512]`, sigmoid baked in, opset 17 — and load unchanged through
 `OnnxSegmenter`). Originals: Zenodo record 15907576
 (DOI 10.5281/zenodo.15907576), the four Keras `.hdf5`, md5-pinned, marked
