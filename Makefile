@@ -30,6 +30,18 @@ PLUGINNAME = WINMOL_Analyzer
 # environment that has the runtime dependencies installed.
 PYTHON = python3
 
+# Two distinct things that both used to be called VERSION:
+#   REF            — the git ref `make package` exports (a commit or tag).
+#                    Kept aliased to VERSION so the historically documented
+#                    `make package VERSION=Version_0.3.2` still means the ref.
+#   PLUGIN_VERSION — the version stamped into metadata.txt and into the zip
+#                    FILE name. Defaults to whatever metadata.txt already
+#                    says; CI derives it from the tag instead
+#                    (scripts/plugin_version.py).
+VERSION ?= HEAD
+REF ?= $(VERSION)
+PLUGIN_VERSION ?= $(shell sed -n 's/^version=//p' metadata.txt)
+
 # The plugin GUI (QGIS side) AND the compute core it shells out to: winmol_run.py
 # needs classes/, utils/, plugin_utils/, config.json and requirements/ to run.
 PY_FILES = \
@@ -150,16 +162,21 @@ zip: deploy dclean
 	cd $(HOME)/$(QGISDIR)/python/plugins; zip -9r $(CURDIR)/$(PLUGINNAME).zip $(PLUGINNAME)
 
 package: compile
-	# Create a zip package of the plugin named $(PLUGINNAME).zip.
+	# Create a zip package named $(PLUGINNAME)-<version>.zip. The version is
+	# in the FILE name only: the directory inside the archive stays
+	# $(PLUGINNAME), because QGIS identifies an installed plugin by it.
 	# This requires use of git (your plugin development directory must be a
 	# git repository).
-	# To use, pass a valid commit or tag as follows:
-	#   make package VERSION=Version_0.3.2
+	# Pass a valid commit or tag to export:
+	#   make package REF=v0.6.0.2          (VERSION= is an accepted alias)
+	# and optionally override the stamped version:
+	#   make package REF=v0.6.0.2 PLUGIN_VERSION=0.6.0.2
 	@echo
 	@echo "------------------------------------"
 	@echo "Exporting plugin to zip package.	"
 	@echo "------------------------------------"
-	bash scripts/build_plugin_zip.sh $(VERSION) $(PLUGINNAME).zip
+	bash scripts/build_plugin_zip.sh $(REF) \
+		$(PLUGINNAME)-$(PLUGIN_VERSION).zip $(PLUGIN_VERSION)
 
 clean:
 	@echo
