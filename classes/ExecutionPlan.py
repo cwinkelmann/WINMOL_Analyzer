@@ -54,6 +54,7 @@ class ExecutionPlan:
     tile_overlap_m: float
     halo_px: int
     estimated_prediction_tiles: int
+    estimated_vector_tiles: int
     prediction_batch_size: int
     producer_queue_batches: int
     producer_workers: int
@@ -106,6 +107,36 @@ def _estimate_prediction_tiles(config: Any, raster: RasterInfo) -> int:
     return max(1, x_tiles * y_tiles)
 
 
+def _estimate_vector_tiles(config: Any, raster: RasterInfo) -> int:
+    """Estimate the VECTOR-stage tile count (tile_inner_px grid).
+
+    The vector grid is laid over the PREDICTED stem map, whose pixel size is
+    tile_size / img_width meters (the prediction resamples to the model's
+    native resolution), not over the input orthomosaic's grid. The previous
+    scheduler gated tile parallelism on the estimated PREDICTION tile count
+    (~512 px grid, hundreds of tiles), which made the "few tiles" gate
+    meaningless: a raster with 2 vector tiles and 600 prediction tiles was
+    scheduled as if it had hundreds of independent vector work items.
+    """
+    if raster.width <= 0 or raster.height <= 0:
+        return 0
+    tile_inner_px = max(1, int(_cfg(config, 'tile_inner_px', 4096)))
+    px_x = abs(raster.pixel_size_x) or 0.0
+    px_y = abs(raster.pixel_size_y) or 0.0
+    tile_size = float(_cfg(config, 'tile_size', 15.0))
+    img_width = int(_cfg(config, 'img_width', 512))
+    pred_px = tile_size / max(img_width, 1)
+    if px_x > 0.0 and px_y > 0.0 and pred_px > 0.0:
+        est_width = raster.width * px_x / pred_px
+        est_height = raster.height * px_y / pred_px
+    else:
+        est_width = float(raster.width)
+        est_height = float(raster.height)
+    x_tiles = int(math.ceil(est_width / tile_inner_px))
+    y_tiles = int(math.ceil(est_height / tile_inner_px))
+    return max(1, x_tiles * y_tiles)
+
+
 def _scenario(hardware: Any) -> str:
     gpu_count = int(getattr(hardware, 'gpu_count', 0) or 0)
     if gpu_count <= 0:
@@ -124,27 +155,49 @@ def _vector_worker_split(
     config: Any,
     hw_cpu: int,
     cpu_workers: int,
-    tiles: int,
+    vector_tiles: int,
     process_type: str,
     huge_nodes_job: bool,
 ) -> tuple[int, int]:
+    """Split the CPU budget into tile-level x inner-stage workers.
+
+    Tile workers and inner workers COMPOSE (tile_workers * inner_workers
+    <= cpu_workers) instead of excluding each other: measured vector wall
+    time equalled the serial sum of per-tile totals because the old split
+    returned either (N, 1) or (1, N), and the (N, 1) branch was additionally
+    gated behind cpu_workers // 4, which is <= 1 on most workstations.
+
+    ``vector_tiles`` is the estimated VECTOR tile count (see
+    _estimate_vector_tiles), not the prediction tile count the old code
+    received.
+    """
     if process_type == 'Stems':
         return 1, max(1, cpu_workers)
-
-    if tiles < 8 or hw_cpu < 8:
-        inner = cpu_workers if not huge_nodes_job else max(1, hw_cpu // 5)
-        return 1, max(1, inner)
 
     max_tile_workers = max(
         1,
         int(_cfg(config, 'max_vector_tile_workers', 4)),
     )
-    tile_workers = min(max_tile_workers, max(1, cpu_workers // 4), tiles)
-    if tile_workers <= 1:
-        inner = cpu_workers if not huge_nodes_job else max(1, hw_cpu // 5)
-        return 1, max(1, inner)
 
-    return max(1, tile_workers), 1
+    if huge_nodes_job:
+        # Memory guard (unchanged): dense multi-tile jobs keep the old
+        # conservative split so at most max_tile_workers tiles are resident
+        # and inner pools stay trimmed.
+        if vector_tiles < 2 or hw_cpu < 8:
+            return 1, max(1, hw_cpu // 5)
+        tile_workers = min(
+            max_tile_workers, max(1, cpu_workers // 4), vector_tiles)
+        if tile_workers <= 1:
+            return 1, max(1, hw_cpu // 5)
+        return tile_workers, 1
+
+    if vector_tiles < 2 or hw_cpu < 8:
+        return 1, max(1, cpu_workers)
+
+    tile_workers = min(max_tile_workers, cpu_workers, vector_tiles)
+    if tile_workers <= 1:
+        return 1, max(1, cpu_workers)
+    return tile_workers, max(1, cpu_workers // tile_workers)
 
 
 def _resolve_prediction_mode(config: Any, scen: str) -> str:
@@ -186,6 +239,7 @@ def build_execution_plan(
         max(hw_cpu - 1, 1),
     )
     tiles = _estimate_prediction_tiles(config, raster)
+    vector_tiles = _estimate_vector_tiles(config, raster)
     scen = _scenario(hardware)
     gpu_mem_gb = _gpu_memory_gb(hardware)
     large_prediction_job = raster.estimated_input_gb >= 4.0 or tiles >= 800
@@ -318,7 +372,7 @@ def build_execution_plan(
         config,
         hw_cpu,
         cpu_workers,
-        tiles,
+        vector_tiles,
         process_type,
         huge_nodes_job,
     )
@@ -334,6 +388,7 @@ def build_execution_plan(
         tile_overlap_m=tile_overlap_m,
         halo_px=halo_px,
         estimated_prediction_tiles=tiles,
+        estimated_vector_tiles=vector_tiles,
         prediction_batch_size=prediction_batch_size,
         producer_queue_batches=producer_queue_batches,
         producer_workers=producer_workers,

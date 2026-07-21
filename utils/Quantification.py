@@ -34,13 +34,23 @@ def _as_binary_mask(pred):
 
 
 def _worker_count(config=None):
+    """Inner-parallelism budget for the current process.
+
+    Mirrors Skeletonization._worker_count: daemonic pool workers stay
+    serial; non-daemonic child processes (vector tile workers) may use
+    the per-tile budget from config.cpu_workers so tile-level and
+    inner-stage parallelism compose. The pools here are ThreadPools, so
+    even the composed case only adds threads, never grandchild processes.
+    """
     proc = mp.current_process()
-    if proc.name != "MainProcess":
+    if bool(getattr(proc, 'daemon', False)):
         return 1
 
     value = getattr(config, 'cpu_workers', None) \
         if config is not None else None
     if value is None:
+        if proc.name != "MainProcess":
+            return 1
         value = max(mp.cpu_count() - 1, 1)
     try:
         return max(1, int(value))

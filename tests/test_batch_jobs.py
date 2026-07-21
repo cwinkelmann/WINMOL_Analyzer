@@ -5,6 +5,7 @@ loop it replaces, so these pin the invariants rather than the speed. They also
 pin the failure behaviour: the previous loop raised out on the first bad file
 and abandoned the rest of the batch.
 """
+import json
 import subprocess
 
 import pytest
@@ -17,8 +18,10 @@ def fake_run(monkeypatch):
     """Record calls instead of launching winmol_run.py."""
     calls = []
 
-    def _run(input_image, model_path, output_folder, gpu_id=None):
-        calls.append({"ortho": input_image, "gpu": gpu_id})
+    def _run(input_image, model_path, output_folder, gpu_id=None,
+             cpu_budget=None):
+        calls.append({"ortho": input_image, "gpu": gpu_id,
+                      "cpu_budget": cpu_budget})
         if "boom" in input_image:
             raise subprocess.CalledProcessError(1, "winmol_run.py")
 
@@ -75,3 +78,52 @@ def test_sequential_path_still_reports_failures(fake_run, monkeypatch):
     assert [f[0] for f in failures] == ["/in/boom.tif"]
     assert len(fake_run) == 3
     assert {c["gpu"] for c in fake_run} == {None}
+
+
+def test_parallel_jobs_share_the_cpu_budget(fake_run, monkeypatch):
+    """Each child plans against the whole machine, so N concurrent vector
+    phases would oversubscribe the cores N-fold without a per-job cap."""
+    monkeypatch.setattr(winmol_batch, "detect_gpu_count", lambda: 2)
+    monkeypatch.setattr(winmol_batch.os, "cpu_count", lambda: 16)
+
+    winmol_batch.process_orthos(["/in/a.tif", "/in/b.tif"], "/m.onnx", "/out",
+                                jobs=2)
+
+    assert {c["cpu_budget"] for c in fake_run} == {8}
+
+
+def test_sequential_jobs_keep_the_whole_machine(fake_run):
+    winmol_batch.process_orthos(["/in/a.tif"], "/m.onnx", "/out", jobs=1)
+
+    assert {c["cpu_budget"] for c in fake_run} == {None}
+
+
+def test_cpu_budget_lands_in_child_overrides(monkeypatch):
+    captured = {}
+
+    def _fake_subprocess_run(command, check, env):
+        captured["env"] = env
+
+    monkeypatch.setattr(winmol_batch.subprocess, "run", _fake_subprocess_run)
+    monkeypatch.delenv("WINMOL_CONFIG_OVERRIDES_JSON", raising=False)
+
+    winmol_batch.run_winmol("/in/a.tif", "/m.onnx", "/tmp/out", gpu_id=0,
+                            cpu_budget=6)
+
+    overrides = json.loads(captured["env"]["WINMOL_CONFIG_OVERRIDES_JSON"])
+    assert overrides == {"max_cpu_workers": 6}
+
+
+def test_cpu_budget_does_not_override_an_explicit_user_cap():
+    merged = winmol_batch._with_cpu_budget('{"max_cpu_workers": 2}', 8)
+    assert json.loads(merged) == {"max_cpu_workers": 2}
+
+
+def test_cpu_budget_merges_with_existing_overrides():
+    merged = winmol_batch._with_cpu_budget('{"tile_inner_px": 512}', 8)
+    assert json.loads(merged) == {"tile_inner_px": 512,
+                                  "max_cpu_workers": 8}
+
+
+def test_cpu_budget_passes_unparsable_overrides_through():
+    assert winmol_batch._with_cpu_budget("{not json", 8) == "{not json"

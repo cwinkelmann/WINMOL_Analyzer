@@ -3,6 +3,7 @@
 ################################################################################
 """Imports"""
 
+import atexit
 import math
 import multiprocessing as mp
 from typing import Any, List, Tuple
@@ -31,18 +32,71 @@ def _as_binary_mask(pred):
 
 
 def _worker_count(config=None):
+    """Inner-parallelism budget for the current process.
+
+    Daemonic pool workers may not spawn children, so they always run
+    serial. Non-daemonic child processes (the vector stage's tile workers,
+    spawned via ProcessPoolExecutor) may use the per-tile budget the
+    scheduler wrote into config.cpu_workers — this is what lets tile-level
+    and inner-stage parallelism compose. A child process WITHOUT an
+    explicit budget stays serial rather than grabbing every core.
+    """
     proc = mp.current_process()
-    if proc.name != "MainProcess":
+    if bool(getattr(proc, 'daemon', False)):
         return 1
 
     value = getattr(config, 'cpu_workers', None) \
         if config is not None else None
     if value is None:
+        if proc.name != "MainProcess":
+            return 1
         value = max(mp.cpu_count() - 1, 1)
     try:
         return max(1, int(value))
     except Exception:
         return 1
+
+
+_REFINE_POOL = None
+_REFINE_POOL_WORKERS = 0
+
+
+def _refine_pool(workers: int) -> mp.pool.Pool:
+    """Persistent process pool for refine_skeleton_segments.
+
+    Pool startup costs ~1.6 s per pool on spawn-start platforms (macOS,
+    Windows), and refine used to pay it once PER TILE. Reuse one pool for
+    the life of the process — per tile worker on the parallel vector path,
+    once overall on the serial path — and resize it only when the
+    requested worker count changes.
+    """
+    global _REFINE_POOL, _REFINE_POOL_WORKERS
+    if _REFINE_POOL is not None and _REFINE_POOL_WORKERS == workers:
+        return _REFINE_POOL
+    close_refine_pool()
+    _REFINE_POOL = mp.Pool(workers)
+    _REFINE_POOL_WORKERS = workers
+    return _REFINE_POOL
+
+
+def close_refine_pool():
+    global _REFINE_POOL, _REFINE_POOL_WORKERS
+    pool = _REFINE_POOL
+    _REFINE_POOL = None
+    _REFINE_POOL_WORKERS = 0
+    if pool is None:
+        return
+    try:
+        pool.close()
+        pool.join()
+    except Exception:
+        try:
+            pool.terminate()
+        except Exception:
+            pass
+
+
+atexit.register(close_refine_pool)
 
 
 ################################################################################
@@ -398,21 +452,23 @@ def refine_skeleton_segments(parts: List[Part], skel: np.ndarray,
                 measuring_point_spacing, min_length
             ))
     else:
-        with mp.Pool(workers) as pool:
-            r = []
-            for part in parts:
-                low_bounds = (part.l_bound[0] - 5, part.l_bound[1] - 5)
-                up_bounds = (part.u_bound[0] + 5, part.u_bound[1] + 5)
-                sub_skel = skel[
-                    low_bounds[0]:up_bounds[0] + 1,
-                    low_bounds[1]:up_bounds[1] + 1
-                ]
-                r.append(pool.apply_async(refine_skeleton_segment, args=(
-                    part, low_bounds, up_bounds, sub_skel,
-                    measuring_point_spacing, min_length
-                ), callback=return_callback, error_callback=error_callback))
-            for r_ in r:
-                r_.wait()
+        # Persistent pool: all results are consumed (r_.wait) before this
+        # function returns, so reusing it across tiles is safe.
+        pool = _refine_pool(workers)
+        r = []
+        for part in parts:
+            low_bounds = (part.l_bound[0] - 5, part.l_bound[1] - 5)
+            up_bounds = (part.u_bound[0] + 5, part.u_bound[1] + 5)
+            sub_skel = skel[
+                low_bounds[0]:up_bounds[0] + 1,
+                low_bounds[1]:up_bounds[1] + 1
+            ]
+            r.append(pool.apply_async(refine_skeleton_segment, args=(
+                part, low_bounds, up_bounds, sub_skel,
+                measuring_point_spacing, min_length
+            ), callback=return_callback, error_callback=error_callback))
+        for r_ in r:
+            r_.wait()
 
     print("Number of split segments:", split)
     print("Number of removed segments:", out)
