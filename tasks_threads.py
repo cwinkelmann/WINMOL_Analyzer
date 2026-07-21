@@ -132,8 +132,13 @@ class EnvSetupWorker(QObject):
                 self.done.emit(self.target_exe)
                 return
             venv = installer.venv_location(self.plugin_dir)
+            # download=False: the Setup tab owns every byte of model
+            # traffic. Bundling a model fetch into the environment build
+            # is what used to end a first-ever setup with a download
+            # failure the user could neither retry nor understand.
             info = installer.setup_environment(
-                venv, plugin_dir=self.plugin_dir, progress=self._emit)
+                venv, plugin_dir=self.plugin_dir, download=False,
+                progress=self._emit)
             self.done.emit(info.get("python") or "")
         except Exception as exc:
             self.failed.emit(str(exc))

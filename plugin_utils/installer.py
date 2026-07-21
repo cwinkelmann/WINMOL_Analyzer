@@ -31,6 +31,8 @@ import json
 import os
 import queue
 import re
+import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -103,7 +105,6 @@ def managed_base_python(plugin_dir, progress=None) -> str:
     still gets a working 3.11. Raises RuntimeError only if no 3.11 is on PATH
     AND the download/extract fails.
     """
-    import shutil
     for name in ("python3.11", "python3.11.exe", "python3", "python"):
         exe = shutil.which(name)
         if exe and _python_version(exe) == (3, 11):
@@ -114,7 +115,6 @@ def managed_base_python(plugin_dir, progress=None) -> str:
 
 
 def get_python_command() -> str:
-    import shutil
     return "python3" if shutil.which("python3") else "python"
 
 
@@ -153,7 +153,6 @@ def choose_base_python() -> str:
     Returns the executable path, or raises RuntimeError with an actionable
     message if none in the supported range is found.
     """
-    import shutil
     candidates = []
     for name in ("python3.11", "python3.10", "python3.12", "python3.9",
                  "python3", "python"):
@@ -227,6 +226,185 @@ def _write_marker(venv_path) -> None:
     with open(_marker_path(venv_path), "w") as f:
         json.dump({"req_hash": _requirements_hash(),
                    "requirements": str(plugin_requirements_path())}, f)
+
+
+def invalidate_marker(venv_path) -> bool:
+    """Drop the ``.winmol_ready`` sentinel so :func:`is_ready` reports the
+    environment as needing a rebuild.
+
+    Called as the first step of BOTH "Reinstall dependencies" and
+    "Delete environment": ``setup_environment`` short-circuits on a valid
+    marker, so a repair would otherwise silently do nothing, and a
+    half-deleted venv would keep being blessed as ready.
+
+    Returns True when a marker was actually removed.
+    """
+    try:
+        os.remove(_marker_path(venv_path))
+        return True
+    except OSError:
+        return False
+
+
+# --- disk usage / removal ---------------------------------------------------
+
+def directory_size(path) -> int:
+    """Total size in bytes of the files under ``path`` (0 when absent).
+
+    Symlinks are not followed and unreadable entries are skipped: this
+    feeds a human-readable "frees N GB" figure, so it must never raise.
+    """
+    total = 0
+    for root, _dirs, files in os.walk(path, onerror=lambda _e: None):
+        for name in files:
+            full = os.path.join(root, name)
+            try:
+                if not os.path.islink(full):
+                    total += os.path.getsize(full)
+            except OSError:
+                pass
+    return total
+
+
+def path_is_inside(path, root) -> bool:
+    """True when ``path`` is ``root`` or a descendant of it.
+
+    realpath + normcase are mandatory rather than a plain
+    ``os.path.commonpath``: on Windows a user's own conda interpreter can
+    reach the same tree through a different case or an 8.3 short path,
+    and mis-classifying it is the difference between "forget this
+    setting" and "rmtree a Python we never created".
+    """
+    if not path or not root:
+        return False
+    a = os.path.normcase(os.path.realpath(path))
+    b = os.path.normcase(os.path.realpath(root))
+    return a == b or a.startswith(b + os.sep)
+
+
+def _managed_roots(plugin_dir) -> tuple:
+    return (managed_root(plugin_dir), plugin_dir)
+
+
+def _is_managed_path(path, plugin_dir) -> bool:
+    """A path may only be deleted when it is a STRICT descendant of the
+    managed root or of the plugin directory."""
+    for root in _managed_roots(plugin_dir):
+        if not root:
+            continue
+        if path_is_inside(path, root) and not path_is_inside(root, path):
+            return True
+    return False
+
+
+def _chmod_retry(func, path):
+    """rmtree error handler: clear the read-only bit (Windows venvs ship
+    read-only files) and retry once; re-raise if it still fails."""
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+
+def _rmtree(path) -> None:
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=lambda f, p, _e: _chmod_retry(f, p))
+    else:
+        shutil.rmtree(path, onerror=lambda f, p, _i: _chmod_retry(f, p))
+
+
+def remove_environment(plugin_dir, remove_venv=True, remove_runtime=False,
+                       remove_models=False, configured_exe=None,
+                       dry_run=False, progress=None) -> dict:
+    """Delete WINMOL's managed artifacts. Never raises.
+
+    Returns ``{'planned': [(path, bytes)], 'removed': [path],
+    'failed': [(path, message)], 'freed_bytes': int,
+    'clear_setting': bool}``. With ``dry_run=True`` the SAME dict shape
+    comes back without anything being deleted — the confirmation text and
+    its "frees N GB" figure are therefore produced by the exact code path
+    that performs the deletion, so the two can never drift.
+
+    ``clear_setting`` is True only when ``configured_exe`` resolves
+    INSIDE a tree that is actually being removed; a bring-your-own conda
+    interpreter is never touched and never un-configured. The caller (the
+    dialog) performs the QgsSettings write — this module stays importable
+    without QGIS.
+    """
+    report = _as_progress(progress)
+    venv = venv_location(plugin_dir)
+    runtime = os.path.join(managed_root(plugin_dir), "py311")
+    models_dir = os.path.join(plugin_dir, MODELS_PATH)
+    result = {"planned": [], "removed": [], "failed": [],
+              "freed_bytes": 0, "clear_setting": False}
+
+    result["clear_setting"] = bool(
+        remove_venv and configured_exe
+        and path_is_inside(configured_exe, venv))
+
+    trees = []
+    if remove_venv:
+        trees.append(venv)
+    if remove_runtime:
+        trees.append(runtime)
+    for path in trees:
+        if not _is_managed_path(path, plugin_dir):
+            result["failed"].append(
+                (path, "refused: outside the managed tree"))
+            continue
+        if os.path.isdir(path):
+            result["planned"].append((path, directory_size(path)))
+
+    model_plan = None
+    if remove_models:
+        if not _is_managed_path(models_dir, plugin_dir):
+            result["failed"].append(
+                (models_dir, "refused: outside the managed tree"))
+        else:
+            model_plan = _plan_models(plugin_dir, models_dir, dry_run=True)
+            if model_plan["freed_bytes"] or model_plan["planned"]:
+                result["planned"].append(
+                    (models_dir, model_plan["freed_bytes"]))
+
+    if dry_run:
+        result["freed_bytes"] = sum(size for _p, size in result["planned"])
+        return result
+
+    # A half-deleted venv must degrade to "needs rebuild", never stay
+    # blessed by is_ready(); do this BEFORE the first rmtree.
+    if remove_venv:
+        invalidate_marker(venv)
+
+    for path, size in list(result["planned"]):
+        if path == models_dir:
+            continue
+        report.phase(f"Removing {path} …")
+        try:
+            _rmtree(path)
+            result["removed"].append(path)
+            result["freed_bytes"] += size
+        except Exception as exc:
+            result["failed"].append((path, str(exc)))
+    if model_plan is not None:
+        done = _plan_models(plugin_dir, models_dir, dry_run=False,
+                            progress=report)
+        result["removed"].extend(done["removed"])
+        result["failed"].extend(done["failed"])
+        result["freed_bytes"] += done["freed_bytes"]
+    return result
+
+
+def _plan_models(plugin_dir, models_dir, dry_run, progress=None):
+    """Delegate model removal to the registry (it owns the naming rule,
+    the ``*.part`` leftovers and the verified-digest memo)."""
+    empty = {"planned": [], "removed": [], "failed": [], "freed_bytes": 0}
+    try:
+        from . import model_registry
+        registry = model_registry.load_registry(
+            os.path.join(plugin_dir, "config.json"))
+    except Exception as exc:
+        if not dry_run and progress is not None:
+            progress(f"Could not read the model registry: {exc}")
+        return empty
+    return model_registry.remove_all(registry, models_dir, dry_run=dry_run)
 
 
 # --- progress reporting -----------------------------------------------------
@@ -605,8 +783,8 @@ def installed_message(missing_models) -> str:
         return "WINMOL environment installed."
     names = ", ".join(sorted(missing_models))
     return ("WINMOL environment installed, but these models could not be "
-            f"downloaded: {names}. Check your internet connection and use the "
-            "Environment button to retry, or Browse to select a local .onnx "
+            f"downloaded: {names}. Check your internet connection and open "
+            "the Setup tab to retry, or Browse to select a local .onnx "
             "model file.")
 
 
@@ -694,7 +872,7 @@ def resolve_environment(plugin_dir, prompt=True, build=True) -> dict:
         result.update(
             status="needs_setup",
             message="WINMOL environment not set up yet. Open the plugin and "
-                    "use the Environment button to create it (Python 3.11 + "
+                    "use the Setup tab to create it (Python 3.11 + "
                     "onnxruntime).")
         return result
 

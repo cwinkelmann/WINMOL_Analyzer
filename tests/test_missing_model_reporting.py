@@ -6,6 +6,8 @@ returned by installer and referenced nowhere else, so a user whose download
 failed got "WINMOL environment installed." and an empty model list, with no
 indication anything had gone wrong.
 """
+import os
+
 import pytest
 
 from plugin_utils import installer
@@ -54,3 +56,51 @@ def test_no_warning_when_every_model_downloaded(
                                            build=True)
     assert result["status"] == "installed"
     assert "could not" not in result["message"].lower(), result["message"]
+
+
+# --- the schema-v2 hazard ---------------------------------------------------
+
+SHIPPED_CONFIG = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "config.json")
+
+#: The top-level keys of the schema-v2 registry. The v1 loop iterated
+#: config.json's keys directly, so every one of these was reported as a
+#: model that could not be downloaded — a fabricated failure at the end
+#: of the very first environment build.
+V2_TOP_LEVEL_KEYS = ("_comment", "schema", "tile_px", "gui_default",
+                     "preload", "families", "models", "recommended")
+
+
+def test_download_models_never_reports_registry_keys_as_models(
+        tmp_path, monkeypatch):
+    def _no_network(*_a, **_k):
+        raise AssertionError("startup must perform zero network I/O")
+    monkeypatch.setattr(installer.urllib.request, "urlretrieve", _no_network)
+    from plugin_utils import model_registry
+    monkeypatch.setattr(model_registry, "_DEFAULT_FETCHER", _no_network)
+
+    missing = installer.download_models(str(tmp_path),
+                                        config_path=SHIPPED_CONFIG)
+    assert missing == []
+    assert not set(missing) & set(V2_TOP_LEVEL_KEYS)
+
+
+def test_the_environment_build_does_not_fetch_models(monkeypatch):
+    """The Setup tab owns every byte of model traffic: an environment
+    build must not end with a model download failure the user can
+    neither retry nor understand."""
+    import ast
+    path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "tasks_threads.py")
+    tree = ast.parse(open(path, encoding="utf-8").read())
+    calls = [n for n in ast.walk(tree)
+             if isinstance(n, ast.Call)
+             and getattr(n.func, "attr", None) == "setup_environment"]
+    assert calls, "EnvSetupWorker no longer calls setup_environment"
+    for call in calls:
+        flags = {kw.arg: kw.value for kw in call.keywords}
+        assert "download" in flags, (
+            "setup_environment must be called with download=False")
+        assert flags["download"].value is False
