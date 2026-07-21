@@ -99,9 +99,14 @@ class EnvSetupWorker(QObject):
     done = pyqtSignal(str)      # interpreter path on success ('' if unknown)
     failed = pyqtSignal(str)    # error message
 
-    def __init__(self, plugin_dir):
+    def __init__(self, plugin_dir, target_exe=None):
         super().__init__()
         self.plugin_dir = plugin_dir
+        # When set, install the deps INTO this existing interpreter instead of
+        # building the managed venv (the "Choose interpreter…" path). Running
+        # it here rather than inline keeps pip off the GUI thread, which is
+        # what used to freeze QGIS for the whole install.
+        self.target_exe = target_exe
         self._cancelled = False
 
     def cancel(self):
@@ -110,13 +115,25 @@ class EnvSetupWorker(QObject):
         worker returns within a bounded time and teardown can wait it out."""
         self._cancelled = True
 
+    def _emit(self, message):
+        self.log.emit(str(message))
+
     def run(self):
         try:
             from .plugin_utils import installer
+            if self.target_exe:
+                installer.install_requirements_into(self.target_exe,
+                                                    progress=self._emit)
+                if not installer._has_compute_deps(self.target_exe):
+                    self.failed.emit(
+                        f"{self.target_exe} still lacks the WINMOL "
+                        "dependencies after the install.")
+                    return
+                self.done.emit(self.target_exe)
+                return
             venv = installer.venv_location(self.plugin_dir)
             info = installer.setup_environment(
-                venv, plugin_dir=self.plugin_dir,
-                progress=lambda m: self.log.emit(str(m)))
+                venv, plugin_dir=self.plugin_dir, progress=self._emit)
             self.done.emit(info.get("python") or "")
         except Exception as exc:
             self.failed.emit(str(exc))
