@@ -543,3 +543,27 @@ finding: what you did, what you expected, what happened, logs verbatim.
 
 ### (findings below)
 
+
+
+## Release Bugs
+
+### OPEN — 2026-07-21
+I created a demo release https://github.com/cwinkelmann/WINMOL_Analyzer/releases/tag/v0.0.0-demo1
+#### the zip installed, but creating and python environment looks stuck. Nothing happens for a while, making it more verbose would be nice. 
+
+#### The zip had no semantic versioning number.
+
+#### Per default all 3 products should be enabled in the plugin
+
+The plugin should be capable of downloading more models in a dialogue. For now we should pin them against a github release
+
+
+
+
+#### Missing models
+Download missing models from the release page. The plugin should be able to download them automatically.
+https://github.com/cwinkelmann/WINMOL_segmentor_pt/releases 
+Spruce Deadwood as INT8 should be default, A SpecDS INT8 W05 would be second best
+
+### Add a setup tab to the plugin
+There env setup, deletion and model download can be combined. Don't do that in that single tab "Detect stems from UAV images"
