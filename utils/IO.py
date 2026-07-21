@@ -1544,6 +1544,61 @@ def _reconstruct_edge_stems_for_tiled_merge(
     return _stems_to_layer_gdfs(final_stems, target_crs, config=recon_cfg)
 
 
+def write_untiled_results(stems, profile, output_gpkg, config=None):
+    """Write un-tiled vector results with the SAME GeoPackage contract as
+    merge_and_filter_tiled_results: layers ("stems", "nodes", "vectors")
+    rebuilt from the quantified Stem objects via _stems_to_layer_gdfs, so
+    schema, layer names, and CRS handling match the tiled merge exactly.
+
+    Trees and Nodes share this contract — the tiled merge also writes all
+    three layers regardless of process_type (see
+    _reconstruct_edge_stems_for_tiled_merge).
+    """
+    _remove_existing_output(output_gpkg)
+
+    stems = list(stems or [])
+    if not stems:
+        print("")
+        print("UNTILED SUMMARY")
+        print("Total stems written:   0")
+        print("Total nodes written:   0")
+        print("Total vectors written: 0")
+        print(f"No output GPKG created: {output_gpkg} (0 features written)")
+        return output_gpkg
+
+    crs = _crs_from_profile(profile)
+    stems_gdf, nodes_gdf, vectors_gdf = _stems_to_layer_gdfs(
+        stems, crs, config=config)
+
+    written_gpkg = _write_merged(
+        output_gpkg,
+        [stems_gdf] if stems_gdf is not None else [],
+        [nodes_gdf] if nodes_gdf is not None else [],
+        [vectors_gdf] if vectors_gdf is not None else [],
+    )
+    written_layers = []
+    try:
+        written_layers = list(fiona.listlayers(written_gpkg))
+    except Exception as exc:
+        print(
+            f"UNTILED VERIFY FAIL | file {written_gpkg} "
+            f"| {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
+    print("")
+    print("UNTILED SUMMARY")
+    print(f"Total stems written:   "
+          f"{0 if stems_gdf is None else len(stems_gdf)}")
+    print(f"Total nodes written:   "
+          f"{0 if nodes_gdf is None else len(nodes_gdf)}")
+    print(f"Total vectors written: "
+          f"{0 if vectors_gdf is None else len(vectors_gdf)}")
+    print(f"Layers written:        {written_layers}")
+    print(f"Output saved to: {written_gpkg}")
+    return written_gpkg
+
+
 def merge_and_filter_tiled_results(
     work_dir: str,
     output_gpkg: str | None = None,

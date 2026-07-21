@@ -70,6 +70,15 @@ CPU_ONLY = 'cpu_only'
 SINGLE_GPU = 'gpu'
 MULTI_GPU = 'multi_gpu_dgx'
 
+# Untiled vector phase RAM heuristic (Config.vector_processing = 'auto').
+# The legacy whole-raster chain holds the uint8 stem map plus skeletonize /
+# labeling / EDT working copies at once — roughly uint8 pred (1) + bool
+# skeleton (1) + int32 labels (4) + float64 EDT (8) + float64 temporaries
+# (8) ≈ 22 bytes/pixel; doubled for safety margin and rounded up.
+UNTILED_BYTES_PER_PIXEL = 48.0
+# Never plan more than half of physical RAM for the untiled vector phase.
+UNTILED_RAM_BUDGET_FRACTION = 0.5
+
 
 def _cfg(config: Any, key: str, default: Any) -> Any:
     return getattr(config, key, default)
@@ -198,6 +207,59 @@ def _vector_worker_split(
     if tile_workers <= 1:
         return 1, max(1, cpu_workers)
     return tile_workers, max(1, cpu_workers // tile_workers)
+
+
+def _estimate_stem_map_pixels(config: Any, raster: RasterInfo) -> int:
+    """Estimate the pixel count of the PREDICTION-GRID stem map.
+
+    The vector phase consumes the resampled stem map whose pixel size is
+    tile_size / img_width (m/px), not the input orthomosaic grid. When the
+    input has no usable georeferencing, fall back to the input grid size.
+    """
+    if raster.width <= 0 or raster.height <= 0:
+        return 0
+    px_x = abs(raster.pixel_size_x) or 0.0
+    px_y = abs(raster.pixel_size_y) or 0.0
+    tile_size = float(_cfg(config, 'tile_size', 15.0))
+    img_width = int(_cfg(config, 'img_width', 512))
+    pred_px = tile_size / max(img_width, 1)
+    if px_x <= 0.0 or px_y <= 0.0 or pred_px <= 0.0:
+        return raster.width * raster.height
+    stem_w = int(math.ceil(raster.width * px_x / pred_px))
+    stem_h = int(math.ceil(raster.height * px_y / pred_px))
+    return stem_w * stem_h
+
+
+def _untiled_fits_in_ram(config: Any, hardware: Any,
+                         raster: RasterInfo) -> bool:
+    """True when the whole-raster vector chain clearly fits in RAM.
+
+    Conservative on purpose: unknown RAM or a degenerate raster means False,
+    so 'auto' keeps the current tiled behavior when in doubt.
+    """
+    total_ram_gb = float(getattr(hardware, 'total_ram_gb', 0.0) or 0.0)
+    if total_ram_gb <= 0.0:
+        return False
+    pixels = _estimate_stem_map_pixels(config, raster)
+    if pixels <= 0:
+        return False
+    needed_gb = pixels * UNTILED_BYTES_PER_PIXEL / (1024.0 ** 3)
+    return needed_gb <= total_ram_gb * UNTILED_RAM_BUDGET_FRACTION
+
+
+def _resolve_vector_mode(config: Any, hardware: Any, raster: RasterInfo,
+                         process_type: str) -> str:
+    if process_type == 'Stems':
+        return 'none'
+    pref = str(_cfg(config, 'vector_processing', 'auto')).lower()
+    if pref == 'untiled':
+        return 'untiled'
+    if pref == 'tiled':
+        return 'tiled'
+    # 'auto' (and any unrecognized value): untiled only when clearly safe.
+    if _untiled_fits_in_ram(config, hardware, raster):
+        return 'untiled'
+    return 'tiled'
 
 
 def _resolve_prediction_mode(config: Any, scen: str) -> str:
@@ -377,7 +439,12 @@ def build_execution_plan(
         huge_nodes_job,
     )
     prediction_mode = _resolve_prediction_mode(config, scen)
-    vector_mode = 'none' if process_type == 'Stems' else 'tiled'
+    vector_mode = _resolve_vector_mode(config, hardware, raster, process_type)
+    if vector_mode == 'untiled':
+        # One whole-raster job: all vector parallelism goes to the inner
+        # stages (quantification workers), never to tile fan-out.
+        vector_tile_workers = 1
+        vector_inner_workers = max(1, cpu_workers)
 
     return ExecutionPlan(
         process_type=process_type,

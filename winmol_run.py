@@ -212,9 +212,33 @@ class ImageProcessing:
         stems = Quant.quantify_stems(stems, pred, profile, config=self.config)
         return stems
 
+    def run_untiled_vector_phase(self, plan, pred_path=None, pred=None,
+                                 profile=None):
+        """Whole-raster vector phase: the legacy (reference-correct) chain.
+
+        Loads the full stem map into memory, runs trees_processing once, and
+        writes the same GeoPackage contract as the tiled merge (layers
+        'stems'/'nodes'/'vectors', identical schema and CRS handling) via
+        IO.write_untiled_results. Used when plan.vector_mode == 'untiled'.
+        """
+        print("\nRunning un-tiled vector processing...")
+        if pred is None or profile is None:
+            pred, profile = IO.load_stem_map(pred_path or self.stem_path)
+        stems = self.trees_processing(pred, profile)
+        return IO.write_untiled_results(
+            stems,
+            profile,
+            self._output_gpkg_path(),
+            config=self.config,
+        )
+
     def run_vector_phase(self, plan, pred_path=None, pred=None, profile=None):
         if self.process_type == 'Stems':
             return None
+
+        if getattr(plan, 'vector_mode', 'tiled') == 'untiled':
+            return self.run_untiled_vector_phase(
+                plan, pred_path=pred_path, pred=pred, profile=profile)
 
         print("\nRunning tiled vector processing...")
         work_dir = tempfile.mkdtemp(
@@ -276,12 +300,14 @@ class ImageProcessing:
                   f"for inspection: {work_dir}")
             raise
 
-    def run_merge_phase(self, plan, work_dir):
-        out_path = self.trees_path if self.trees_path.lower().endswith(
+    def _output_gpkg_path(self):
+        return self.trees_path if self.trees_path.lower().endswith(
             '.gpkg') else f"{self.trees_path}.gpkg"
+
+    def run_merge_phase(self, plan, work_dir):
         return IO.merge_and_filter_tiled_results(
             work_dir=work_dir,
-            output_gpkg=out_path,
+            output_gpkg=self._output_gpkg_path(),
             edge_buffer_m=plan.tile_overlap_m,
             config=self.config,
             # Pass the full stem-map extent so stems on the ortho's true outer
