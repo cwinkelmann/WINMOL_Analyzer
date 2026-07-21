@@ -509,6 +509,27 @@ GDAL-read path (rasterio out_shape + Resampling.bilinear / .nearest).
 ### Model download links
 Downloading the onnx models should be optional. The released hdf5 models should be the source of truth, converting them locally could be better.
 
+⚠️ DECIDED 2026-07-21 — **ONNX download it is; no local conversion.** Converting
+HDF5 → ONNX on the user's machine requires `requirements/convert.txt`
+(`tensorflow==2.16.2` + `tf-keras` + `tf2onnx` + `onnx`, ~1 GB) inside the
+plugin venv, which today is deliberately TensorFlow-free
+(`requirements/plugin.txt` = base + psutil; see the docstring of
+`plugin_utils/installer.py`). Shipping TF again would undo the whole point of
+the ONNX migration (PR #2) and re-introduce the CUDA/TF-vs-QGIS isolation
+problems the venv exists to avoid — for a conversion whose output we already
+publish. So:
+
+- **Runtime path:** the plugin downloads `.onnx` on demand, pinned to a GitHub
+  release (`WINMOL_segmentor_pt` `models-v1`), verified by sha256.
+- **HDF5 stays the provenance/source of truth**, referenced in `config.json`
+  at Zenodo record **15907576** (DOI 10.5281/zenodo.15907576 — the record that
+  holds *all four*; the older 10491124 is missing Spruce_Deadwood, which is why
+  they were hard to find).
+- `scripts/convert_models_to_onnx.py` remains the **dev-only** reproducibility
+  tool (it verifies ONNX-vs-Keras parity on real tiles) — not a user path.
+
+Implemented on branch `feat/model-zoo-registry`.
+
 
 ### Clean up Root dir. 
 There are many scripts which seem weird. I.e. resources.py
