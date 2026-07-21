@@ -210,13 +210,18 @@ class EnvRemoveWorker(QObject):
     failed = pyqtSignal(str)
 
     def __init__(self, plugin_dir, remove_venv=True, remove_runtime=False,
-                 remove_models=False, configured_exe=None):
+                 remove_models=False, configured_exe=None, dry_run=False):
         super().__init__()
         self.plugin_dir = plugin_dir
         self.remove_venv = remove_venv
         self.remove_runtime = remove_runtime
         self.remove_models = remove_models
         self.configured_exe = configured_exe
+        # Pricing a deletion is a full directory walk over a 2 GB tree —
+        # seconds on a network home directory. The confirmation dialog's
+        # "frees N GB" figure therefore comes back through this worker
+        # too, not from a walk on the GUI thread.
+        self.dry_run = dry_run
         self._cancelled = False
 
     def cancel(self):
@@ -236,8 +241,58 @@ class EnvRemoveWorker(QObject):
                 remove_runtime=self.remove_runtime,
                 remove_models=self.remove_models,
                 configured_exe=self.configured_exe,
+                dry_run=self.dry_run,
                 progress=self._emit)
+            result["dry_run"] = self.dry_run
             self.done.emit(result)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class EnvProbeWorker(QObject):
+    """Measures the compute environment off the GUI thread.
+
+    ``setup_state.env_info`` spawns interpreters (a version probe and an
+    ``import onnxruntime, rasterio, geopandas`` that costs over a second
+    warm, and up to 60 s cold) and ``installer.directory_size`` walks a
+    2 GB tree. Doing that inline is what re-froze the dialog on open and
+    on every Rescan, so the whole measurement lives here and the dialog
+    paints a cheap ``setup_state.env_seed`` until the result arrives.
+
+    Read-only by construction: it creates, deletes and writes nothing, so
+    unlike the other workers it does NOT take part in the one-job-at-a-
+    time interlock and never disables a button. ``token`` is echoed back
+    so the dialog can drop a result that a later change superseded.
+    """
+
+    log = pyqtSignal(str)
+    progress = pyqtSignal(int)
+    done = pyqtSignal(object)   # {'token','info','usage'}
+    failed = pyqtSignal(str)
+
+    def __init__(self, plugin_dir, configured_exe=None, token=0):
+        super().__init__()
+        self.plugin_dir = plugin_dir
+        self.configured_exe = configured_exe
+        self.token = token
+        self._cancelled = False
+
+    def cancel(self):
+        """Best-effort flag. Every step is timeout-bounded (30 s / 60 s
+        subprocess timeouts, a bounded walk), so teardown can wait it
+        out."""
+        self._cancelled = True
+
+    def run(self):
+        try:
+            from .plugin_utils import installer, setup_state
+            info = setup_state.env_info(self.plugin_dir, self.configured_exe)
+            usage = {
+                "venv": installer.directory_size(info.venv_path),
+                "runtime": installer.directory_size(info.runtime_path),
+            }
+            self.done.emit({"token": self.token, "info": info,
+                            "usage": usage})
         except Exception as exc:
             self.failed.emit(str(exc))
 

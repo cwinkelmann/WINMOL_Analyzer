@@ -728,6 +728,24 @@ def test_remove_model_takes_the_part_file_and_the_memo(tmp_path):
     assert mr.installed_state(entry, str(tmp_path)) == "missing"
 
 
+def test_remove_model_prunes_the_memo_under_the_key_verify_file_wrote(
+        tmp_path):
+    """verify_file() keys the memo by basename(local_path); remove_model()
+    keyed it by entry.file. Those coincide for every entry shipped today
+    and diverge silently the moment an entry.file carries a subdirectory —
+    leaving a stale "verified" verdict behind for the next download."""
+    entry = _entry(tmp_path, data=b"DATA", file=os.path.join("sub",
+                                                             "x.onnx"))
+    (tmp_path / "sub").mkdir()
+    (tmp_path / entry.file).write_bytes(b"DATA")
+    mr.verify_entry(entry, str(tmp_path))
+    assert "x.onnx" in mr._cache_load(str(tmp_path))
+
+    mr.remove_model(entry, str(tmp_path))
+    assert "x.onnx" not in mr._cache_load(str(tmp_path)), (
+        "the memo survived the deletion under its real key")
+
+
 def test_remove_model_absent_is_zero_not_an_error(tmp_path):
     assert mr.remove_model(_entry(tmp_path), str(tmp_path)) == 0
 

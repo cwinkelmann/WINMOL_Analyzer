@@ -29,6 +29,7 @@ from . import installer
 
 TXT_ENV_READY = "Ready — Python {version}"
 TXT_ENV_NONE = "Not set up"
+TXT_ENV_CHECKING = "Checking the environment…"
 TXT_ENV_UNSUPPORTED = "Python {version} — unsupported"
 TXT_ENV_DEPS_MISSING = "Dependencies missing"
 TXT_ENV_INCOMPLETE = "Incomplete — reinstall dependencies"
@@ -77,7 +78,16 @@ DOWNLOADABLE_STATES = ("missing", "corrupt")
 
 @dataclass
 class EnvInfo:
-    """A snapshot of the compute environment, probe results included."""
+    """A snapshot of the compute environment, probe results included.
+
+    ``probed`` distinguishes a measured snapshot (:func:`env_info`, which
+    spawns interpreters and therefore only ever runs on a worker thread)
+    from the cheap :func:`env_seed` the dialog paints with while that
+    worker is still running. An unprobed snapshot is read OPTIMISTICALLY:
+    an interpreter that exists is assumed usable until the probe says
+    otherwise, because the alternative — claiming "unsupported Python"
+    for a second on every open — is a lie the user would act on.
+    """
 
     exe: Optional[str]
     exists: bool
@@ -87,6 +97,7 @@ class EnvInfo:
     venv_path: str
     runtime_path: str
     marker_ok: bool
+    probed: bool = True
 
 
 @dataclass
@@ -160,20 +171,8 @@ def _wanted_version_text() -> str:
 
 # --- environment -----------------------------------------------------------
 
-def env_info(plugin_dir, configured_exe, version_fn=None, deps_fn=None,
-             ready_fn=None) -> EnvInfo:
-    """Probe the compute environment.
-
-    ``configured_exe`` is what the dialog is currently pointed at (the
-    QgsSettings interpreter, or the managed venv's python). The three
-    ``*_fn`` seams default to the installer's own probes and exist so
-    tests can describe a machine instead of owning one; they are resolved
-    at CALL time, so monkeypatching ``installer._python_version`` works.
-    """
-    version_fn = version_fn or installer._python_version
-    deps_fn = deps_fn or installer._has_compute_deps
-    ready_fn = ready_fn or installer.is_ready
-
+def _env_paths(plugin_dir, configured_exe):
+    """(venv_path, runtime_path, exe, exists) — stat() only."""
     venv_path = installer.venv_location(plugin_dir)
     runtime_path = os.path.join(installer.managed_root(plugin_dir), "py311")
     exe = (configured_exe or "").strip() or None
@@ -181,16 +180,80 @@ def env_info(plugin_dir, configured_exe, version_fn=None, deps_fn=None,
         managed_exe = installer.get_venv_python_path(venv_path)
         if os.path.exists(managed_exe):
             exe = managed_exe
-    exists = bool(exe) and os.path.exists(exe)
+    return venv_path, runtime_path, exe, bool(exe) and os.path.exists(exe)
+
+
+def env_seed(plugin_dir, configured_exe, env=None) -> EnvInfo:
+    """A probe-free EnvInfo for the FIRST paint.
+
+    :func:`env_info` spawns up to three interpreters and is measured in
+    seconds; running it while the dialog is being constructed is what put
+    a multi-second freeze on every open. This builds the same record out
+    of stat() calls and one small JSON read, marks it ``probed=False``,
+    and leaves the dialog to refine it from a worker thread.
+
+    ``env`` is the dict ``installer.resolve_environment`` already produced
+    at plugin load: when it describes the same interpreter and reports it
+    usable, its dependency verdict is carried over so a configured user's
+    detail line does not flicker through "dependencies not checked".
+    """
+    venv_path, runtime_path, exe, exists = _env_paths(plugin_dir,
+                                                      configured_exe)
+    env = env or {}
+    deps_ok = None
+    resolved = (env.get("python") or "").strip()
+    if exists and resolved and env.get("status") in (
+            "byo", "ready", "installed"):
+        if os.path.normcase(resolved) == os.path.normcase(exe):
+            deps_ok = True
     return EnvInfo(
         exe=exe,
         exists=exists,
-        version=tuple(version_fn(exe)) if exists else None,
-        deps_ok=bool(deps_fn(exe)) if exists else None,
+        version=None,
+        deps_ok=deps_ok,
         managed=bool(exe) and installer.path_is_inside(exe, venv_path),
         venv_path=venv_path,
         runtime_path=runtime_path,
-        marker_ok=bool(ready_fn(venv_path)),
+        # The marker is a JSON file plus a hash of requirements.txt; no
+        # interpreter is spawned for it (installer.is_ready would).
+        marker_ok=installer.marker_matches(venv_path),
+        probed=False,
+    )
+
+
+def env_info(plugin_dir, configured_exe, version_fn=None, deps_fn=None,
+             ready_fn=None) -> EnvInfo:
+    """Probe the compute environment. NEVER call this on the GUI thread.
+
+    ``configured_exe`` is what the dialog is currently pointed at (the
+    QgsSettings interpreter, or the managed venv's python). The three
+    ``*_fn`` seams default to the installer's own probes and exist so
+    tests can describe a machine instead of owning one; they are resolved
+    at CALL time, so monkeypatching ``installer._python_version`` works.
+
+    The measured version is handed to ``ready_fn`` for the managed venv,
+    whose interpreter is the very one just probed — ``is_ready`` used to
+    spawn it a second time to re-learn the same number.
+    """
+    version_fn = version_fn or installer._python_version
+    deps_fn = deps_fn or installer._has_compute_deps
+    ready_fn = ready_fn or installer.is_ready
+
+    venv_path, runtime_path, exe, exists = _env_paths(plugin_dir,
+                                                      configured_exe)
+    version = tuple(version_fn(exe)) if exists else None
+    managed = bool(exe) and installer.path_is_inside(exe, venv_path)
+    return EnvInfo(
+        exe=exe,
+        exists=exists,
+        version=version,
+        deps_ok=bool(deps_fn(exe)) if exists else None,
+        managed=managed,
+        venv_path=venv_path,
+        runtime_path=runtime_path,
+        marker_ok=bool(ready_fn(venv_path,
+                                version=version if managed else None)),
+        probed=True,
     )
 
 
@@ -198,6 +261,8 @@ def env_state_text(info) -> str:
     """The bold one-liner at the top of Step 1."""
     if not info.exists:
         return TXT_ENV_NONE
+    if not info.probed:
+        return TXT_ENV_CHECKING
     if not _supported(info.version):
         return TXT_ENV_UNSUPPORTED.format(version=version_text(info.version))
     if info.deps_ok is False:
@@ -230,7 +295,15 @@ def env_detail_text(info, usage=None) -> str:
 
 def env_ready(info) -> bool:
     """True when a detection could run right now."""
-    if not info.exists or not _supported(info.version):
+    if not info.exists:
+        return False
+    if not info.probed:
+        # Optimistic by design (see EnvInfo): an interpreter that is on
+        # disk is assumed usable until the worker's probe lands. This is
+        # exactly what the pre-Setup-tab dialog did, and it is why the
+        # first paint costs nothing.
+        return True
+    if not _supported(info.version):
         return False
     if info.deps_ok is False:
         return False
@@ -254,6 +327,8 @@ def blocking_reason(info, busy_kind=None):
         return TXT_BLOCK_BUSY
     if not info.exists:
         return TXT_BLOCK_NO_ENV
+    if not info.probed:
+        return None
     if not _supported(info.version):
         return TXT_BLOCK_VERSION.format(version=version_text(info.version),
                                         want=_wanted_version_text())
@@ -301,6 +376,10 @@ def button_states(info, rows, selected_entry_id=None, run_active=False,
     a detection, an environment job or a download — every one of them is
     off, which is what makes "one job at a time" true rather than
     hoped-for.
+
+    ``models_treeWidget`` is in here for the same reason: it carries an
+    ``itemDoubleClicked -> download`` connection, so leaving it live while
+    the buttons are dead is a signal path straight around the interlock.
     """
     busy = bool(run_active or env_busy or dl_busy)
     row = find_row(rows, selected_entry_id)
@@ -319,6 +398,8 @@ def button_states(info, rows, selected_entry_id=None, run_active=False,
         "models_verify_button": bool(
             row is not None and row.pinned and row.present),
         "models_delete_button": bool(row is not None and row.present),
+        "models_treeWidget": True,
+        "models_variants_checkBox": True,
         "run_button": env_ready(info),
     }
     if busy:

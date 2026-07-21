@@ -207,19 +207,34 @@ def _marker_path(venv_path) -> str:
     return os.path.join(venv_path, READY_MARKER)
 
 
-def is_ready(venv_path) -> bool:
-    """True when the venv exists, runs a supported Python, and was installed
-    against the current requirements."""
-    py = get_venv_python_path(venv_path)
-    if not os.path.exists(py):
-        return False
-    if not (MIN_PY <= _python_version(py) <= MAX_PY):
-        return False   # e.g. a stale 3.9 venv the code can't run
+def marker_matches(venv_path) -> bool:
+    """True when the ``.winmol_ready`` sentinel matches the current
+    requirements. Pure file I/O — no interpreter is spawned, so this is
+    the part of :func:`is_ready` that is safe on a GUI thread."""
     try:
         with open(_marker_path(venv_path)) as f:
             return json.load(f).get("req_hash") == _requirements_hash()
     except Exception:
         return False
+
+
+def is_ready(venv_path, version=None) -> bool:
+    """True when the venv exists, runs a supported Python, and was installed
+    against the current requirements.
+
+    ``version`` short-circuits the interpreter probe for a caller that has
+    just measured it (setup_state.env_info does): re-spawning the venv's
+    python to re-learn a version we were handed is pure waste, and it used
+    to happen on every Setup-tab repaint.
+    """
+    py = get_venv_python_path(venv_path)
+    if not os.path.exists(py):
+        return False
+    if version is None:
+        version = _python_version(py)
+    if not (MIN_PY <= tuple(version)[:2] <= MAX_PY):
+        return False   # e.g. a stale 3.9 venv the code can't run
+    return marker_matches(venv_path)
 
 
 def _write_marker(venv_path) -> None:

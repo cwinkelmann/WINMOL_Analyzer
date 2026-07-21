@@ -66,9 +66,22 @@ SETUP_BUTTONS = (
     "models_refresh_button",
 )
 
+#: Setup-tab controls that are not buttons but still reach an action —
+#: models_treeWidget carries itemDoubleClicked -> download, so leaving it
+#: live while the buttons are dead is a signal path around the interlock.
+SETUP_INPUTS = (
+    "models_treeWidget",
+    "models_variants_checkBox",
+)
+
 #: Idle text for setup_status_label. It is NEVER empty: an empty status
 #: line during a multi-minute pip install is what read as "frozen".
 IDLE_STATUS = "Idle."
+
+#: What the status line says while a detection owns the dialog. A setup
+#: job that finishes during a run must not overwrite it with "Idle." —
+#: the status line would then be lying about a live child process.
+RUN_STATUS = "Detection running — setup paused."
 
 # Keep-alive for background threads that outlive the dialog. A parentless
 # QThread whose only Python reference is a dialog attribute gets GC-deleted when
@@ -133,11 +146,30 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         # A download started by the Run pre-flight should continue into the
         # run; one started from the Setup tab must NOT launch an inference.
         self._dl_then_run = False
-        # Cached Setup-tab state. env_info() shells out three times (python
-        # -c version, dependency probe, is_ready), so it is memoised and
-        # invalidated explicitly whenever the environment can have changed.
+        # Set when that download succeeded, and consumed by
+        # _clear_dl_thread. The rerun CANNOT be kicked from the worker's
+        # done slot: `done` is delivered before thread.finished has nulled
+        # _dl_thread, so run_process would see _busy_kind() == 'download',
+        # bounce to the Setup tab and never retry.
+        self._rerun_after_download = False
+        # (dry-run report, flags) from the deletion pricing job, consumed by
+        # _clear_env_thread for the same reason.
+        self._pending_deletion = None
+        self._deletion_flags = None
+        # Cached Setup-tab state. It is SEEDED from stat() only
+        # (setup_state.env_seed) and refined by EnvProbeWorker: env_info()
+        # spawns interpreters (one of them imports onnxruntime/rasterio/
+        # geopandas) and directory_size() walks a multi-GB tree, which is
+        # seconds of a frozen GUI if done here.
         self._env_info_cache = None
         self._env_usage_cache = None
+        # Read-only environment probe. Deliberately NOT part of _busy_kind():
+        # it creates and deletes nothing, so it must never disable a button
+        # or block a run. It IS reaped by _shutdown_threads.
+        self._probe_thread = None
+        self._probe_worker = None
+        self._probe_token = 0
+        self._probe_pending = False
         self._model_rows = []
         # Repaints are suppressed until construction has placed every
         # widget; the .ui and the runtime-built controls both have to
@@ -580,6 +612,11 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
 
     def _on_variant_changed(self, _index=None):
         self._refresh_model_info()
+        # model_status.scan() is handed the variant, so the "recommended
+        # here" row — and with it models_download_default_button's target
+        # — changes with this combo. Without the repaint the Setup tree
+        # keeps recommending the previous precision.
+        self._refresh_setup_state()
 
     def _refresh_variant_controls(self):
         """Enable the variant selector for registry families and gray out
@@ -1096,6 +1133,16 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             except (RuntimeError, AttributeError):
                 pass
         self._reap_thread(self._dl_thread, self._dl_worker)
+        # Environment probe: read-only, and every step is timeout-bounded
+        # (30 s / 60 s subprocess timeouts, a bounded walk), so it can be
+        # waited out. It is still reaped — a live QThread destroyed with
+        # the dialog qFatals QGIS whatever the thread was doing.
+        if self._probe_worker is not None:
+            try:
+                self._probe_worker.cancel()
+            except (RuntimeError, AttributeError):
+                pass
+        self._reap_thread(self._probe_thread, self._probe_worker)
 
     def _reap_thread(self, thread, worker):
         """Quit + wait a bounded time for a QThread. If it is still running
@@ -1259,7 +1306,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             # start a competing env build.
             self._run_active = True
             self._set_busy_ui(True)
-            self._set_status("Detection running — setup paused.")
+            self._set_status(RUN_STATUS)
             self.thread.start()
         # catch out of memory error
         except MemoryError:
@@ -1473,36 +1520,101 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         return os.path.dirname(os.path.abspath(__file__))
 
     def _env_snapshot(self, force=False):
-        """The current :class:`setup_state.EnvInfo`, memoised.
+        """The current :class:`setup_state.EnvInfo` — NEVER measured here.
 
-        env_info() shells out up to three times (interpreter version,
-        dependency probe, ready marker). Doing that on every repaint —
-        every tab change, every tree selection — would put a fresh
-        multi-hundred-millisecond stall on the GUI thread, which is the
-        class of bug this whole change exists to remove. It is refreshed
-        explicitly wherever the environment can actually have changed.
+        ``setup_state.env_info`` spawns up to three interpreters (one of
+        them importing onnxruntime + rasterio + geopandas, bounded only by
+        a 60 s timeout) and the size figures walk a multi-GB tree. Measured
+        warm on a developer machine that is ~4 s; on Windows with an AV
+        scanner or an SMB home directory it is far worse. Doing it from
+        __init__ and again from every Rescan is precisely the freeze this
+        change exists to remove.
+
+        So the cache is SEEDED from stat() alone and refined by
+        EnvProbeWorker; an unprobed snapshot reads optimistically (see
+        setup_state.EnvInfo) so nothing is claimed that has not been
+        measured.
         """
         if force:
             self._env_info_cache = None
             self._env_usage_cache = None
         if self._env_info_cache is None:
-            self._env_info_cache = setup_state.env_info(
-                self._plugin_dir(), self.python_exe)
+            self._env_info_cache = setup_state.env_seed(
+                self._plugin_dir(), self.python_exe, self.env)
+            self._start_env_probe()
         return self._env_info_cache
 
     def _env_usage(self):
-        """{'venv': bytes, 'runtime': bytes}, computed once per change.
+        """{'venv': bytes, 'runtime': bytes} — whatever the last probe
+        measured, and ``{}`` until then.
 
-        A directory walk over a venv is thousands of stat() calls, so it
-        is cached alongside the probes rather than repeated per repaint.
+        Never computed here: a directory walk over a 2 GB venv measured
+        1.95 s warm, and env_detail_text treats a missing key as "don't
+        show a size" rather than as an error.
         """
-        if self._env_usage_cache is None:
-            info = self._env_snapshot()
-            self._env_usage_cache = {
-                "venv": installer.directory_size(info.venv_path),
-                "runtime": installer.directory_size(info.runtime_path),
-            }
-        return self._env_usage_cache
+        return self._env_usage_cache or {}
+
+    # --- the read-only environment probe -------------------------------
+
+    def _start_env_probe(self):
+        """Measure the environment on a worker thread.
+
+        Rides its own pair rather than _env_thread/_dl_thread on purpose:
+        it is read-only, so it must not take part in the one-job-at-a-time
+        interlock (a probe must never block a Run), and conversely a probe
+        requested while a build is running must not be refused. It is
+        registered in _shutdown_threads like every other pair.
+        """
+        # Bumped FIRST, so a probe already in flight is superseded rather
+        # than allowed to overwrite the fresh state with a stale reading.
+        self._probe_token += 1
+        if self._probe_thread is not None:
+            # One in flight already: re-run it when that one lands, so a
+            # Rescan during a probe is not silently dropped.
+            self._probe_pending = True
+            return
+        try:
+            from .tasks_threads import EnvProbeWorker
+        except Exception:                          # pragma: no cover - GUI
+            return
+        worker = EnvProbeWorker(self._plugin_dir(), self.python_exe,
+                                token=self._probe_token)
+        thread = QThread()
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.done.connect(self._on_env_probed)
+        worker.failed.connect(self._on_env_probe_failed)
+        worker.done.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.done.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_probe_thread)
+        self._probe_thread, self._probe_worker = thread, worker
+        thread.start()
+
+    def _on_env_probed(self, result):
+        """A measured EnvInfo landed. Drop it if a later change already
+        superseded this probe."""
+        if not isinstance(result, dict):
+            return
+        if result.get("token") != self._probe_token:
+            return
+        self._env_info_cache = result.get("info")
+        self._env_usage_cache = result.get("usage") or {}
+        self._refresh_setup_state()
+
+    def _on_env_probe_failed(self, msg):
+        """A failed probe leaves the optimistic seed in place: refusing to
+        run because a probe crashed would be worse than trying."""
+        self.update_output_log(f"Could not inspect the environment: {msg}")
+
+    def _clear_probe_thread(self):
+        self._probe_thread = None
+        self._probe_worker = None
+        if self._probe_pending:
+            self._probe_pending = False
+            self._start_env_probe()
 
     def _set_python(self, exe):
         """Persist the chosen interpreter and use it immediately (no restart)."""
@@ -1583,7 +1695,14 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         never connected on the pair itself: a successful DELETE handled
         as a successful BUILD would call _set_python() and re-point the
         plugin at the tree it just erased.
+
+        Refuses on ANY other kind of job, not just on its own pair: the
+        per-pair guard alone let a detection and an environment build
+        overlap, which is exactly what "a run and any setup job are
+        mutually exclusive" was supposed to rule out.
         """
+        if not self._claim_job("env"):
+            return False
         if self._env_thread is not None:
             self.update_output_log("An environment job is already running…")
             return False
@@ -1611,7 +1730,12 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
     def _start_dl_job(self, worker, banner, on_done, on_failed,
                       indeterminate=False):
         """Run ``worker`` on the model thread pair (download / verify /
-        delete). Byte-for-byte the same discipline as _start_env_job."""
+        delete). Byte-for-byte the same discipline as _start_env_job,
+        cross-kind refusal included — a download started during a live
+        detection can replace, on disk, the .onnx the running child has
+        open (and on Windows the replace fails mid-run)."""
+        if not self._claim_job("download"):
+            return False
         if self._dl_thread is not None:
             self.update_output_log("A model job is already running…")
             return False
@@ -1673,7 +1797,10 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
                 bar.setValue(0)
             except Exception:                      # pragma: no cover - GUI
                 pass
-        self._set_status(IDLE_STATUS)
+        # A setup job finishing during a detection must not claim the
+        # dialog is idle — the status line would then be lying about a
+        # live child process.
+        self._set_status(RUN_STATUS if self._run_active else IDLE_STATUS)
 
     def _set_status(self, text):
         self._last_status = text or IDLE_STATUS
@@ -1726,11 +1853,18 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
 
     def _clear_env_thread(self):
         """thread.finished: drop refs so a later job makes a fresh thread,
-        stop the heartbeat and repaint."""
+        stop the heartbeat and repaint.
+
+        A deletion armed by the pricing job is confirmed from here for the
+        same reason the download rerun is: the pair is only free once
+        `finished` has landed.
+        """
         self._env_thread = None
         self._env_worker = None
         self._end_setup_activity()
         self._refresh_setup_state(force_env=True)
+        if self._pending_deletion is not None:
+            QTimer.singleShot(0, self._run_pending_deletion)
 
     def _on_env_ready(self, exe):
         if exe:
@@ -1789,11 +1923,21 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
 
     def _clear_dl_thread(self):
         """thread.finished: drop refs so a later job makes a fresh thread,
-        stop the heartbeat and repaint."""
+        stop the heartbeat and repaint.
+
+        The download-on-Run rerun is fired from HERE, never from the
+        worker's done slot: ``done`` is delivered before ``finished``, so a
+        zero-timer posted there beats the thread teardown, run_process sees
+        _busy_kind() == 'download', bounces to the Setup tab and — with
+        _dl_then_run already cleared — never retries.
+        """
         self._dl_thread = None
         self._dl_worker = None
         self._end_setup_activity()
         self._refresh_setup_state()
+        if self._rerun_after_download:
+            self._rerun_after_download = False
+            QTimer.singleShot(0, self.run_process)
 
     def _on_model_downloaded(self, path):
         self.update_output_log(f"Model downloaded and verified: {path}")
@@ -1801,10 +1945,11 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self._refresh_setup_state()
         # Continue the interrupted run — but ONLY when the download was
         # started by the Run pre-flight. Fetching a model from the Setup
-        # tab must not launch an inference behind the user's back.
+        # tab must not launch an inference behind the user's back. The
+        # rerun itself is armed here and fired by _clear_dl_thread.
         if self._dl_then_run:
             self._dl_then_run = False
-            QTimer.singleShot(0, self.run_process)
+            self._rerun_after_download = True
 
     def _on_model_download_failed(self, msg):
         entry = getattr(self._dl_worker, "entry", None)
@@ -1816,6 +1961,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             f"({self.models_dir}) or select it via the Custom model "
             "picker.")
         self._dl_then_run = False
+        self._rerun_after_download = False
 
     # === Setup tab =====================================================
 
@@ -1836,13 +1982,36 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
     def _busy(self):
         return self._busy_kind() is not None
 
+    def _claim_job(self, kind):
+        """Last line of the interlock, inside the two starters.
+
+        The button states and the per-slot guards can both be bypassed —
+        by a signal nobody remembered to disable, or by a slot invoked
+        programmatically — so the refusal also lives where the thread is
+        actually created. ``kind`` is what the caller is about to start;
+        anything else already running wins.
+        """
+        running = self._busy_kind()
+        if running is None or running == kind:
+            return True
+        self.update_output_log(
+            f"A {running} job is already running; not starting the "
+            f"{kind} job.")
+        self._refuse_while_busy()
+        return False
+
     def _set_busy_ui(self, busy):
-        """Hard-disable Run and every Setup button before a job starts.
+        """Hard-disable Run and every Setup control before a job starts.
 
         Applied eagerly (not via the interlock) so a second click cannot
-        land between the decision and the repaint.
+        land between the decision and the repaint. SETUP_INPUTS is in here
+        with the buttons because models_treeWidget carries an
+        itemDoubleClicked -> download connection: greying out Download
+        while the tree stays live leaves a signal path straight around the
+        interlock, and a double-click during a detection could replace, on
+        disk, the very .onnx the running child has open.
         """
-        for name in ("run_button",) + SETUP_BUTTONS:
+        for name in ("run_button",) + SETUP_BUTTONS + SETUP_INPUTS:
             widget = getattr(self, name, None)
             if widget is None:
                 continue
@@ -1869,8 +2038,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self._set_label("env_detail_label",
                         setup_state.env_detail_text(info, self._env_usage()))
         self._model_rows = self._scan_models()
-        self._refresh_model_tree()
-        self._refresh_setup_actions()
+        self._refresh_model_tree()      # ...which applies the interlock
         self._apply_blocking_reason(info)
 
     def _apply_blocking_reason(self, info):
@@ -1980,26 +2148,31 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
     def _refresh_model_tree(self, *_args):
         """Repaint the model tree, keeping the current selection."""
         tree = getattr(self, "models_treeWidget", None)
-        if tree is None:
-            return
-        checkbox = getattr(self, "models_variants_checkBox", None)
-        show_all = bool(checkbox is not None and checkbox.isChecked())
-        selected = None
-        item = tree.currentItem()
-        if item is not None:
-            selected = item.data(0, Qt.UserRole)
-        try:
-            tree.blockSignals(True)
-            tree.clear()
-            self._fill_model_tree(tree, show_all, selected)
-        finally:
+        if tree is not None:
+            checkbox = getattr(self, "models_variants_checkBox", None)
+            show_all = bool(checkbox is not None and checkbox.isChecked())
+            selected = None
+            item = tree.currentItem()
+            if item is not None:
+                selected = item.data(0, Qt.UserRole)
             try:
-                tree.blockSignals(False)
-            except Exception:                      # pragma: no cover - GUI
-                pass
+                tree.blockSignals(True)
+                tree.clear()
+                self._fill_model_tree(tree, show_all, selected)
+            finally:
+                try:
+                    tree.blockSignals(False)
+                except Exception:                  # pragma: no cover - GUI
+                    pass
         self._set_label("models_summary_label",
                         setup_state.models_summary_text(self._model_rows))
         self._set_label("models_dir_label", self.models_dir)
+        # Re-deriving the actions is part of repainting the tree, not a
+        # step a caller may forget: toggling "Show all precision variants"
+        # is wired straight here, and it can drop the current selection —
+        # leaving Download/Verify/Delete enabled for a row that no longer
+        # exists, so clicking them did nothing at all.
+        self._refresh_setup_actions()
 
     def _fill_model_tree(self, tree, show_all, selected):
         grouped = model_status.group_by_family(self._model_rows,
@@ -2041,7 +2214,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
 
     def _refresh_setup_actions(self, *_args):
         """Apply the interlock. The ONLY caller of setEnabled on a
-        SETUP_BUTTONS member."""
+        SETUP_BUTTONS or SETUP_INPUTS member."""
         row = self._selected_model_row()
         states = setup_state.button_states(
             self._env_snapshot(), self._model_rows,
@@ -2049,7 +2222,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             run_active=self._run_active,
             env_busy=self._env_thread is not None,
             dl_busy=self._dl_thread is not None)
-        for name in SETUP_BUTTONS:
+        for name in SETUP_BUTTONS + SETUP_INPUTS:
             widget = getattr(self, name, None)
             if widget is None:
                 continue
@@ -2057,17 +2230,30 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
                 widget.setEnabled(bool(states.get(name, False)))
             except Exception:                      # pragma: no cover - GUI
                 pass
+        self._set_verify_tooltip(row)
+
+    def _set_verify_tooltip(self, row):
+        """Always written, never only on the unpinned branch: a tooltip
+        that says "no checksum is published for this model" and is then
+        left behind describes the PREVIOUS selection."""
         verify = getattr(self, "models_verify_button", None)
-        if verify is not None and row is not None and not row.pinned:
-            try:
-                verify.setToolTip(
-                    "no checksum is published for this model")
-            except Exception:                      # pragma: no cover - GUI
-                pass
+        if verify is None:
+            return
+        if row is not None and not row.pinned:
+            tip = "no checksum is published for this model"
+        else:
+            tip = "Check the file on disk against its published checksum"
+        try:
+            verify.setToolTip(tip)
+        except Exception:                          # pragma: no cover - GUI
+            pass
 
     # --- Step 1 slots --------------------------------------------------
 
     def _setup_create_env(self):
+        if self._busy():
+            self._refuse_while_busy()
+            return
         self._create_environment()
 
     def _setup_repair_env(self):
@@ -2080,6 +2266,9 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         if self._busy():
             self._refuse_while_busy()
             return
+        # (the guard above is the first statement of every _setup_* slot;
+        #  an AST test pins that, because the button interlock alone is
+        #  reachable around — models_treeWidget's double-click was.)
         installer.invalidate_marker(installer.venv_location(
             self._plugin_dir()))
         self._env_info_cache = None
@@ -2105,8 +2294,51 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         flags = self._ask_deletion_scope()
         if flags is None:
             return
-        preview = self._deletion_preview(flags)
-        if not self._confirm_deletion(preview, flags):
+        self._deletion_flags = flags
+        self._pending_deletion = None
+        self._start_deletion_pricing(flags)
+
+    def _start_deletion_pricing(self, flags):
+        """Price the deletion ON THE WORKER.
+
+        remove_environment(dry_run=True) is a full directory walk of the
+        venv (~2 s measured on a 2 GB tree, far worse over SMB), and it
+        used to run inline right after the user accepted the scope
+        dialog. It is the same cost class as the freeze this change
+        removes, so it rides EnvRemoveWorker like the real deletion does —
+        which also keeps the promise that the figure in the confirmation
+        comes from the exact code path that performs the removal.
+        """
+        from .tasks_threads import EnvRemoveWorker
+        self._start_env_job(
+            EnvRemoveWorker(self._plugin_dir(),
+                            configured_exe=self.python_exe,
+                            dry_run=True, **flags),
+            "Checking what would be removed …",
+            self._on_deletion_priced, self._on_setup_failed)
+
+    def _on_deletion_priced(self, result):
+        """done from the pricing job. It only ARMS the confirmation.
+
+        Asking here and starting the real removal from the answer would
+        hit _start_env_job's own single-flight guard: `done` is delivered
+        before thread.finished has nulled _env_thread. _clear_env_thread
+        fires the confirmation instead.
+        """
+        if isinstance(result, dict) and result.get("dry_run"):
+            self._pending_deletion = (result, self._deletion_flags)
+
+    def _run_pending_deletion(self):
+        """Confirm the priced deletion and, on Yes, perform it."""
+        pending = self._pending_deletion
+        self._pending_deletion = None
+        if pending is None:
+            return
+        preview, flags = pending
+        if not flags or not self._confirm_deletion(preview, flags):
+            return
+        if self._busy():
+            self._refuse_while_busy()
             return
         from .tasks_threads import EnvRemoveWorker
         self._start_env_job(
@@ -2116,19 +2348,16 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self._on_env_removed, self._on_setup_failed)
 
     def _refuse_while_busy(self):
-        """Deleting the interpreter a live winmol_run.py child is
-        executing is the one genuinely dangerous case: the child holds
-        that python and its onnxruntime DLLs open."""
-        self._set_status(
-            f"Cannot delete while a job is running ({self._busy_kind()}). "
-            "Wait for it to finish.")
+        """Every Setup action refuses while anything else is running.
 
-    def _deletion_preview(self, flags):
-        """A dry run of the exact code path that performs the deletion —
-        so the sizes in the confirmation cannot drift from reality."""
-        return installer.remove_environment(
-            self._plugin_dir(), configured_exe=self.python_exe,
-            dry_run=True, **flags)
+        Deleting the interpreter a live winmol_run.py child is executing
+        is the most dangerous case — the child holds that python and its
+        onnxruntime DLLs open — but a download is no better: it would
+        replace on disk the very model file the child has mapped.
+        """
+        self._set_status(
+            f"Cannot do that while a job is running "
+            f"({self._busy_kind()}). Wait for it to finish.")
 
     def _ask_deletion_scope(self):
         """A small purpose-built dialog: venv on, the two destructive
@@ -2238,9 +2467,19 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
     # --- Step 2 slots --------------------------------------------------
 
     def _setup_rescan(self):
+        if self._busy():
+            self._refuse_while_busy()
+            return
         self._refresh_setup_state(force_env=True)
 
     def _setup_download_selected(self, *_args):
+        # Reached by itemDoubleClicked as well as by the button, and the
+        # tree used to stay enabled while every button was dead — that
+        # double-click could start a download on top of a live detection
+        # and replace the .onnx the running child has open.
+        if self._busy():
+            self._refuse_while_busy()
+            return
         entry = self._entry_for(self._selected_model_row())
         if entry is None:
             self._set_status("Select a model first.")
@@ -2249,6 +2488,9 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self._offer_model_download(entry)
 
     def _setup_download_recommended(self):
+        if self._busy():
+            self._refuse_while_busy()
+            return
         entry = self._entry_for(self._recommended_row())
         if entry is None:
             self._set_status("No recommended model for this selection.")
@@ -2257,6 +2499,9 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self._offer_model_download(entry)
 
     def _setup_verify_selected(self):
+        if self._busy():
+            self._refuse_while_busy()
+            return
         row = self._selected_model_row()
         entry = self._entry_for(row)
         if entry is None:
@@ -2273,13 +2518,12 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self._on_models_changed, self._on_setup_failed)
 
     def _setup_delete_selected(self):
+        if self._busy():
+            self._refuse_while_busy()
+            return
         row = self._selected_model_row()
         entry = self._entry_for(row)
         if entry is None or not row.present:
-            return
-        if self._run_active and self._is_run_model(row):
-            self._set_status(
-                "That model is being used by the running detection.")
             return
         note = ""
         if row.recommended:
@@ -2302,10 +2546,6 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             ModelMaintenanceWorker("delete", entry, self.models_dir),
             f"Deleting {entry.file} …",
             self._on_models_changed, self._on_setup_failed)
-
-    def _is_run_model(self, row):
-        entry = self._selected_entry
-        return entry is not None and entry.id == row.entry_id
 
     def _on_models_changed(self, result):
         if result.get("action") == "verify" and not result.get("ok"):

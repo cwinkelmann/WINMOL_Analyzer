@@ -599,7 +599,12 @@ def remove_model(entry, model_dir) -> int:
             os.remove(candidate)
         except OSError:
             pass
-    _cache_forget(model_dir, entry.file)
+    # Key the memo the way verify_file() writes it — basename(local_path),
+    # not entry.file. They coincide for every entry shipped today, but an
+    # entry.file carrying a subdirectory would silently leave the stale
+    # verdict behind, and a re-download of a same-sized file would inherit
+    # it.
+    _cache_forget(model_dir, os.path.basename(path))
     return freed
 
 
@@ -631,7 +636,11 @@ def remove_all(registry, model_dir, dry_run=False) -> dict:
             except OSError as exc:
                 result["failed"].append((candidate, str(exc)))
         if not dry_run:
-            _cache_forget(model_dir, entry.file)
+            # basename(local_path), the key verify_file() writes — see
+            # remove_model(). (The whole cache file goes below anyway;
+            # keeping the key rule identical stops the two drifting.)
+            _cache_forget(model_dir,
+                          os.path.basename(local_path(entry, model_dir)))
     cache = os.path.join(model_dir, VERIFIED_CACHE)
     if not dry_run and os.path.exists(cache):
         try:

@@ -328,13 +328,26 @@ def test_the_old_env_button_is_gone():
 # --- AST: the anti-freeze contract -----------------------------------------
 
 GUI_THREAD_FUNCTIONS = ("_refresh_setup_state", "_refresh_model_tree",
-                        "_refresh_setup_actions")
+                        "_refresh_setup_actions", "_env_snapshot",
+                        "_env_usage", "_apply_blocking_reason",
+                        "_scan_models", "__init__")
 
 BANNED_CALLS = (
     "run", "Popen", "check_call", "check_output",      # subprocess
     "rmtree", "remove_model", "verify_entry", "ensure_model",
     "setup_environment", "install_requirements",
     "install_requirements_into", "download_model", "download_models",
+    # ...and the ones that let the freeze back in through a side door.
+    # BANNED_CALLS used to be a list of names nobody had measured: the
+    # Setup tab's repaint called env_info -> _python_version x2 +
+    # _has_compute_deps (an `import onnxruntime, rasterio, geopandas`,
+    # 1.16 s warm and bounded only by a 60 s timeout) and directory_size
+    # (1.95 s over a 2.17 GB venv) — about 4 s of blocked GUI thread on
+    # every dialog open and every Rescan, none of which this test could
+    # see. Everything below belongs on EnvProbeWorker.
+    "env_info", "directory_size", "_python_version", "_has_compute_deps",
+    "is_ready", "resolve_environment", "remove_environment",
+    "remove_all", "verify_file",
 )
 
 
@@ -362,18 +375,88 @@ def test_nothing_blocking_runs_on_the_gui_thread():
         f"blocking work reachable from a GUI slot: {offenders}")
 
 
-def test_env_removal_from_a_gui_slot_is_only_ever_a_dry_run():
-    """The real deletion goes through EnvRemoveWorker; the only thing a
-    slot may do inline is price it."""
-    for node in ast.walk(_module()):
-        if not isinstance(node, ast.Call):
-            continue
-        if getattr(node.func, "attr", None) != "remove_environment":
-            continue
-        flags = {kw.arg: kw.value for kw in node.keywords}
-        assert "dry_run" in flags and flags["dry_run"].value is True, (
-            f"remove_environment at line {node.lineno} deletes on the GUI "
-            "thread; hand it to EnvRemoveWorker instead")
+def test_env_removal_never_runs_in_the_dialog_at_all():
+    """Not even the dry run. Pricing a deletion is a full directory walk
+    of the venv — the same cost class as performing it — so both the
+    pricing pass and the removal go through EnvRemoveWorker."""
+    offenders = [node.lineno for node in ast.walk(_module())
+                 if isinstance(node, ast.Call)
+                 and getattr(node.func, "attr", None) == "remove_environment"]
+    assert not offenders, (
+        f"remove_environment called on the GUI thread at {offenders}; hand "
+        "it to EnvRemoveWorker (dry_run=True prices it) instead")
+    # ...and the pricing pass really is a dry run, not a deletion.
+    priced = [node for node in ast.walk(_function_node(
+        "_start_deletion_pricing"))
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "id", None) == "EnvRemoveWorker"]
+    assert priced, "_start_deletion_pricing does not build an EnvRemoveWorker"
+    flags = {kw.arg: kw.value for kw in priced[0].keywords}
+    assert "dry_run" in flags and flags["dry_run"].value is True
+
+
+# --- AST: mutual exclusion --------------------------------------------------
+
+def _setup_action_slots():
+    return sorted(name for name in _function_names()
+                  if name.startswith("_setup_"))
+
+
+def _first_statement(node):
+    body = list(node.body)
+    if body and isinstance(body[0], ast.Expr) and \
+            isinstance(body[0].value, ast.Constant):
+        body = body[1:]          # skip the docstring
+    return body[0] if body else None
+
+
+@pytest.mark.parametrize("slot", _setup_action_slots())
+def test_every_setup_action_slot_opens_with_the_busy_guard(slot):
+    """models_treeWidget.itemDoubleClicked reaches _setup_download_selected
+    without going anywhere near a button, and the tree used to stay
+    enabled while every button was dead. A double-click during a live
+    detection then started a download that can replace, on disk, the
+    .onnx the running child has open. The interlock therefore also lives
+    at the top of every slot, not only in the enabled states."""
+    first = _first_statement(_function_node(slot))
+    assert isinstance(first, ast.If), (
+        f"{slot} does not start with a guard")
+    assert "_busy" in ast.dump(first.test), (
+        f"{slot}'s first statement does not test self._busy()")
+    body = ast.dump(ast.Module(body=first.body, type_ignores=[]))
+    assert "_refuse_while_busy" in body and "Return" in body, (
+        f"{slot} tests _busy() but does not refuse and return")
+
+
+def test_the_model_tree_itself_is_disabled_while_busy():
+    """Not only the buttons: the tree carries itemDoubleClicked ->
+    download, so a live tree is a signal path around the interlock."""
+    module = _module()
+    for node in ast.walk(module):
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "SETUP_INPUTS"
+                for t in node.targets):
+            inputs = [el.value for el in node.value.elts]
+            break
+    else:                                          # pragma: no cover
+        pytest.fail("SETUP_INPUTS constant not found")
+    assert "models_treeWidget" in inputs
+    assert set(inputs) <= set(_named(_root())), (
+        "SETUP_INPUTS names something the .ui does not declare")
+    source = ast.dump(_function_node("_set_busy_ui"))
+    assert "SETUP_INPUTS" in source, (
+        "_set_busy_ui disables the buttons but leaves the tree live")
+    assert "SETUP_INPUTS" in ast.dump(_function_node("_refresh_setup_actions"))
+
+
+@pytest.mark.parametrize("starter", ["_start_env_job", "_start_dl_job"])
+def test_the_starters_refuse_a_job_of_another_kind(starter):
+    """The per-pair guard alone let a download start during a detection:
+    _start_dl_job only ever looked at _dl_thread."""
+    source = ast.dump(_function_node(starter))
+    assert "_claim_job" in source, (
+        f"{starter} only guards its own pair; a run or the other pair can "
+        "still be live")
 
 
 @pytest.mark.parametrize("starter", ["_start_env_job", "_start_dl_job"])
@@ -393,24 +476,52 @@ def test_terminal_slots_are_passed_per_worker_not_per_pair():
     for starter in ("_start_env_job", "_start_dl_job"):
         args = [a.arg for a in _function_node(starter).args.args]
         assert "on_done" in args and "on_failed" in args
-    # ...and the remove path names its own terminal slots
-    node = _function_node("_setup_delete_env")
-    referenced = {n.attr for n in ast.walk(node)
-                  if isinstance(n, ast.Attribute)}
+    # ...and every step of the remove path names its own terminal slots
+    referenced = set()
+    for name in ("_setup_delete_env", "_start_deletion_pricing",
+                 "_run_pending_deletion"):
+        referenced |= {n.attr for n in ast.walk(_function_node(name))
+                       if isinstance(n, ast.Attribute)}
     assert "_on_env_removed" in referenced
     assert "_on_env_ready" not in referenced
 
 
-def test_shutdown_still_reaps_both_pairs():
+def test_shutdown_still_reaps_every_pair():
     node = _function_node("_shutdown_threads")
     source = ast.dump(node)
-    assert "_env_thread" in source and "_dl_thread" in source
+    for pair in ("_env_thread", "_dl_thread", "_probe_thread"):
+        assert pair in source, f"{pair} is never reaped"
     reaps = [c for c in ast.walk(node)
              if isinstance(c, ast.Call)
              and getattr(c.func, "attr", None) == "_reap_thread"]
-    assert len(reaps) >= 3, (
-        "the inference, env and download pairs must all be reaped; a "
-        "missed one qFatals QGIS on close")
+    assert len(reaps) >= 4, (
+        "the inference, env, download and probe pairs must all be reaped; "
+        "a missed one qFatals QGIS on close")
+
+
+def test_the_environment_is_measured_on_a_worker():
+    """The probe (three interpreter launches plus two directory walks) is
+    what froze the dialog on open; it belongs on a thread of its own."""
+    node = _function_node("_start_env_probe")
+    referenced = {n.attr for n in ast.walk(node)
+                  if isinstance(n, ast.Attribute)}
+    for required in ("moveToThread", "quit", "deleteLater", "start"):
+        assert required in referenced, \
+            f"_start_env_probe never uses {required}"
+    names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+    assert "EnvProbeWorker" in names
+    # ...and it is read-only, so it must NOT join the interlock: a probe
+    # that disabled Run would block a detection for no reason at all.
+    assert "_probe_thread" not in ast.dump(_function_node("_busy_kind"))
+
+
+def test_the_first_paint_is_seeded_not_measured():
+    node = _function_node("_env_snapshot")
+    called = {c.func.attr for c in ast.walk(node)
+              if isinstance(c, ast.Call) and hasattr(c.func, "attr")}
+    assert "env_seed" in called, (
+        "_env_snapshot measures on the GUI thread again")
+    assert "env_info" not in called
 
 
 def test_the_download_on_run_rerun_is_gated():
@@ -421,11 +532,62 @@ def test_the_download_on_run_rerun_is_gated():
                if isinstance(n, ast.If)
                and "_dl_then_run" in ast.dump(n.test)]
     assert guarded, "_on_model_downloaded re-runs unconditionally"
-    reruns = [c for c in ast.walk(node)
-              if isinstance(c, ast.Call)
-              and getattr(c.func, "attr", None) == "singleShot"]
-    assert reruns and all(
-        any(r is c for r in ast.walk(guarded[0])) for c in reruns)
+    arms = [n for n in ast.walk(guarded[0])
+            if isinstance(n, ast.Attribute)
+            and n.attr == "_rerun_after_download"]
+    assert arms, "the gated branch must arm the rerun flag"
+
+
+def _singleshot_targets(node):
+    """The slots handed to QTimer.singleShot inside ``node``."""
+    out = set()
+    for call in ast.walk(node):
+        if not isinstance(call, ast.Call):
+            continue
+        if getattr(call.func, "attr", None) != "singleShot":
+            continue
+        for arg in call.args:
+            name = getattr(arg, "attr", None)
+            if name:
+                out.add(name)
+    return out
+
+
+def test_the_rerun_is_fired_from_the_thread_cleared_slot():
+    """worker.done is delivered BEFORE thread.finished nulls _dl_thread.
+    A zero-timer posted from the done slot therefore reaches run_process
+    while _busy_kind() is still 'download': the pre-flight computes
+    TXT_BLOCK_BUSY, bounces to the Setup tab and — _dl_then_run having
+    already been cleared — never retries. So the rerun may only be
+    scheduled from _clear_dl_thread, and only after the pair is free."""
+    done = _function_node("_on_model_downloaded")
+    assert "run_process" not in _singleshot_targets(done), (
+        "_on_model_downloaded must arm the rerun, not post it: the "
+        "download thread is still live when done fires")
+
+    clear = _function_node("_clear_dl_thread")
+    assert "run_process" in _singleshot_targets(clear)
+    # ...and strictly after _dl_thread is dropped, or run_process still
+    # sees a busy dialog.
+    body = clear.body
+    cleared_at = next(
+        i for i, stmt in enumerate(body)
+        if isinstance(stmt, ast.Assign)
+        and any(getattr(t, "attr", None) == "_dl_thread"
+                for t in stmt.targets))
+    fired_at = next(i for i, stmt in enumerate(body)
+                    if "singleShot" in ast.dump(stmt))
+    assert fired_at > cleared_at
+
+
+def test_the_deletion_confirmation_is_also_fired_after_the_pair_is_free():
+    """Same race, same cure: the pricing job's done slot only arms the
+    confirmation; _clear_env_thread runs it once the pair is free."""
+    priced = _function_node("_on_deletion_priced")
+    assert not _singleshot_targets(priced)
+    assert "_pending_deletion" in ast.dump(priced)
+    clear = _function_node("_clear_env_thread")
+    assert "_run_pending_deletion" in _singleshot_targets(clear)
 
 
 def test_the_setup_progress_bar_is_the_only_one_a_setup_job_drives():

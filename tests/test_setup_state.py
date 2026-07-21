@@ -233,7 +233,7 @@ def test_env_info_managed_venv(tmp_path, monkeypatch):
         f.write(b"#!")
     monkeypatch.setattr(inst, "_python_version", lambda _e: (3, 11))
     monkeypatch.setattr(inst, "_has_compute_deps", lambda _e: True)
-    monkeypatch.setattr(inst, "is_ready", lambda _p: True)
+    monkeypatch.setattr(inst, "is_ready", lambda _p, version=None: True)
 
     info = ss.env_info(plugin_dir, None)
     assert info.exe == exe and info.exists is True
@@ -252,7 +252,7 @@ def test_env_info_bring_your_own_interpreter(tmp_path, monkeypatch):
     byo.write_bytes(b"#!")
     monkeypatch.setattr(inst, "_python_version", lambda _e: (3, 11))
     monkeypatch.setattr(inst, "_has_compute_deps", lambda _e: True)
-    monkeypatch.setattr(inst, "is_ready", lambda _p: False)
+    monkeypatch.setattr(inst, "is_ready", lambda _p, version=None: False)
 
     info = ss.env_info(plugin_dir, str(byo))
     assert info.managed is False and info.exists is True
@@ -262,7 +262,7 @@ def test_env_info_bring_your_own_interpreter(tmp_path, monkeypatch):
 
 
 def test_env_info_nothing_configured(tmp_path, monkeypatch):
-    monkeypatch.setattr(inst, "is_ready", lambda _p: False)
+    monkeypatch.setattr(inst, "is_ready", lambda _p, version=None: False)
     monkeypatch.setattr(inst, "_python_version", _never_probed)
     monkeypatch.setattr(inst, "_has_compute_deps", _never_probed)
     info = ss.env_info(str(tmp_path), None)
@@ -276,7 +276,7 @@ def _never_probed(_exe):
 
 
 def test_env_info_configured_path_that_vanished(tmp_path, monkeypatch):
-    monkeypatch.setattr(inst, "is_ready", lambda _p: False)
+    monkeypatch.setattr(inst, "is_ready", lambda _p, version=None: False)
     monkeypatch.setattr(inst, "_python_version", _never_probed)
     monkeypatch.setattr(inst, "_has_compute_deps", _never_probed)
     info = ss.env_info(str(tmp_path), str(tmp_path / "deleted" / "python"))
@@ -292,11 +292,114 @@ def test_env_info_stale_marker(tmp_path, monkeypatch):
         f.write(b"#!")
     monkeypatch.setattr(inst, "_python_version", lambda _e: (3, 11))
     monkeypatch.setattr(inst, "_has_compute_deps", lambda _e: True)
-    monkeypatch.setattr(inst, "is_ready", lambda _p: False)
+    monkeypatch.setattr(inst, "is_ready", lambda _p, version=None: False)
     info = ss.env_info(plugin_dir, None)
     assert info.marker_ok is False
     assert ss.env_state_text(info) == "Incomplete — reinstall dependencies"
     assert ss.blocking_reason(info) == ss.TXT_BLOCK_INCOMPLETE
+
+
+def test_env_info_hands_the_measured_version_to_is_ready(tmp_path,
+                                                         monkeypatch):
+    """is_ready() re-spawned the venv's interpreter to re-learn a version
+    env_info had just measured — two subprocess launches for one number,
+    on a path that used to run on the GUI thread."""
+    plugin_dir = str(tmp_path)
+    venv = inst.venv_location(plugin_dir)
+    exe = inst.get_venv_python_path(venv)
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    with open(exe, "wb") as f:
+        f.write(b"#!")
+    calls = []
+
+    def _version(exe_path):
+        calls.append(exe_path)
+        return (3, 11)
+
+    monkeypatch.setattr(inst, "_python_version", _version)
+    monkeypatch.setattr(inst, "_has_compute_deps", lambda _e: True)
+    monkeypatch.setattr(inst, "marker_matches", lambda _p: True)
+
+    info = ss.env_info(plugin_dir, None)
+    assert info.marker_ok is True
+    assert calls == [exe], (
+        f"the interpreter was probed {len(calls)} times for one version")
+
+
+# --- env_seed: the probe-free first paint -----------------------------------
+
+def _no_subprocess(_exe):
+    raise AssertionError("env_seed must not spawn an interpreter")
+
+
+def test_env_seed_never_probes(tmp_path, monkeypatch):
+    plugin_dir = str(tmp_path)
+    exe = inst.get_venv_python_path(inst.venv_location(plugin_dir))
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    with open(exe, "wb") as f:
+        f.write(b"#!")
+    monkeypatch.setattr(inst, "_python_version", _no_subprocess)
+    monkeypatch.setattr(inst, "_has_compute_deps", _no_subprocess)
+    monkeypatch.setattr(
+        inst, "is_ready",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("env_seed must not call is_ready")))
+
+    info = ss.env_seed(plugin_dir, None)
+    assert info.probed is False
+    assert info.exists is True and info.managed is True
+    assert info.version is None
+
+
+def test_an_unprobed_seed_is_read_optimistically(tmp_path, monkeypatch):
+    """Claiming "unsupported Python" for a second on every open would be a
+    lie the user acts on; an interpreter on disk is assumed usable until
+    the worker's probe lands."""
+    plugin_dir = str(tmp_path)
+    exe = inst.get_venv_python_path(inst.venv_location(plugin_dir))
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    with open(exe, "wb") as f:
+        f.write(b"#!")
+    info = ss.env_seed(plugin_dir, None)
+    assert ss.env_ready(info) is True
+    assert ss.blocking_reason(info) is None
+    assert ss.env_state_text(info) == ss.TXT_ENV_CHECKING
+    assert ss.button_states(info, [], None)["run_button"] is True
+
+
+def test_an_absent_interpreter_is_still_blocked_without_probing(tmp_path):
+    info = ss.env_seed(str(tmp_path), None)
+    assert info.probed is False and info.exists is False
+    assert ss.env_ready(info) is False
+    assert ss.blocking_reason(info) == ss.TXT_BLOCK_NO_ENV
+    assert ss.env_state_text(info) == ss.TXT_ENV_NONE
+
+
+def test_env_seed_carries_the_resolved_dependency_verdict(tmp_path):
+    """installer.resolve_environment already paid for the dependency probe
+    at plugin load; reusing its verdict keeps a configured user's detail
+    line from flickering through "dependencies not checked"."""
+    plugin_dir = str(tmp_path)
+    exe = inst.get_venv_python_path(inst.venv_location(plugin_dir))
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    with open(exe, "wb") as f:
+        f.write(b"#!")
+    seeded = ss.env_seed(plugin_dir, None,
+                         {"python": exe, "status": "ready"})
+    assert seeded.deps_ok is True
+    # a verdict about a DIFFERENT interpreter is never carried over
+    other = ss.env_seed(plugin_dir, None,
+                        {"python": str(tmp_path / "elsewhere"),
+                         "status": "byo"})
+    assert other.deps_ok is None
+
+
+def test_env_detail_text_survives_a_missing_usage_map(tmp_path):
+    """The sizes come from the probe worker, so the first paint has none —
+    that must read as "no size yet", not as an error."""
+    info = ss.env_seed(str(tmp_path), None)
+    assert "·" in ss.env_detail_text(info, {})
+    assert "GB" not in ss.env_detail_text(info, {})
 
 
 # --- text -------------------------------------------------------------------
