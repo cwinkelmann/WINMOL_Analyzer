@@ -250,7 +250,15 @@ class TileBatchProducer(threading.Thread):
                             indexes,
                             window=window,
                             out_shape=(len(indexes), oh, ow),
-                            resampling=Resampling.bilinear,
+                            # cubic, NOT bilinear: bilinear smoothing
+                            # thins the predicted mask ~6% near the 0.5
+                            # threshold at full-ortho scale, silently
+                            # dropping ~50 marginal stems per large scene
+                            # (isolated by a single-variable A/B against
+                            # the pre-c99d727 bicubic; IoU 0.90 -> 0.996).
+                            # The 15x prep win came from resampling in
+                            # the GDAL read, not from bilinear.
+                            resampling=Resampling.cubic,
                             boundless=True,
                             fill_value=0,
                         ).transpose(1, 2, 0)

@@ -1,3 +1,6 @@
+# Desired Features
+
+
 ### load models as keras format
 https://www.tensorflow.org/tutorials/keras/save_and_load
 hdf5 seems to deprecated, but should still work in 2.21
@@ -25,6 +28,10 @@ the tests should run in github to ensure changes are not ruining something
 ### Fix QGIS plugin installation
 currently the plugin fails to install on a mac but also on python 3.11 on linux with cuda. The venv installation process is quite flakey. In general multipe ways of installing exist. 
 A classic windows install should work for QGIS 3.44 and 4, in linux one could install qgis into a conda environment or via apt. The plugin should be installable via the QGIS plugin manager and also via a zip file. The installation process should be documented in detail. On a mac options are slightly reduced. In all cases a CUDA GPU or Apple MPS should be usable. 
+
+### Autotune static parameters like batch size
+the autotune is quite static, there is no point in running it all the time. It should be possible to run it once and then save the results for later use. The autotune should also be able to tune more parameters like batch size, tile size, number of workers etc. The results should be saved in a config file which can be loaded later. The autotune should also be able to run on a different machine than the one running QGIS.
+
 
 #### API connectivity
 Instead of having a analyser locally, a worker on a beefy GPU machine could be used. The QGIS plugin would then send the orthomosaic to the worker and receive the results back. This would allow to use a GPU on a different machine than the one running QGIS. The API should be secure and support authentication and authorization. The API should be documented in detail.
@@ -124,3 +131,19 @@ so a DINO head exported to ONNX needs no loader changes provided it honours the
 `[N,512,512,3] → [N,512,512,1]` external contract. Combined with the
 segmentation/vectorization split above, this could be evaluated end-to-end
 against the golden fixtures without disturbing the existing model path.
+
+### Inference Docker Containers
+Currently there is a dockerfile.blackwell, Dockefile_olive container
+
+These need to be checked and updated if they work on these beefy machine machines with multiple GPUS
+
+Create slimmer container which work on Blackwell multi GPU machine
+
+
+## Backlog
+
+### implement Python 3.14
+the current version is python 3.14, 3.11 is end of life soon too. With Python 3.14 everywhere we would be safe for a while. Matrix testing for multiple python version could make sure that the code works on all versions. The QGIS plugin should also be tested on multiple python versions.
+
+### Code seperation - to be planned
+seperate the QGIS plugin from the stem inference code. 
