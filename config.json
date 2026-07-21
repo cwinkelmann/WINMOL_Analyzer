@@ -1,17 +1,22 @@
 {
   "_comment": [
     "WINMOL model registry, schema v2. Loader: plugin_utils/model_registry.py (also accepts legacy v1 flat {name: url}).",
-    "Entry ids are stable API: the four classic ids (General, Beech, Spruce, Spruce_Deadwood) are unchanged from v1 and keep their v1 URLs and on-disk filenames.",
+    "Entry ids are stable API: the four classic ids (General, Beech, Spruce, Spruce_Deadwood) are unchanged from v1. Their URLs/filenames were REPOINTED (2026-07-21) from the unchecksummed models-onnx-v1 release to the sha256-pinned, numerically-identical models-v1 conversions of the same Keras weights; a previously downloaded General.onnx etc. is no longer recognized and is re-fetched once.",
     "'file' is the mandatory on-disk filename used by BOTH the QGIS plugin (<plugin>/models/) and the batch CLI (--model-dir); it always equals the URL basename (query-stripped) so files fetched manually (gh release download / browser) are recognized.",
-    "'sha256' (zoo assets) or 'md5' (Zenodo hdf5) enables integrity verification; null = skip verification (legacy behavior). TODO: compute and fill sha256 for the four models-onnx-v1 release assets.",
+    "'sha256' (zoo assets) or 'md5' (Zenodo hdf5) enables integrity verification. EVERY downloadable entry is pinned: tests/test_model_registry.py::test_every_entry_has_a_digest fails the build if an unpinned entry is added.",
     "'preload' lists entry ids installer.download_models may fetch at env-setup time; it ships EMPTY: all downloads are on-demand at selection time.",
+    "'recommended' is the ranked default list (best first). recommended[0] MUST equal gui_default. The EFFECTIVE default is device-aware: Registry.default_entry(device) keeps recommended[0]'s FAMILY (the domain choice) and swaps in that family's cpu (int8) or gpu (fp16) variant. Any explicit user/CLI selection overrides it.",
     "'lossless' on a variant means numerically equivalent to its family's fp32 reference; auto variant selection only substitutes a device variant when it is lossless, otherwise it stays on the family default (results-stable).",
     "'hidden': true keeps an entry out of the GUI dropdown (hdf5 originals need TensorFlow; the plugin venv is ONNX-only). They remain addressable by id from the CLI and scripts/convert_models_to_onnx.py.",
     "'Custom' is a reserved id (GUI escape hatch); the loader rejects a registry that defines it."
   ],
   "schema": 2,
   "tile_px": 512,
-  "gui_default": "Spruce_Deadwood",
+  "gui_default": "Spruce_Deadwood_int8",
+  "recommended": [
+    "Spruce_Deadwood_int8",
+    "UNet_PT_int8"
+  ],
   "preload": [],
   "families": {
     "classic_general": {
@@ -33,13 +38,13 @@
       "gpu": "Spruce_fp16"
     },
     "classic_spruce_deadwood": {
-      "label": "Classic WINMOL — Spruce + deadwood",
+      "label": "Classic WINMOL — Spruce + deadwood (default)",
       "default": "Spruce_Deadwood",
       "cpu": "Spruce_Deadwood_int8",
       "gpu": "Spruce_Deadwood_fp16"
     },
     "unet_pt": {
-      "label": "UNet PyTorch retrain (beech) — recommended",
+      "label": "UNet PyTorch w05 retrain (beech) — second choice",
       "default": "UNet_PT",
       "cpu": "UNet_PT_int8",
       "gpu": "UNet_PT_fp16"
@@ -68,13 +73,13 @@
       "backend": "any",
       "precision": "fp32",
       "format": "onnx",
-      "url": "https://github.com/cwinkelmann/WINMOL_Analyzer/releases/download/models-onnx-v1/General.onnx",
-      "file": "General.onnx",
-      "sha256": null,
+      "url": "https://github.com/cwinkelmann/WINMOL_segmentor_pt/releases/download/models-v1/model_UNet_GenDS_512.onnx",
+      "file": "model_UNet_GenDS_512.onnx",
+      "sha256": "fa192f96eef750a9ebdc261983b74e0353b2b3f1f746a026655cabbe8f44e0f0",
       "size_mb": 124.6,
       "f1": null,
       "lossless": true,
-      "description": "ONNX conversion of the original Keras GenDS model (Zenodo 10.5281/zenodo.15907576), numerically identical."
+      "description": "ONNX conversion of the original Keras GenDS model (Zenodo 10.5281/zenodo.15907576), numerically identical. Served from the sha256-pinned models-v1 release (was the unchecksummed models-onnx-v1/General.onnx)."
     },
     "General_int8": {
       "label": "General — CPU-optimised int8",
@@ -110,13 +115,13 @@
       "backend": "any",
       "precision": "fp32",
       "format": "onnx",
-      "url": "https://github.com/cwinkelmann/WINMOL_Analyzer/releases/download/models-onnx-v1/Beech.onnx",
-      "file": "Beech.onnx",
-      "sha256": null,
+      "url": "https://github.com/cwinkelmann/WINMOL_segmentor_pt/releases/download/models-v1/model_UNet_SpecDS_Beech_512.onnx",
+      "file": "model_UNet_SpecDS_Beech_512.onnx",
+      "sha256": "91497501aa4c303838569d17d62875dc1e6e1fa18dcb6086dfd9647e3dc34ca4",
       "size_mb": 124.6,
       "f1": null,
       "lossless": true,
-      "description": "ONNX conversion of the original Keras SpecDS_Beech model (Zenodo 10.5281/zenodo.15907576), numerically identical."
+      "description": "ONNX conversion of the original Keras SpecDS_Beech model (Zenodo 10.5281/zenodo.15907576), numerically identical. Served from the sha256-pinned models-v1 release (was the unchecksummed models-onnx-v1/Beech.onnx)."
     },
     "Beech_int8": {
       "label": "Beech — CPU-optimised int8",
@@ -152,13 +157,13 @@
       "backend": "any",
       "precision": "fp32",
       "format": "onnx",
-      "url": "https://github.com/cwinkelmann/WINMOL_Analyzer/releases/download/models-onnx-v1/Spruce.onnx",
-      "file": "Spruce.onnx",
-      "sha256": null,
+      "url": "https://github.com/cwinkelmann/WINMOL_segmentor_pt/releases/download/models-v1/model_UNet_SpecDS_Spruce_512.onnx",
+      "file": "model_UNet_SpecDS_Spruce_512.onnx",
+      "sha256": "26546a66b64247961c8f2df07019d846297b1296f223755e405709c111c855fd",
       "size_mb": 124.6,
       "f1": null,
       "lossless": true,
-      "description": "ONNX conversion of the original Keras SpecDS_Spruce model (Zenodo 10.5281/zenodo.15907576), numerically identical."
+      "description": "ONNX conversion of the original Keras SpecDS_Spruce model (Zenodo 10.5281/zenodo.15907576), numerically identical. Served from the sha256-pinned models-v1 release (was the unchecksummed models-onnx-v1/Spruce.onnx)."
     },
     "Spruce_int8": {
       "label": "Spruce — CPU-optimised int8",
@@ -189,21 +194,21 @@
       "description": "Post-training fp16, lossless."
     },
     "Spruce_Deadwood": {
-      "label": "Spruce + standing deadwood — classic UNet, fp32",
+      "label": "Spruce + standing deadwood (SpecDS) — recommended, 1st",
       "family": "classic_spruce_deadwood",
       "backend": "any",
       "precision": "fp32",
       "format": "onnx",
-      "url": "https://github.com/cwinkelmann/WINMOL_Analyzer/releases/download/models-onnx-v1/Spruce_Deadwood.onnx",
-      "file": "Spruce_Deadwood.onnx",
-      "sha256": null,
+      "url": "https://github.com/cwinkelmann/WINMOL_segmentor_pt/releases/download/models-v1/model_UNet_SpecDS_Spruce_Deadwood_512.onnx",
+      "file": "model_UNet_SpecDS_Spruce_Deadwood_512.onnx",
+      "sha256": "88028ece8e24a64f7b08727267f933e3d62e12dfbf76d6667d35fa76cfaf83f1",
       "size_mb": 124.6,
       "f1": null,
       "lossless": true,
-      "description": "ONNX conversion of the original Keras SpecDS_Spruce_Deadwood model (Zenodo 10.5281/zenodo.15907576), numerically identical."
+      "description": "ONNX conversion of the original Keras SpecDS_Spruce_Deadwood model (Zenodo 10.5281/zenodo.15907576), numerically identical. Served from the sha256-pinned models-v1 release (was the unchecksummed models-onnx-v1/Spruce_Deadwood.onnx)."
     },
     "Spruce_Deadwood_int8": {
-      "label": "Spruce + deadwood — CPU-optimised int8",
+      "label": "Spruce + deadwood (SpecDS) — CPU int8 [DEFAULT]",
       "family": "classic_spruce_deadwood",
       "backend": "cpu",
       "precision": "int8",
@@ -214,7 +219,7 @@
       "size_mb": 31.4,
       "f1": null,
       "lossless": false,
-      "description": "Post-training static int8, domain-calibrated."
+      "description": "Shipped default (recommended[0]). Post-training static int8 of the SpecDS Spruce+Deadwood Keras model, domain-calibrated. NOTE: unlike the fp16 variant, this int8 build is NOT certified lossless in the models-v1 manifest — it is the default by explicit product decision (small size, fast CPU), not by a measured-equivalence claim. On a GPU host the effective default becomes the lossless Spruce_Deadwood_fp16."
     },
     "Spruce_Deadwood_fp16": {
       "label": "Spruce + deadwood — GPU-optimised fp16",
@@ -231,7 +236,7 @@
       "description": "Post-training fp16, lossless."
     },
     "UNet_PT": {
-      "label": "UNet PyTorch retrain (beech) — fp32 reference, F1 0.760",
+      "label": "UNet PyTorch w05 (beech) — 2nd choice, F1 0.760",
       "family": "unet_pt",
       "backend": "any",
       "precision": "fp32",
@@ -245,7 +250,7 @@
       "description": "Reference WINMOL UNet, two-stage lrfix retrain, TestDS F1 0.760."
     },
     "UNet_PT_int8": {
-      "label": "UNet PyTorch — CPU-optimised int8 (10x, lossless)",
+      "label": "UNet PyTorch w05 — CPU int8 (10x, lossless) [2nd choice]",
       "family": "unet_pt",
       "backend": "cpu",
       "precision": "int8",
@@ -256,7 +261,7 @@
       "size_mb": 7.9,
       "f1": 0.76,
       "lossless": true,
-      "description": "10x faster on CPU (AVX-VNNI), TestDS F1 0.760 (lossless)."
+      "description": "Documented runner-up (recommended[1]). 10x faster on CPU (AVX-VNNI), TestDS F1 0.760, certified lossless vs its fp32 reference. DISAMBIGUATION: this is the 'w05' build of the PyTorch UNet retrain (asset unet_w05_int8_cpu.onnx). It is sometimes miscalled 'SpecDS INT8 W05' — no such build exists: 'w05' belongs ONLY to the PyTorch UNet family (trained on beech), while 'SpecDS' names the classic Keras per-species models, which have no w05 variant. The two are different families and must not be conflated."
     },
     "UNet_PT_fp16": {
       "label": "UNet PyTorch — GPU-optimised fp16 (lossless)",

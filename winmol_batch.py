@@ -254,8 +254,7 @@ def _manual_hint(entry, model_dir):
     if "zenodo.org" in entry.url:
         dest = os.path.join(model_dir, entry.file)
         return f"  curl -L -o {dest} '{entry.url}'"
-    return ("  gh release download models-onnx-v1 "
-            f"--repo cwinkelmann/WINMOL_Analyzer --dir {model_dir}")
+    return f"  curl -L -o {os.path.join(model_dir, entry.file)} '{entry.url}'"
 
 
 def _print_models(registry, model_dir):
@@ -435,8 +434,8 @@ def main(argv: List[str]) -> int:
                 "Point --model-dir (or $WINMOL_MODEL_DIR) at the directory "
                 "holding the models named in config.json, or fetch them "
                 "with:\n"
-                "  gh release download models-onnx-v1 "
-                "--repo cwinkelmann/WINMOL_Analyzer --dir <dir>"
+                "  gh release download models-v1 "
+                "--repo cwinkelmann/WINMOL_segmentor_pt --dir <dir>"
             )
             return 2
 
