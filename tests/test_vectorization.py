@@ -46,3 +46,119 @@ def test_connect_stems_reduces_fragment_count(golden):
 
 def test_connect_stems_empty_input(pipeline_config):
     assert Vec.connect_stems([], pipeline_config) == []
+
+
+def _mk_stem(coords):
+    from shapely.geometry import LineString, Point
+
+    from classes.Stem import Stem
+    return Stem(Point(coords[0]), Point(coords[-1]), LineString(coords),
+                [], [], [], [])
+
+
+def _vote_inputs(base, max_distance=3.0):
+    line_start, line_stop = Vec._stem_end_lines(base)
+    start_buffer = base.start.buffer(max_distance, resolution=32)
+    end_buffer = base.stop.buffer(max_distance, resolution=32)
+    return line_start, line_stop, start_buffer, end_buffer
+
+
+def test_score_then_build_appends_collinear_follower():
+    """Deferred-geometry path, branch 1: a collinear stem starting just
+    past base.stop is scored without geometry, then built into the same
+    merged stem the old inline construction produced."""
+    from shapely.geometry import LineString
+    from shapely.ops import linemerge
+
+    base = _mk_stem([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)])
+    follower = _mk_stem([(6, 0), (7, 0), (8, 0), (9, 0), (10, 0)])
+    line_start, line_stop, start_buffer, end_buffer = _vote_inputs(base)
+
+    scored = Vec._score_connectivity(
+        base, line_start, line_stop, start_buffer, end_buffer,
+        3.0, 40.0, 5.0, follower)
+    assert scored is not None and scored[1] == 1
+
+    changed, vote, cand, slave = Vec.calc_connectivity_votes(
+        base, line_start, line_stop, start_buffer, end_buffer,
+        3.0, 40.0, 5.0, follower)
+    assert changed and vote == scored[0] and slave is follower
+
+    expected = linemerge([
+        LineString(base.path.coords[:-1]),
+        LineString([base.path.coords[-2], follower.path.coords[1]]),
+        LineString(follower.path.coords[1:]),
+    ])
+    assert list(cand.path.coords) == list(expected.coords)
+    assert cand.start.coords[0] == (0.0, 0.0)
+    assert cand.stop.coords[0] == (10.0, 0.0)
+
+
+def test_score_then_build_prepends_collinear_leader():
+    """Branch 2 (mirrored): the candidate ends just before base.start."""
+    base = _mk_stem([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)])
+    leader = _mk_stem([(-8, 0), (-7, 0), (-6, 0), (-3, 0), (-2, 0)])
+    line_start, line_stop, start_buffer, end_buffer = _vote_inputs(base)
+
+    scored = Vec._score_connectivity(
+        base, line_start, line_stop, start_buffer, end_buffer,
+        3.0, 40.0, 5.0, leader)
+    assert scored is not None and scored[1] == 2
+
+    cand = Vec._build_connection(base, leader, scored[1])
+    assert cand.start.coords[0] == (-8.0, 0.0)
+    assert cand.stop.coords[0] == (4.0, 0.0)
+    assert cand.path.coords[0] == (-8.0, 0.0)
+    assert cand.path.coords[-1] == (4.0, 0.0)
+
+
+def test_score_connectivity_identical_stem_scores_none():
+    """The stem == stems0 early-out must be the ONLY thing rejecting a
+    value-equal twin. A collinear twin is also rejected by the buffer
+    gates (start/stop 4 m apart > max_distance 3), which would let this
+    test pass with the early-out deleted. This loop-back path (>= 8
+    coords, so _stem_end_lines uses distinct segments) passes every
+    geometric gate: the control stem — identical geometry, different crs,
+    so Stem.__eq__ is False — scores a vote, while the true twin must
+    not."""
+    coords = [(0, 0), (10, 0), (0, 0.5), (1, 0.5), (2, 0.5),
+              (3, 0.5), (16, 0), (5, 0.5), (1, 0)]
+    base = _mk_stem(coords)
+    twin = _mk_stem(coords)
+    control = _mk_stem(coords)
+    control.crs = "not-the-base"
+    line_start, line_stop, start_buffer, end_buffer = _vote_inputs(base)
+    args = (base, line_start, line_stop, start_buffer, end_buffer,
+            3.0, 40.0, 30.0)
+
+    # The control proves the geometric gates pass for this layout...
+    assert twin == base and control != base
+    assert Vec._score_connectivity(*args, control) is not None
+    # ...so only the identity early-out can reject the twin.
+    assert Vec._score_connectivity(*args, twin) is None
+
+    changed, vote, cand, slave = Vec.calc_connectivity_votes(*args, twin)
+    assert changed is False and cand is None and slave is None
+
+
+def test_remove_duplicates_against_base_empty_path_is_noop():
+    """An empty base path (not producible by the current pipeline) must
+    be a silent no-op, as the historical per-candidate contains() loop
+    was — not a ValueError from unpacking an empty geometry's bounds."""
+    from shapely.geometry import LineString, Point
+
+    from classes.Stem import Stem
+    base = Stem(Point(0, 0), Point(0, 0), LineString(), [], [], [], [])
+    other = _mk_stem([(0, 0), (1, 0)])
+    remaining, removed = Vec._remove_duplicates_against_base(
+        [base, other], {0, 1}, 0)
+    assert remaining == {0, 1} and removed == 0
+
+
+def test_score_connectivity_rejects_far_candidate():
+    base = _mk_stem([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)])
+    far = _mk_stem([(50, 0), (51, 0), (52, 0), (53, 0), (54, 0)])
+    line_start, line_stop, start_buffer, end_buffer = _vote_inputs(base)
+    assert Vec._score_connectivity(
+        base, line_start, line_stop, start_buffer, end_buffer,
+        3.0, 40.0, 5.0, far) is None

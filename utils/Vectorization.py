@@ -105,12 +105,29 @@ def _remove_duplicates_against_base(
         return remaining, 0
     base = cycle_stems[base_idx]
     buffer_geom = base.path.buffer(0.3)
+    if buffer_geom.is_empty:
+        # An empty base path (not producible by the current pipeline,
+        # every path has >= 2 coords) buffers to an empty polygon whose
+        # .bounds is (), and unpacking would ValueError. The historical
+        # per-candidate contains() loop silently matched nothing here;
+        # keep that no-op contract.
+        return remaining, 0
+    # Bounding-box prefilter (the counterpart of remove_duplicates'
+    # STRtree, without building a tree per merge): a geometry contained
+    # in the buffer necessarily has its bbox inside the buffer's bbox,
+    # so skipping the others cannot change the removed set.
+    minx, miny, maxx, maxy = buffer_geom.bounds
     to_remove = set()
     for idx in remaining:
         if idx == base_idx:
             continue
         try:
-            if buffer_geom.contains(cycle_stems[idx].path):
+            path = cycle_stems[idx].path
+            p_minx, p_miny, p_maxx, p_maxy = path.bounds
+            if (p_minx < minx or p_miny < miny
+                    or p_maxx > maxx or p_maxy > maxy):
+                continue
+            if buffer_geom.contains(path):
                 to_remove.add(idx)
         except Exception:
             continue
@@ -184,12 +201,17 @@ def connect_stems(stems: List[Stem], config) -> List[Stem]:
                     ):
                         filtered_indices.append(idx)
 
+                # Score first, build later: the vote depends only on
+                # endpoint distances and end-line angles, all known
+                # before any merged geometry exists. linemerge +
+                # _clone_stem run once, for the argmin winner, instead
+                # of for every candidate that passes the gates.
                 best_vote = math.inf
-                best_candidate = None
+                best_branch = None
                 best_slave_idx = None
 
                 for idx in filtered_indices:
-                    changed, vote, candidate_stem, _ = calc_connectivity_votes(
+                    scored = _score_connectivity(
                         base_stem,
                         line_start,
                         line_stop,
@@ -200,13 +222,13 @@ def connect_stems(stems: List[Stem], config) -> List[Stem]:
                         tolerance_angle,
                         cycle_stems[idx],
                     )
-                    if changed and vote < best_vote:
-                        best_vote = vote
-                        best_candidate = candidate_stem
+                    if scored is not None and scored[0] < best_vote:
+                        best_vote, best_branch = scored
                         best_slave_idx = idx
 
-                if best_candidate is not None and best_slave_idx is not None:
-                    base_stem = best_candidate
+                if best_slave_idx is not None:
+                    base_stem = _build_connection(
+                        base_stem, cycle_stems[best_slave_idx], best_branch)
                     cycle_stems[base_idx] = base_stem
                     remaining.discard(best_slave_idx)
                     global_change = True
@@ -245,7 +267,22 @@ def connect_stems(stems: List[Stem], config) -> List[Stem]:
     return connected_stems
 
 
-def calc_connectivity_votes(
+class _VoteEnds:
+    """Endpoint stand-in for the merged candidate inside calc_vote.
+
+    calc_vote reads only candidate.start / candidate.stop, which are known
+    before any merged geometry is built: branch 1 keeps stems0.start and
+    takes stem.stop, branch 2 mirrored. Feeding these Points through the
+    same calc_vote expression yields the identical float."""
+
+    __slots__ = ("start", "stop")
+
+    def __init__(self, start: Point, stop: Point):
+        self.start = start
+        self.stop = stop
+
+
+def _score_connectivity(
         stems0: Stem,
         line_start: LineString,
         line_stop: LineString,
@@ -255,32 +292,24 @@ def calc_connectivity_votes(
         max_tree_height,
         tolerance_angle,
         stem: Stem
-) -> (bool, List[float], List[Stem], List[Stem]):
-    # Calculate votes for the aggregation of stem parts to stems
-    if stem == stems0:
-        # if the stems are identical return no change and infinite vote
-        return False, math.inf, None, None
-    change = False
-    votes = []
-    candidates = []
-    slaves = []
+):
+    """Gate checks + vote for appending `stem` to `stems0`, WITHOUT
+    building any merged geometry.
 
-    if len(stem.path.coords) < 4:
-        e_line_start = LineString([stem.path.coords[0], stem.path.coords[-1]])
-        e_line_stop = LineString([stem.path.coords[0], stem.path.coords[-1]])
-    else:
-        if len(stem.path.coords) < 8:
-            k = len(stem.path.coords) - 2
-        else:
-            k = 6
-        e_line_start = LineString([stem.path.coords[1], stem.path.coords[k]])
-        e_line_stop = LineString(
-            [stem.path.coords[-(k + 1)], stem.path.coords[-2]])
+    Returns (vote, branch) for the better of the two attachment branches
+    (1: stem appended after stems0, 2: stem prepended) or None. Branch
+    order and the strict-less tie rule reproduce the old argmin exactly.
+    """
+    if stem == stems0:
+        # if the stems are identical: no change
+        return None
+
+    e_line_start, e_line_stop = _stem_end_lines(stem)
 
     ang_l_sp_el_st = abs(ang(line_stop.coords, e_line_start.coords))
     ang_el_sp_l_st = abs(ang(e_line_stop.coords, line_start.coords))
 
-    has_length_2 = len(stem.path.coords) == 2
+    best = None
     if end_buffer.contains(stem.start) and ang_l_sp_el_st < tolerance_angle:
         missing_part_ = LineString(
             [stems0.path.coords[-2],
@@ -297,41 +326,10 @@ def calc_connectivity_votes(
                 tolerance_angle * dist_f) and ang_mp_el_st < (
                 tolerance_angle * dist_f) and stems0.start.distance(
                 stem.stop) < max_tree_height):
-
-            if len(stems0.path.coords) > 2 and len(stem.path.coords) > 2:
-                start = LineString(stems0.path.coords[:-1])
-                end = LineString(stem.path.coords[1:])
-                new_path = linemerge([start, missing_part_, end])
-            else:
-                if len(stems0.path.coords) > 2 and has_length_2:
-                    start = LineString(stems0.path.coords[:-1])
-                    new_path = linemerge([start, missing_part_])
-                else:
-                    if (len(stems0.path.coords) == 2 and len(
-                            stem.path.coords) > 2):
-                        end = LineString(stem.path.coords[1:])
-                        new_path = linemerge([missing_part_, end])
-                    else:
-                        if (len(stems0.path.coords) == 2 and has_length_2):
-                            new_path = missing_part_
-
-            change = True
-            candidate = _clone_stem(stems0)
-            candidate.path = new_path
-            candidate.stop = stem.stop
-            # merged path = stems0[:-1] + stem[1:]; merge the diameter lists
-            # the same way and drop stale per-node measures (A-1)
-            candidate.segment_diameter_list = \
-                _merge_diameter_lists(stems0, stem)
-            candidate.segment_length_list = []
-            candidate.segment_volume_list = []
-            candidate.vector = []
-            slave = stem
             vote = calc_vote(ang_l_sp_el_st, ang_l_sp_mp, ang_mp_el_st,
-                             candidate, stem, stems0, tolerance_angle)
-            candidates.append(candidate)
-            votes.append(vote)
-            slaves.append(slave)
+                             _VoteEnds(stems0.start, stem.stop),
+                             stem, stems0, tolerance_angle)
+            best = (vote, 1)
 
     if start_buffer.contains(stem.stop) and ang_el_sp_l_st < tolerance_angle:
         missing_part_ = LineString(
@@ -344,49 +342,80 @@ def calc_connectivity_votes(
         ang_mp_l_st = abs(ang(missing_part_.coords, line_start.coords))
 
         if (ang_el_sp_l_st < (tolerance_angle * dist_f) and ang_el_sp_mp < (
-                tolerance_angle * dist_f) and abs(
-                ang(missing_part_.coords, line_start.coords)) < (
+                tolerance_angle * dist_f) and ang_mp_l_st < (
                 tolerance_angle * dist_f) and stem.start.distance(
                 stems0.stop) < max_tree_height):
-            if len(stem.path.coords) > 2 and len(stems0.path.coords) > 2:
-                start = LineString(stem.path.coords[:-1])
-                end = LineString(stems0.path.coords[1:])
-                new_path = linemerge([start, missing_part_, end])
-            else:
-                if len(stem.path.coords) > 2 and len(stems0.path.coords) == 2:
-                    start = LineString(stem.path.coords[:-1])
-                    new_path = linemerge([start, missing_part_])
-                else:
-                    if has_length_2 and len(stems0.path.coords) > 2:
-                        end = LineString(stems0.path.coords[1:])
-                        new_path = linemerge([missing_part_, end])
-                    else:
-                        if (has_length_2 and len(
-                                stems0.path.coords) == 2):
-                            new_path = missing_part_
-
-            change = True
-            candidate = _clone_stem(stems0)
-            candidate.path = new_path
-            candidate.start = stem.start
-            # merged path = stem[:-1] + stems0[1:] in this branch (A-1)
-            candidate.segment_diameter_list = \
-                _merge_diameter_lists(stem, stems0)
-            candidate.segment_length_list = []
-            candidate.segment_volume_list = []
-            candidate.vector = []
-            slave = stem
             vote = calc_vote(ang_el_sp_l_st, ang_el_sp_mp, ang_mp_l_st,
-                             candidate, stems0, stem, tolerance_angle)
-            candidates.append(candidate)
-            votes.append(vote)
-            slaves.append(slave)
+                             _VoteEnds(stem.start, stems0.stop),
+                             stems0, stem, tolerance_angle)
+            # strict less: branch 1 wins ties, like the old first-argmin
+            if best is None or vote < best[0]:
+                best = (vote, 2)
 
-    if change:
-        index_min = min(range(len(votes)), key=votes.__getitem__)
-        return True, votes[index_min], candidates[index_min], slaves[index_min]
+    return best
+
+
+def _merge_paths(first: Stem, second: Stem) -> LineString:
+    """The merged path first[:-1] + missing part + second[1:], built with
+    the exact expressions the old calc_connectivity_votes used."""
+    missing_part_ = LineString(
+        [first.path.coords[-2], second.path.coords[1]])
+    first_long = len(first.path.coords) > 2
+    second_long = len(second.path.coords) > 2
+    if first_long and second_long:
+        start = LineString(first.path.coords[:-1])
+        end = LineString(second.path.coords[1:])
+        return linemerge([start, missing_part_, end])
+    if first_long:
+        start = LineString(first.path.coords[:-1])
+        return linemerge([start, missing_part_])
+    if second_long:
+        end = LineString(second.path.coords[1:])
+        return linemerge([missing_part_, end])
+    return missing_part_
+
+
+def _build_connection(stems0: Stem, stem: Stem, branch: int) -> Stem:
+    """Materialize the merged stem for the winning candidate/branch that
+    _score_connectivity chose."""
+    candidate = _clone_stem(stems0)
+    if branch == 1:
+        candidate.path = _merge_paths(stems0, stem)
+        candidate.stop = stem.stop
+        # merged path = stems0[:-1] + stem[1:]; merge the diameter lists
+        # the same way and drop stale per-node measures (A-1)
+        candidate.segment_diameter_list = _merge_diameter_lists(stems0, stem)
     else:
+        candidate.path = _merge_paths(stem, stems0)
+        candidate.start = stem.start
+        # merged path = stem[:-1] + stems0[1:] in this branch (A-1)
+        candidate.segment_diameter_list = _merge_diameter_lists(stem, stems0)
+    candidate.segment_length_list = []
+    candidate.segment_volume_list = []
+    candidate.vector = []
+    return candidate
+
+
+def calc_connectivity_votes(
+        stems0: Stem,
+        line_start: LineString,
+        line_stop: LineString,
+        start_buffer,
+        end_buffer,
+        max_distance,
+        max_tree_height,
+        tolerance_angle,
+        stem: Stem
+) -> (bool, List[float], List[Stem], List[Stem]):
+    """Compatibility wrapper over _score_connectivity/_build_connection
+    with the historical (changed, vote, candidate, slave) contract."""
+    scored = _score_connectivity(
+        stems0, line_start, line_stop, start_buffer, end_buffer,
+        max_distance, max_tree_height, tolerance_angle, stem)
+    if scored is None:
         return False, math.inf, None, None
+    vote, branch = scored
+    return True, vote, _build_connection(stems0, stem, branch), stem
 
 
 # calculate vote
