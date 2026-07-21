@@ -5,13 +5,31 @@
 # locally -- useful on Linux, and the only practical way to test a QGIS version
 # you do not want on your workstation.
 #
-# Build the image first:
-#     docker build -t winmol_analyser_docker .
+# The QGIS version comes from $QGIS_TAG and is baked into the image name, so
+# several QGIS versions can coexist:
+#     ./startDocker.sh                          # the default LTR
+#     QGIS_TAG=4.2.0-trixie ./startDocker.sh    # trial QGIS 4 / Qt6
+# Keep the default in sync with the Dockerfile's ARG QGIS_TAG (a test enforces
+# this). See docs/CONTAINERS.md, especially before trialling a 4.x tag.
+#
+# NOTE: every qgis/qgis tag is amd64-only, so on an arm64 host (Apple Silicon)
+# this needs `--platform linux/amd64` emulation -- and the X11 plumbing below
+# (/tmp/.X11-unix, --net host) is Linux-only regardless. Use a Linux host.
 #
 # NOTE: `xhost +` below disables X access control for ALL clients, not just this
 # container. Prefer `xhost +local:docker` and run `xhost -` when you are done.
 
 set -euo pipefail
+
+QGIS_TAG="${QGIS_TAG:-3.44.12-noble}"
+IMAGE="winmol_analyser_docker:${QGIS_TAG}"
+
+# Build the image if it is not there yet (rebuild by hand after Dockerfile
+# changes: docker build --build-arg QGIS_TAG="$QGIS_TAG" -t "$IMAGE" .).
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    echo "Building $IMAGE ..."
+    docker build --build-arg QGIS_TAG="$QGIS_TAG" -t "$IMAGE" .
+fi
 
 xhost +
 
@@ -34,5 +52,5 @@ docker run --rm -it --name qgis --net host \
     -v /tmp/.X11-unix:/tmp/.X11-unix \
     -v "$(pwd)":/root/.local/share/QGIS/QGIS3/profiles/default/python/plugins/WINMOL_Analyser \
     -e DISPLAY="unix$DISPLAY" \
-    winmol_analyser_docker \
+    "$IMAGE" \
     qgis
