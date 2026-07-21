@@ -43,6 +43,13 @@ EXTRAS = metadata.txt icon.png config.json
 
 EXTRA_DIRS = classes utils plugin_utils requirements
 
+# Vestigial: resources.qrc compiles exactly one file, icon.png, and nothing
+# resolves a ':/plugins/...' path any more — winmol_analyzer.py loads the icon
+# from disk so it works under both Qt5 and Qt6, and the .ui has an empty
+# <resources/>. The import at winmol_analyzer.py is wrapped in try/except.
+# Kept because scripts/build_plugin_zip.sh hard-requires resources.py in the
+# package and aborts without it; removing it means editing that script in the
+# same commit. See docs/root-layout.md.
 COMPILED_RESOURCE_FILES = resources.py
 
 PEP8EXCLUDE=pydev,resources.py,conf.py,third_party,ui
