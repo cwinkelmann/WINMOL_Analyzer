@@ -2,7 +2,13 @@ name: Create and release archive
 on:
   push:
     tags:
-      - '*'
+      # Plugin releases only. The previous '*' trigger also fired for
+      # asset-only tags such as `models-onnx-v1`, which attached a plugin
+      # zip whose metadata.txt read `version=models-onnx-v1` — not a valid
+      # QGIS version. scripts/plugin_version.py rejects such tags too, so a
+      # stray `v`-prefixed non-version fails the build loudly rather than
+      # publishing a broken package.
+      - 'v*'
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -14,18 +20,34 @@ jobs:
           path: WINMOL_Analyzer
 
       - name: Build the plugin package
-        # Uses `git archive`, so the file set comes from .gitattributes
-        # (export-ignore) — the SAME single list `make package` uses. The
-        # previous hand-maintained -x list had drifted: it still shipped
-        # tests/fixtures, docs/ and 11 MB of standalone/*.ipynb notebooks.
+        # scripts/build_plugin_zip.sh is the single packaging path, shared
+        # with `make package`, so the local build and the released artifact
+        # cannot drift apart.
+        #
+        # Two names, one archive:
+        #   WINMOL_Analyzer-<version>.zip  — the versioned artifact, so a
+        #     download is identifiable on disk and two releases do not both
+        #     land as "...zip" and "...zip (1)".
+        #   WINMOL_Analyzer_QGIS_Plugin.zip — stable alias. The download
+        #     buttons in documentation/index.html point at
+        #     releases/latest/download/<name>, a permalink form that cannot
+        #     carry a version, so the historical name must keep resolving.
+        id: package
         run: |
           set -euo pipefail
           cd WINMOL_Analyzer
-          bash scripts/build_plugin_zip.sh HEAD \
-            ../WINMOL_Analyzer_QGIS_Plugin.zip "${GITHUB_REF_NAME#v}"
+          VERSION="$(python3 scripts/plugin_version.py "$GITHUB_REF_NAME")"
+          ZIP="$(python3 scripts/plugin_version.py \
+            "$GITHUB_REF_NAME" --zip-name)"
+          bash scripts/build_plugin_zip.sh HEAD "../$ZIP" "$VERSION"
+          cp "../$ZIP" "../WINMOL_Analyzer_QGIS_Plugin.zip"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "artifacts=$ZIP,WINMOL_Analyzer_QGIS_Plugin.zip" \
+            >> "$GITHUB_OUTPUT"
+
       - name: Upload Release
         uses: ncipollo/release-action@v1.12.0
         with:
-          artifacts: "WINMOL_Analyzer_QGIS_Plugin.zip"
+          artifacts: ${{ steps.package.outputs.artifacts }}
           allowUpdates: true
           token: ${{ secrets.GITHUB_TOKEN }}
