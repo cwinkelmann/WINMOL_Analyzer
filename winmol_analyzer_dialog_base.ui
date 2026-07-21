@@ -489,7 +489,7 @@
           <string>Detected Wind-Thrown Trees (Line Layer)</string>
          </property>
          <property name="checked">
-          <bool>false</bool>
+          <bool>true</bool>
          </property>
         </widget>
        </item>
@@ -529,7 +529,7 @@
           <string>Measuring Nodes (Point Layer)</string>
          </property>
          <property name="checked">
-          <bool>false</bool>
+          <bool>true</bool>
          </property>
         </widget>
        </item>
