@@ -518,3 +518,28 @@ there are many qgis related files which seem relevant to qgis only and could be 
 
 ### QGIS Docker Container
 The current container is fixed on QGIS 3.28.2, which is a way too old (2022, no LTR(. I would suggest to use the latest LTR version of QGIS 3.44) and make it run on QGIS 4.2.0
+
+---
+
+## Review round — 2026-07-21 · branch `fix/review-findings`
+
+**What is under review:** `fix/review-findings`, cut from `feat/gpu-container`
+@ `7c0628b` (the live line, post-restack).
+
+**Do not review from tag `v0.6.0.2`.** That tag sits on the pre-restack
+lineage (see `backup/feat-gpu-container-old-line`); it is not an ancestor of
+`feat/gpu-container` and the two have diverged by 50 commits, so anything
+fixed from that tag can never fast-forward back into the stack. When a
+reviewable build is needed, tag *this* line instead (pushing a tag triggers
+the release ZIP via `on-push-tags.yml`).
+
+**Where fixes go:** commit them on this branch. It PRs into
+`feat/gpu-container`, i.e. it sits on *top* of the PR stack — nothing below
+(#1 → #2 → #3/#4 → #9 → #10 → #12) ever needs rebasing.
+
+**Convention in this file:** `🐛 OPEN` · `✅ FIXED` (state the cause, not just
+the fix) · `⚠️ CLARIFIED` / `ENVIRONMENTAL` (not a code bug). One `###` per
+finding: what you did, what you expected, what happened, logs verbatim.
+
+### (findings below)
+
