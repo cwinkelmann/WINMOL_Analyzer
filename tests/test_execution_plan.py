@@ -173,8 +173,10 @@ def _plan(config, hardware, raster, process_type='Trees'):
     return build_execution_plan(config, hardware, raster, process_type)
 
 
-def test_config_default_knob_is_auto():
-    assert Config().vector_processing == 'auto'
+def test_config_default_knob_is_tiled():
+    # Deliberate: default preserves the pre-existing tiled behavior (and
+    # its published numbers); 'auto'/'untiled' are opt-in (docs/CONFIG.md).
+    assert Config().vector_processing == 'tiled'
 
 
 def test_stems_process_type_has_no_vector_mode():
@@ -203,25 +205,36 @@ def test_auto_picks_untiled_for_small_raster_with_ample_ram():
     assert plan.vector_mode == 'untiled'
 
 
+def _auto_config():
+    config = Config()
+    config.vector_processing = 'auto'
+    return config
+
+
 def test_auto_picks_untiled_for_full_ortho_with_big_ram():
     # 6.6 GB working set <= 50% of 64 GB -> clearly safe.
-    plan = _plan(Config(), _hardware(64.0), FULL_ORTHO)
+    plan = _plan(_auto_config(), _hardware(64.0), FULL_ORTHO)
     assert plan.vector_mode == 'untiled'
 
 
 def test_auto_falls_back_to_tiled_when_ram_is_small():
     # 6.6 GB working set > 50% of 8 GB -> tiled.
-    plan = _plan(Config(), _hardware(8.0), FULL_ORTHO)
+    plan = _plan(_auto_config(), _hardware(8.0), FULL_ORTHO)
     assert plan.vector_mode == 'tiled'
 
 
 def test_auto_falls_back_to_tiled_when_ram_is_unknown():
-    plan = _plan(Config(), _hardware(0.0), SMALL)
+    plan = _plan(_auto_config(), _hardware(0.0), SMALL)
     assert plan.vector_mode == 'tiled'
 
 
 def test_auto_falls_back_to_tiled_for_degenerate_raster():
-    plan = _plan(Config(), _hardware(64.0), _raster(0, 0))
+    plan = _plan(_auto_config(), _hardware(64.0), _raster(0, 0))
+    assert plan.vector_mode == 'tiled'
+
+
+def test_default_config_stays_tiled_even_with_ample_ram():
+    plan = _plan(Config(), _hardware(64.0), FULL_ORTHO)
     assert plan.vector_mode == 'tiled'
 
 

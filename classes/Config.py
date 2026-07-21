@@ -7,7 +7,7 @@ class Config(object):
     # map in RAM); 'auto' picks 'untiled' only when the planner estimates the
     # stem map comfortably fits in RAM (see ExecutionPlan._untiled_fits_in_ram)
     # and falls back to 'tiled' when in doubt.
-    vector_processing = "auto"           # auto | tiled | untiled
+    vector_processing = "tiled"          # tiled | untiled | auto
 
     # tiled stream production pipeline
     tile_inner_px = 4096

@@ -46,7 +46,7 @@ below instead.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `vector_processing` | auto | Vector-phase strategy: `tiled`, `untiled`, or `auto`. See the section below. |
+| `vector_processing` | tiled | Vector-phase strategy: `tiled`, `untiled`, or `auto`. See the section below. |
 | `max_cpu_workers` | 32 | Hard ceiling on CPU workers, applied as `min(this, cores-1)`. **The main lever on a many-core box.** |
 | `max_gpu_workers` | 8 | Ceiling on GPU worker processes (one per GPU). |
 | `single_gpu_cpu_workers` | 24 | CPU workers requested when 1 GPU is present; clamped by `max_cpu_workers`. |
@@ -71,12 +71,17 @@ seam-split stems can survive the edge-buffer dedup and the order-sensitive
 The un-tiled chain is the reference-correct output and, when the raster fits
 in RAM, ~2x faster (measured 64.9 s vs 120.3 s on a 14624x10088 stem map).
 
+- `tiled` (default) — always tile + merge (constant memory; the
+  pre-existing behavior). The default stays `tiled` deliberately so a
+  version upgrade never silently changes published stem counts — switching
+  to the un-tiled output is an explicit, documented decision
+  (results-changing; see docs/BUGS.md "Tiling changes the results").
 - `untiled` — always run the legacy whole-raster chain
   (`Skel.find_segments` → … → `Quant.quantify_stems`) and write the same
   GeoPackage contract as the tiled merge (`stems`/`nodes`/`vectors` layers,
-  identical schema).
-- `tiled` — always tile + merge (constant memory; the pre-existing behavior).
-- `auto` (default) — pick `untiled` only when it is clearly safe:
+  identical schema). Reference-correct at seams and, when the raster fits
+  in RAM, faster than tiling.
+- `auto` (opt-in) — pick `untiled` only when it is clearly safe:
   estimated stem-map working set (prediction-grid pixels x ~48 bytes/pixel,
   covering the uint8 map + skeletonize/labels/EDT copies with a 2x margin)
   is at most **50 % of detected RAM**. Unknown RAM or a degenerate raster
