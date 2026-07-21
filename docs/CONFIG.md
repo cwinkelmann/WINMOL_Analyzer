@@ -1,5 +1,76 @@
 # Configuration reference
 
+Two different things are configured here:
+
+- the **model registry** (`config.json`, repo root — shipped inside the QGIS
+  plugin): which models exist, where they download from, and how they verify;
+- the **pipeline `Config`** (`classes/Config.py`): tiling, workers, thresholds.
+
+## Model registry (`config.json`, schema v2)
+
+`config.json` is no longer a flat `{name: url}` map. It is a versioned
+registry (`"schema": 2`) parsed by `plugin_utils/model_registry.py` and
+consumed by the QGIS dialog, `plugin_utils/installer.py`, `winmol_batch.py`
+and `scripts/convert_models_to_onnx.py`. The loader still accepts a legacy
+flat map, and `Registry.flat_map()` re-serves `{id: url}` for anything that
+wants the old shape — but external scripts that `json.load` the file and
+iterate `.items()` must migrate.
+
+What an entry carries: stable `id` (the four classic ids **General, Beech,
+Spruce, Spruce_Deadwood are unchanged**, same URLs, same on-disk file names —
+existing caches stay valid), a human-readable `label`/`description`, the
+download `url`, the mandatory on-disk `file` name (always the URL basename;
+one naming rule for the plugin's `models/` dir *and* the batch CLI's
+`--model-dir`, ending the old key-vs-basename split), a checksum (`sha256`
+for the model-zoo assets, `md5` for the Zenodo HDF5 originals, `null` = skip
+verification), and metadata (`family`, `backend`, `precision`, `f1`,
+`size_mb`, `lossless`, `hidden`).
+
+**Families and variants.** A family groups the precision variants of one
+trained model: `default` (fp32 reference), `cpu` (int8), `gpu` (fp16).
+Resolution rules (`Registry.resolve`):
+
+- An **explicit model id is never rewritten** — `General` always means the
+  fp32 `General.onnx`, on every device, under every `--variant`.
+- A **family id** (`unet_pt`, `classic_spruce`, `hrnet`, …) picks the family
+  default; with variant `auto` the device variant is substituted **only when
+  it is certified `lossless`** (the classic int8s are domain-calibrated, not
+  certified — auto never picks them; the PyTorch UNet int8/fp16 are lossless
+  and are picked). `--variant fp32|int8|fp16` forces a variant or errors if
+  the family lacks it.
+- Device for `auto` = `WINMOL_DEVICE` env (`gpu`/`cpu`) if set, else an
+  `nvidia-smi` probe. Apple-Silicon/CoreML machines report `cpu`; use
+  `WINMOL_DEVICE`/`WINMOL_ONNX_PROVIDERS` to steer if needed.
+
+**Sources.** Classic four: the `models-onnx-v1` release of this repo (their
+`sha256` is still `null` — TODO: compute and fill; until then they verify
+like before, by existence only). Zoo: the `models-v1` release of
+`cwinkelmann/WINMOL_segmentor_pt` (22 ONNX assets, sha256 from its
+SHA256SUMS; all share one contract — NCHW `[b,3,512,512]` float32 in [0,1] →
+`[b,1,512,512]`, sigmoid baked in, opset 17 — and load unchanged through
+`OnnxSegmenter`). Originals: Zenodo record 15907576
+(DOI 10.5281/zenodo.15907576), the four Keras `.hdf5`, md5-pinned, marked
+`hidden` (the plugin venv is ONNX-only; the CLI and the converter can still
+address them by id, e.g. `Spruce_Deadwood_hdf5`).
+
+**Downloads are on-demand and verified.** `preload` ships empty, so plugin
+startup does zero model network I/O; the dialog offers the download when you
+Run with a model that is not on disk, and `winmol_batch.py` fetches before
+processing (`--no-download` forbids it). All fetches stream to a `.part`
+file, verify the checksum, then atomically rename — a crash can only leave a
+`*.part`, never a truncated model that passes the old size>0 check. A cached
+file that *fails* its checksum is treated as stale and re-downloaded, so URL
+swaps in future registry updates actually take effect. Verified digests are
+memoized in `<model_dir>/.winmol_verified.json` (hash 374 MB once, then a
+`stat()` suffices).
+
+CLI: `winmol_batch.py --list-models` prints ids, backends, sizes, F1 and
+installed state; model names and family ids are case-insensitive
+(`general` still works). GUI: the dropdown shows one entry per family plus
+`Custom` (reserved id); the Variant selector picks fp32/int8/fp16.
+
+## Pipeline `Config`
+
 Defaults live in `classes/Config.py`. Override any of them without editing code:
 
 ```bash
