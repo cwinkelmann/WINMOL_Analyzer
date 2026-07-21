@@ -675,7 +675,18 @@ Download missing models from the release page. The plugin should be able to down
 https://github.com/cwinkelmann/WINMOL_segmentor_pt/releases 
 Spruce Deadwood as INT8 should be default, A SpecDS INT8 W05 would be second best
 
-⚠️ NAMING — verified against the `models-v1` manifest, 2026-07-21:
+✅ CORRECTED 2026-07-21 (later the same day) — **the note below was WRONG and
+you were right.** After the `models-v1` assets were renamed, the provenance is
+explicit: **`model_UNet_SpecDS_Beech_512_pytorch_w05_int8.onnx`** — a SpecDS,
+w05, int8 build. So "a SpecDS INT8 W05" *does* exist; I claimed it did not
+because the old asset name (`unet_w05_int8_cpu.onnx`) hid the training set.
+It is registered as `UNet_PT_int8` and is the runner-up default, as you asked.
+Two related facts the rename also settled: the family's fp32 member
+(`..._pytorch.onnx`, 124.1 MB) is the FULL-WIDTH reference, not a w05 build;
+and w05 exists only in the `_pytorch` lineage, never in the converted-Keras
+entries. Labels and `docs/CONFIG.md` corrected accordingly.
+
+⚠️ NAMING (superseded by the correction above) — as read on 2026-07-21:
 - 1st choice exists as asked: **`model_UNet_SpecDS_Spruce_Deadwood_512_int8.onnx`**
   (31.4 MB, CPU static int8, domain-calibrated; the int8 of the classic
   Spruce_Deadwood model).
@@ -691,3 +702,25 @@ Spruce Deadwood as INT8 should be default, A SpecDS INT8 W05 would be second bes
 
 ### Add a setup tab to the plugin
 There env setup, deletion and model download can be combined. Don't do that in that single tab "Detect stems from UAV images"
+### Model download failed with HTTP 404 (release v0.0.0-demo3)
+
+✅ FIXED — `280c362` + `657825c`. Reported from the GUI:
+"download failed for model_UNet_SpecDS_Spruce_Deadwood_512_int8.onnx …
+HTTP Error 404". Two independent causes, both invisible to the checks that
+were run at the time:
+1. The `models-v1` assets were **renamed** after `config.json` was written
+   (to the timestamped scheme that fixes the "names are not helpful"
+   complaint). **0 of 22** registry filenames still matched.
+2. `WINMOL_segmentor_pt` was **private**, so the plugin's unauthenticated
+   download could never succeed regardless of names. (Now public.)
+**Why it shipped:** the assets were verified with `gh`, which is
+*authenticated* — that masked both the privacy and the renames. A single
+anonymous fetch would have caught it.
+**Fix:** all 22 entries re-derived from the release `SHA256SUMS` **by
+digest**, not by guessing names — every one mapped to exactly one current
+asset and not a single checksum changed (identical bytes, renamed files).
+**Guards added** (`tests/test_model_urls.py`, vendored
+`tests/fixtures/models_v1_SHA256SUMS`): an offline test that `file` ==
+basename(url) and that every digest matches the published sums, plus an
+anonymous-reachability test over every URL, opt-in via `WINMOL_NET_TESTS=1`
+so CI stays offline. Verified 26/26 reachable without auth.
