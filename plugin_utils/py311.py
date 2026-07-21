@@ -21,6 +21,7 @@ import platform
 import subprocess
 import sys
 import tarfile
+import time
 import urllib.request
 
 from .childenv import child_env
@@ -109,19 +110,27 @@ def _download(url, dest, progress=None):
             open(dest, "wb") as out:
         total = int(resp.headers.get("Content-Length") or 0)
         read = 0
+        # Throttle to ~1 line/s or every 5 MB: on a fast link the 1 MB chunks
+        # would otherwise push dozens of lines per second into the log widget.
+        last_at, last_mb = 0.0, -5
         while True:
             chunk = resp.read(1 << 20)
             if not chunk:
                 break
             out.write(chunk)
             read += len(chunk)
-            if progress:
-                if total:
-                    progress(f"Downloading Python 3.11… "
-                             f"{read // (1 << 20)}/{total // (1 << 20)} MB")
-                else:
-                    progress(f"Downloading Python 3.11… "
-                             f"{read // (1 << 20)} MB")
+            if not progress:
+                continue
+            read_mb = read // (1 << 20)
+            now = time.monotonic()
+            if now - last_at < 1.0 and read_mb - last_mb < 5:
+                continue
+            last_at, last_mb = now, read_mb
+            if total:
+                progress(f"Downloading Python 3.11… "
+                         f"{read_mb}/{total // (1 << 20)} MB")
+            else:
+                progress(f"Downloading Python 3.11… {read_mb} MB")
 
 
 def _safe_extract(tar, path):
