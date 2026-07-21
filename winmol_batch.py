@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
 """Batch runner for WINMOL Analyzer.
 
-- Reads available models from config.json (repo root).
+- Reads available models from config.json (repo root) — the model
+  registry (schema v2 with families/variants/checksums, or a legacy flat
+  {name: url} map). See --list-models.
+- Downloads the resolved model on demand (checksum-verified, atomic)
+  unless --no-download forbids network access.
 - Runs winmol_run.py for all *.tif / *.tiff in the input folder.
 - Optionally merges tiled outputs with utils.IO.merge_and_filter_tiled_results.
 """
 
 import argparse
 import concurrent.futures
-import json
 import os
 import queue
 import subprocess
 import sys
 from typing import Dict, List, Optional
+
+from plugin_utils import model_registry
 
 
 DEFAULT_INPUT_FOLDER = "./standalone/input"
@@ -35,24 +40,28 @@ def load_model_paths(
     config_path: str = DEFAULT_CONFIG_PATH,
     model_dir: str = DEFAULT_MODEL_DIR,
 ) -> Dict[str, str]:
-    """Load model names from config.json and map them to local model paths."""
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(
-            "config.json not found at: "
-            f"{config_path} (expected repo root; next to winmol_batch.py)"
-        )
+    """Map every registry model id to its expected local file path.
 
-    with open(config_path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
+    Backed by plugin_utils.model_registry. Schema-v2 registries use each
+    entry's mandatory ``file`` name (always the URL basename), unifying
+    the plugin's and the CLI's on-disk naming. Legacy flat {name: url}
+    configs keep the historical URL-basename mapping (url_to_filename)
+    byte-identically. Never downloads and never checks existence — it
+    only computes expected paths. Raises FileNotFoundError / ValueError
+    exactly as before.
+    """
+    registry = model_registry.load_registry(config_path)
 
-    if not isinstance(cfg, dict) or not cfg:
-        raise ValueError(f"Invalid/empty config.json: {config_path}")
+    if registry.schema >= 2:
+        return {mid: model_registry.local_path(entry, model_dir)
+                for mid, entry in registry.entries.items()}
 
     model_paths: Dict[str, str] = {}
-    for model_name, url in cfg.items():
-        if not isinstance(model_name, str) or not isinstance(url, str):
-            continue
-        model_paths[model_name] = os.path.join(model_dir, url_to_filename(url))
+    for mid, entry in registry.entries.items():
+        if not entry.url:
+            continue    # legacy: entries with non-string urls are skipped
+        model_paths[mid] = os.path.join(model_dir,
+                                        url_to_filename(entry.url))
 
     if not model_paths:
         raise ValueError(
@@ -191,8 +200,8 @@ def process_orthos(orthos, model_path, output_folder, jobs=1):
     return failures
 
 
-def _resolve_model_name(model_paths):
-    """argparse `type` that accepts a model name in any case.
+def _resolve_model_name(names):
+    """argparse `type` that accepts a model or family name in any case.
 
     The model names originally lived in a hardcoded lowercase dict
     (`spruce` / `beech` / `general`). When they moved to config.json keys they
@@ -201,38 +210,94 @@ def _resolve_model_name(model_paths):
     Matching case-insensitively keeps those callers (and the Dockerfiles in the
     repo root) working, while the canonical capitalised names are what gets
     used internally.
+
+    Exact ids win before the case-insensitive fallback, and entry ids win
+    over family ids in that fallback (family "unet_pt" and entry
+    "UNet_PT" collide case-insensitively) — mirroring Registry.resolve.
     """
-    lookup = {name.lower(): name for name in model_paths}
+    exact = set(names)
+    # build family->entry overwrite order: later wins, so list entries
+    # last to give them case-insensitive precedence.
+    lookup = {name.lower(): name for name in reversed(list(names))}
 
     def _resolve(value):
+        if value in exact:
+            return value
         try:
             return lookup[value.lower()]
         except KeyError:
             raise argparse.ArgumentTypeError(
                 f"invalid model {value!r}; choose from "
-                + ", ".join(sorted(model_paths)))
+                + ", ".join(sorted(names)))
 
     return _resolve
 
 
+def _stderr_progress(done, total, entry):
+    """Carriage-return download progress line on stderr."""
+    mb = done / 1e6
+    if total:
+        pct = int(done * 100 / total)
+        line = (f"\r  {entry.file}  {pct:3d}%  "
+                f"({mb:.1f}/{total / 1e6:.1f} MB)")
+    else:
+        line = f"\r  {entry.file}  {mb:.1f} MB"
+    print(line, end="", file=sys.stderr, flush=True)
+
+
+def _manual_hint(entry, model_dir):
+    """The manual-download command matching this entry's hosting source."""
+    if "WINMOL_segmentor_pt" in entry.url:
+        return ("  gh release download models-v1 "
+                "--repo cwinkelmann/WINMOL_segmentor_pt "
+                f"-p {entry.file} --dir {model_dir}")
+    if "zenodo.org" in entry.url:
+        dest = os.path.join(model_dir, entry.file)
+        return f"  curl -L -o {dest} '{entry.url}'"
+    return f"  curl -L -o {os.path.join(model_dir, entry.file)} '{entry.url}'"
+
+
+def _print_models(registry, model_dir):
+    """--list-models: one line per model id, then the family ids."""
+    print(f"{'ID':<26} {'BACKEND':<7} {'SIZE':>9} {'F1':>6} "
+          f"{'STATE':<10} LABEL")
+    for e in registry.entries.values():
+        installed = os.path.exists(
+            model_registry.local_path(e, model_dir))
+        size = f"{e.size_mb:.1f} MB" if e.size_mb else "-"
+        f1 = f"{e.f1:.3f}" if e.f1 else "-"
+        state = "installed" if installed else "-"
+        print(f"{e.id:<26} {e.backend:<7} {size:>9} {f1:>6} "
+              f"{state:<10} {e.label}")
+    if registry.families:
+        print("\nFamily ids (auto-pick a device variant, see --variant):")
+        for fam in registry.families.values():
+            print(f"  {fam.id:<24} {fam.label}")
+
+
 def main(argv: List[str]) -> int:
-    # Only the KEYS are needed here (for `choices`), and those come from
-    # config.json, not from the model directory — so the default dir is fine
-    # for building the parser even when --model-dir overrides it below.
-    model_paths = load_model_paths()
+    # Only the NAMES are needed here (for the vocabulary), and those come
+    # from config.json, not from the model directory — so the default dir
+    # is fine for building the parser even when --model-dir overrides it
+    # below. Schema v2 adds the family ids (e.g. unet_pt) to the model
+    # ids as accepted names.
+    registry = model_registry.load_registry(DEFAULT_CONFIG_PATH)
+    names = list(registry.entries) + list(registry.families)
 
     parser = argparse.ArgumentParser(
         description=(
             "Batch process orthomosaics in a folder using WINMOL Analyzer. "
-            "Available models are loaded from config.json."
+            "Available models are loaded from the registry in config.json "
+            "(see --list-models)."
         )
     )
     parser.add_argument(
         "model",
-        type=_resolve_model_name(model_paths),
-        help=("Model to use (from config.json): "
-              + ", ".join(sorted(model_paths)) + ". Case-insensitive."),
-        metavar="{" + ",".join(sorted(model_paths)) + "}",
+        nargs="?",
+        type=_resolve_model_name(names),
+        help=("Model id or family id (from config.json): "
+              + ", ".join(sorted(names)) + ". Case-insensitive."),
+        metavar="MODEL",
     )
     parser.add_argument(
         "--input",
@@ -291,22 +356,88 @@ def main(argv: List[str]) -> int:
         default=1.0,
         help="Edge buffer in meters used for tile-edge filtering (default: 1)",
     )
+    parser.add_argument(
+        "--variant",
+        choices=["auto", "fp32", "int8", "fp16"],
+        default="auto",
+        help=(
+            "Precision variant when MODEL is a family id (e.g. unet_pt): "
+            "'auto' substitutes the device variant only when it is "
+            "certified lossless; fp32/int8/fp16 force one. Explicit model "
+            "ids (e.g. Spruce_Deadwood, UNet_PT_int8) are never rewritten."
+        ),
+    )
+    parser.add_argument(
+        "--no-download",
+        action="store_true",
+        help=(
+            "Never touch the network: fail with exit code 2 when the "
+            "resolved model file is absent or fails checksum verification."
+        ),
+    )
+    parser.add_argument(
+        "--list-models",
+        action="store_true",
+        help=(
+            "List the registry (model ids, backend, size, F1, installed "
+            "state, family ids) and exit."
+        ),
+    )
 
     args = parser.parse_args(argv)
 
-    # Re-resolve against the chosen directory now that --model-dir is known.
-    model_paths = load_model_paths(model_dir=args.model_dir)
-    model_path = model_paths[args.model]
-    if not os.path.exists(model_path):
-        print(
-            f"ERROR: Model file not found: {model_path}\n"
-            f"Looked in: {args.model_dir}\n"
-            "Point --model-dir (or $WINMOL_MODEL_DIR) at the directory holding "
-            "the models named in config.json, or fetch them with:\n"
-            "  gh release download models-onnx-v1 "
-            "--repo cwinkelmann/WINMOL_Analyzer --dir <dir>"
-        )
-        return 2
+    if args.list_models:
+        _print_models(registry, args.model_dir)
+        return 0
+    if not args.model:
+        parser.error("the model argument is required (or --list-models)")
+
+    if registry.schema >= 2:
+        try:
+            entry = registry.resolve(
+                args.model, device=model_registry.detect_device(),
+                variant=args.variant)
+        except (KeyError, ValueError) as exc:
+            print(f"ERROR: {exc}")
+            return 2
+        progressed = []
+
+        def _progress(done, total, e):
+            progressed.append(True)
+            _stderr_progress(done, total, e)
+
+        try:
+            model_path = model_registry.ensure_model(
+                entry, args.model_dir, progress=_progress,
+                allow_download=not args.no_download)
+        except model_registry.ModelDownloadError as exc:
+            print(
+                f"ERROR: {exc}\n"
+                f"Looked in: {args.model_dir}\n"
+                "Point --model-dir (or $WINMOL_MODEL_DIR) at the "
+                f"directory holding {entry.file}, or fetch it manually:\n"
+                + _manual_hint(entry, args.model_dir)
+            )
+            return 2
+        finally:
+            if progressed:
+                print(file=sys.stderr)   # newline after the \r progress
+    else:
+        # Legacy flat config: resolve against the chosen directory now
+        # that --model-dir is known; no downloads (historic behavior).
+        model_paths = load_model_paths(model_dir=args.model_dir)
+        model_path = model_paths[args.model]
+        if not os.path.exists(model_path):
+            print(
+                f"ERROR: Model file not found: {model_path}\n"
+                f"Looked in: {args.model_dir}\n"
+                "Point --model-dir (or $WINMOL_MODEL_DIR) at the directory "
+                "holding the models named in config.json, or fetch them "
+                "with:\n"
+                "  gh release download models-v1 "
+                "--repo cwinkelmann/WINMOL_segmentor_pt --dir <dir>"
+            )
+            return 2
 
     orthos = list_orthomosaics(args.input)
     if not orthos:

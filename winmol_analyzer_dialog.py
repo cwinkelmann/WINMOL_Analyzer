@@ -25,7 +25,6 @@ Dialog
 
 import os
 import glob
-import json
 from pathlib import Path
 
 try:
@@ -104,6 +103,15 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         # Background environment-build thread (download 3.11 + venv + pip).
         self._env_thread = None
         self._env_worker = None
+        # Background model-download thread (on-demand registry fetch).
+        self._dl_thread = None
+        self._dl_worker = None
+        # The registry entry behind the current combo selection (None for
+        # Custom / legacy configs); set by set_selected_model().
+        self._selected_entry = None
+        # Parsed model registry (plugin_utils.model_registry.Registry), or
+        # None when config.json could not be loaded.
+        self.registry = None
         # Re-entrancy guard: reassigning self.thread while its OS thread is
         # still running destroys a live QThread -> Qt qFatal() -> the whole
         # QGIS process aborts. Never start a second run over a live one.
@@ -189,23 +197,29 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             print(msg)
 
     def populate_model_combo_box(self) -> None:
-        """Fill the model dropdown from config.json.
+        """Fill the model dropdown from the model registry (config.json).
 
-        config.json is a mapping {"ModelName": "https://.../ModelName.onnx"}.
-        The installer downloads these into <plugin>/models/<ModelName>.onnx.
+        Schema-v2 registries show ONE item per model family (its fp32
+        default entry) in curated registry order — precision variants are
+        chosen via the Variant selector, not listed here. The item text is
+        the human-readable label; the entry id travels in the item's
+        userData. Legacy flat {name: url} configs keep the old sorted
+        key-per-item view. Hidden entries (the TensorFlow-only .hdf5
+        originals) never appear.
 
         We always append a "Custom" entry that lets users pick their own
         .onnx (or legacy .hdf5/.keras) file.
         """
         config_path = os.path.join(os.path.dirname(__file__), "config.json")
-        model_names = []
+        items = []          # (display text, entry id in userData)
+        default_id = None
 
         try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-            if isinstance(cfg, dict):
-                model_names = [k.strip() for k in cfg.keys() if isinstance(k, str) and k.strip()]
+            from .plugin_utils import model_registry
+            self.registry = model_registry.load_registry(config_path)
+            items, default_id = self._registry_combo_items()
         except Exception as e:
+            self.registry = None
             self._log(f"Could not load model list from config.json ({config_path}): {e}")
 
         try:
@@ -215,30 +229,123 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
 
         self.model_comboBox.clear()
 
-        if model_names:
-            for name in sorted(set(model_names), key=str.lower):
-                self.model_comboBox.addItem(name)
+        if items:
+            for text, mid in items:
+                self.model_comboBox.addItem(text, mid)
         else:
             # Backward-compatible fallback.
             for name in ["Beech", "Spruce", "General"]:
-                self.model_comboBox.addItem(name)
+                self.model_comboBox.addItem(name, name)
 
-        self.model_comboBox.addItem("Custom")
+        self.model_comboBox.addItem("Custom", "Custom")
 
-        # Default to Spruce_Deadwood (bundled), then fall back to General.
-        for _default in ("Spruce_Deadwood", "General"):
-            if model_names and _default in model_names:
-                idx = self.model_comboBox.findText(_default)
-                if idx >= 0:
-                    self.model_comboBox.setCurrentIndex(idx)
-                    break
+        # Default to the registry's declared default (its family row),
+        # then fall back to General.
+        if default_id is not None:
+            idx = self.model_comboBox.findData(default_id)
+            if idx >= 0:
+                self.model_comboBox.setCurrentIndex(idx)
 
         try:
             self.model_comboBox.blockSignals(False)
         except Exception:
             pass
 
+        # Preselect the precision the registry considers the effective
+        # default on THIS machine, so what the user sees is what runs.
+        # It is an ordinary selection: changing it overrides the rule.
+        combo = getattr(self, "variant_comboBox", None)
+        if combo is not None and self.registry is not None:
+            try:
+                idx = combo.findData(self._default_variant_value())
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+            except Exception:
+                pass
+
         self.handle_model_combo_box_change()
+
+    def _registry_combo_items(self):
+        """(items, default_id) for the model combo from self.registry.
+
+        Schema v2: one (label, entry_id) per family default. The
+        families behind the registry's ranked ``recommended`` list come
+        first (so the shipped default is row 0 and the documented
+        runner-up row 1), then the rest in registry order, then any
+        family-less visible entries. v1: the sorted flat keys, exactly
+        as before the registry existed.
+
+        ``default_id`` is a combo id, i.e. a FAMILY default entry: the
+        registry's declared default may be an optimised variant
+        (Spruce_Deadwood_int8), which the combo represents by its family
+        row; the concrete precision comes from the variant selector,
+        preset in :meth:`_default_variant_value`.
+        """
+        reg = self.registry
+        items = []
+        if reg.schema >= 2:
+            ranked, seen = [], set()
+            for mid in reg.recommended:
+                entry = reg.entries.get(mid)
+                fam = reg.families.get(entry.family) if entry else None
+                if fam is not None and fam.id not in seen:
+                    ranked.append(fam)
+                    seen.add(fam.id)
+            for fam in reg.families.values():
+                if fam.id not in seen:
+                    ranked.append(fam)
+                    seen.add(fam.id)
+
+            listed = set()
+            for fam in ranked:
+                entry = reg.entries[fam.default]
+                if not entry.hidden:
+                    items.append((entry.label, entry.id))
+                    listed.add(entry.id)
+            # hand-edited registries may hold family-less entries; keep
+            # them selectable rather than silently dropping them
+            for entry in reg.visible():
+                if (entry.id not in listed
+                        and entry.family not in reg.families):
+                    items.append((entry.label, entry.id))
+            defaults = (self._default_combo_id(), "General")
+        else:
+            names = sorted((e.id for e in reg.visible()), key=str.lower)
+            items = [(name, name) for name in names]
+            defaults = ("Spruce_Deadwood", "General")
+        for _default in defaults:
+            if _default and _default in reg.entries:
+                return items, _default
+        return items, None
+
+    def _default_combo_id(self):
+        """The combo id (family default entry) for the registry's
+        declared default, or None."""
+        reg = self.registry
+        mid = reg.gui_default
+        entry = reg.entries.get(mid) if mid else None
+        if entry is None:
+            return None
+        fam = reg.families.get(entry.family)
+        return fam.default if fam is not None else entry.id
+
+    def _default_variant_value(self):
+        """The variant to preselect so the GUI opens on exactly the
+        entry the registry calls the effective default for this machine
+        (int8 on CPU, fp16 on GPU). 'auto' when the registry has no
+        opinion — auto's lossless-only gate would otherwise silently
+        downgrade a declared int8 default to fp32."""
+        reg = self.registry
+        if reg is None or reg.schema < 2:
+            return "auto"
+        try:
+            from .plugin_utils import model_registry
+            entry = reg.default_entry(
+                device=model_registry.detect_device())
+        except Exception:
+            return "auto"
+        return {"int8": "int8", "fp16": "fp16"}.get(
+            entry.precision, "auto")
 
     def handle_model_combo_box_change(self):
         selected_text = self.model_comboBox.currentText()
@@ -262,6 +369,123 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self.apply_style_to_line_edit(self.model_lineEdit, True)
         else:
             self.apply_style_to_line_edit(self.model_lineEdit, False)
+
+        self._refresh_variant_controls()
+        self._refresh_model_info()
+
+    # --- model registry helpers ---------------------------------------------
+
+    def _current_family(self):
+        """The registry Family behind the current combo item, or None
+        (Custom, legacy flat config, or a family-less entry)."""
+        reg = self.registry
+        if reg is None or reg.schema < 2:
+            return None
+        mid = self.model_comboBox.currentData()
+        if not mid or mid == "Custom":
+            return None
+        entry = reg.entries.get(mid)
+        if entry is None:
+            return None
+        return reg.families.get(entry.family)
+
+    def _variant_value(self):
+        """Selected variant ('auto'/'fp32'/'int8'/'fp16')."""
+        combo = getattr(self, "variant_comboBox", None)
+        if combo is None:
+            return "auto"
+        return combo.currentData() or "auto"
+
+    def _selected_registry_entry(self):
+        """Resolve the combo selection (+ variant, + detected device) to a
+        concrete registry entry, or None for Custom / no registry."""
+        reg = self.registry
+        if reg is None:
+            return None
+        mid = self.model_comboBox.currentData()
+        if not mid or mid == "Custom":
+            return None
+        entry = reg.entries.get(mid)
+        if entry is None:
+            return None
+        fam = reg.families.get(entry.family)
+        if fam is None or reg.schema < 2:
+            return entry
+        from .plugin_utils import model_registry
+        try:
+            # resolve via the FAMILY so the variant selector applies; an
+            # entry id would (deliberately) never be variant-rewritten.
+            return reg.resolve(fam.id,
+                               device=model_registry.detect_device(),
+                               variant=self._variant_value())
+        except (KeyError, ValueError):
+            return entry
+
+    def _on_variant_changed(self, _index=None):
+        self._refresh_model_info()
+
+    def _refresh_variant_controls(self):
+        """Enable the variant selector for registry families and gray out
+        variants the current family does not provide (e.g. DeepLab/HRNet
+        have no int8)."""
+        combo = getattr(self, "variant_comboBox", None)
+        if combo is None:
+            return
+        try:
+            fam = self._current_family()
+            combo.setEnabled(fam is not None)
+            if fam is None:
+                return
+            avail = {"auto": True, "fp32": True,
+                     "int8": bool(fam.cpu), "fp16": bool(fam.gpu)}
+            model = combo.model()
+            for i in range(combo.count()):
+                item = model.item(i)
+                if item is not None:
+                    item.setEnabled(avail.get(combo.itemData(i), True))
+            if not avail.get(combo.currentData(), True):
+                combo.setCurrentIndex(0)   # back to Auto
+        except Exception:                          # pragma: no cover - GUI
+            pass
+
+    def _refresh_model_info(self):
+        """Show what the current selection actually is (description, F1,
+        file, download size / installed state) under the top bar."""
+        lbl = getattr(self, "model_info_label", None)
+        if lbl is None:
+            return
+        try:
+            if self.model_comboBox.currentText().strip() == "Custom":
+                lbl.setText(
+                    "Custom: pick a local .onnx (or legacy .hdf5/.keras) "
+                    "model file below.")
+                return
+            entry = self._selected_registry_entry()
+            if entry is None:
+                lbl.setText("")
+                return
+            from .plugin_utils import model_registry
+            parts = [entry.description or entry.label]
+            if entry.f1:
+                parts.append(f"TestDS F1 {entry.f1:.3f}")
+            path = model_registry.local_path(entry, self.models_dir)
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                state = "installed"
+            elif entry.size_mb:
+                state = f"will download {entry.size_mb:.1f} MB on Run"
+            else:
+                state = "will download on Run"
+            parts.append(f"{entry.file} — {state}")
+            lbl.setText("  |  ".join(parts))
+            # registry models fix the network input size (512 px for the
+            # whole zoo); mirror it into the (disabled) spinbox so the UI
+            # never shows a stale value from a previous Custom selection.
+            try:
+                self.image_spinBox.setValue(int(entry.tile_px))
+            except Exception:
+                pass
+        except Exception:                          # pragma: no cover - GUI
+            pass
 
     def model_file_dialog(self):
         options = QFileDialog.Options()
@@ -572,11 +796,21 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
 
     def set_selected_model(self):
         selected_text = self.model_comboBox.currentText().strip()
+        self._selected_entry = None
         if selected_text == "Custom":
             self.model_path = self.model_lineEdit.text().strip()
             return
 
-        if selected_text:
+        entry = self._selected_registry_entry()
+        if entry is not None:
+            # Registry selection: the entry's `file` is the one on-disk
+            # naming rule (same as the batch CLI's model dir).
+            from .plugin_utils import model_registry
+            self._selected_entry = entry
+            self.model_path = model_registry.local_path(
+                entry, self.models_dir)
+        elif selected_text:
+            # Legacy fallback (flat config / no registry): key-based name.
             self.model_path = os.path.join(
                 self.models_dir, f"{selected_text}.onnx")
         else:
@@ -697,6 +931,14 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             except (RuntimeError, AttributeError):
                 pass
         self._reap_thread(self._env_thread, self._env_worker)
+        # Model download: network reads are timeout-bounded (30 s), so the
+        # worker returns within a bounded time; park it if it doesn't.
+        if self._dl_worker is not None:
+            try:
+                self._dl_worker.cancel()
+            except (RuntimeError, AttributeError):
+                pass
+        self._reap_thread(self._dl_thread, self._dl_worker)
 
     def _reap_thread(self, thread, worker):
         """Quit + wait a bounded time for a QThread. If it is still running
@@ -743,6 +985,11 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             QtWidgets.QMessageBox.warning(self, "WINMOL Analyzer", "No model selected.")
             return
         if self.model_comboBox.currentText().strip() != "Custom" and not os.path.exists(self.model_path):
+            if self._selected_entry is not None:
+                # Registry model, not on disk yet: offer to fetch it now
+                # (checksum-verified, on a background thread) and re-run.
+                self._offer_model_download(self._selected_entry)
+                return
             QtWidgets.QMessageBox.warning(
                 self,
                 "WINMOL Analyzer",
@@ -979,6 +1226,44 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         except Exception as exc:                       # pragma: no cover - GUI
             print("WINMOL: could not add Environment button:", exc)
 
+        # Model variant selector + info line (registry schema v2 only).
+        # Auto picks the lossless device variant (int8 on CPU / fp16 on
+        # GPU) and otherwise stays on the fp32 reference, so results
+        # never drift unless the user opts in explicitly.
+        try:
+            row = QtWidgets.QWidget(self)
+            hv = QtWidgets.QHBoxLayout(row)
+            hv.setContentsMargins(0, 0, 0, 0)
+            hv.addWidget(QtWidgets.QLabel("Model variant:", row))
+            self.variant_comboBox = QtWidgets.QComboBox(row)
+            for text, val in (("Auto (recommended)", "auto"),
+                              ("Reference (fp32)", "fp32"),
+                              ("CPU-optimised (int8)", "int8"),
+                              ("GPU-optimised (fp16)", "fp16")):
+                self.variant_comboBox.addItem(text, val)
+            self.variant_comboBox.setToolTip(
+                "Precision variant of the selected model family. Auto "
+                "substitutes a faster device variant only when it is "
+                "certified lossless; otherwise it uses the fp32 "
+                "reference.")
+            self.variant_comboBox.currentIndexChanged.connect(
+                self._on_variant_changed)
+            hv.addWidget(self.variant_comboBox, 1)
+            self.model_info_label = QtWidgets.QLabel(self)
+            self.model_info_label.setWordWrap(True)
+            self.model_info_label.setStyleSheet("color: gray;")
+            top = getattr(self, "verticalLayout_7", None) or self.layout()
+            if top is not None:
+                top.insertWidget(1, row)
+                top.insertWidget(2, self.model_info_label)
+            reg = self.registry
+            if reg is None or reg.schema < 2:
+                row.hide()                 # nothing to vary in v1 configs
+            self._refresh_variant_controls()
+            self._refresh_model_info()
+        except Exception as exc:                       # pragma: no cover - GUI
+            print("WINMOL: could not add model variant controls:", exc)
+
         # Input raster layer selector (pick a layer already loaded in QGIS).
         try:
             from qgis.gui import QgsMapLayerComboBox
@@ -1182,6 +1467,86 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             f"Could not create an environment automatically:\n{msg}\n\n"
             "Use 'Choose interpreter…' to point at an existing conda "
             "env or venv instead.")
+
+    # --- on-demand model download -------------------------------------------
+
+    def _offer_model_download(self, entry):
+        """The selected registry model is not on disk: ask, then fetch it
+        on a background thread (ModelDownloadWorker) and re-run on
+        success. Replaces the old 'restart QGIS to download models' dead
+        end. Thread lifecycle copies EnvSetupWorker's quit/wait/park
+        discipline — deviation can qFatal all of QGIS."""
+        if self._dl_thread is not None:
+            self.update_output_log("A model download is already running…")
+            return
+        size = f" ({entry.size_mb:.1f} MB)" if entry.size_mb else ""
+        reply = QtWidgets.QMessageBox.question(
+            self, "Download model",
+            f"The model '{entry.label}' is not installed yet.\n\n"
+            f"Download it now{size}?\n\nSource: {entry.url}",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.Yes)
+        if reply != QtWidgets.QMessageBox.Yes:
+            return
+        from .tasks_threads import ModelDownloadWorker
+        try:
+            self.log_widget.setCurrentIndex(1)   # show the log tab
+        except Exception:
+            pass
+        self._dl_thread = QThread()
+        self._dl_worker = ModelDownloadWorker(entry, self.models_dir)
+        self._dl_worker.moveToThread(self._dl_thread)
+        self._dl_thread.started.connect(self._dl_worker.run)
+        self._dl_worker.log.connect(self.update_output_log)
+        self._dl_worker.progress.connect(self.update_progress)
+        self._dl_worker.done.connect(self._on_model_downloaded)
+        self._dl_worker.failed.connect(self._on_model_download_failed)
+        # Quit the thread and drop the worker once it finishes either way.
+        self._dl_worker.done.connect(self._dl_thread.quit)
+        self._dl_worker.failed.connect(self._dl_thread.quit)
+        self._dl_worker.done.connect(self._dl_worker.deleteLater)
+        self._dl_worker.failed.connect(self._dl_worker.deleteLater)
+        self._dl_thread.finished.connect(self._dl_thread.deleteLater)
+        self._dl_thread.finished.connect(self._clear_dl_thread)
+        # Lock the buttons that would race the download.
+        for _b in ("run_button", "env_button"):
+            _w = getattr(self, _b, None)
+            if _w is not None:
+                try:
+                    _w.setEnabled(False)
+                except Exception:
+                    pass
+        self._dl_thread.start()
+
+    def _clear_dl_thread(self):
+        """thread.finished: drop refs so a later download makes a fresh
+        thread, and re-enable the buttons (unless a run is active)."""
+        self._dl_thread = None
+        self._dl_worker = None
+        for _b in ("run_button", "env_button"):
+            _w = getattr(self, _b, None)
+            if _w is not None and not self._run_active:
+                try:
+                    _w.setEnabled(True)
+                except Exception:
+                    pass
+
+    def _on_model_downloaded(self, path):
+        self.update_output_log(f"Model downloaded and verified: {path}")
+        self._refresh_model_info()
+        # Continue the interrupted run once the thread has wound down; the
+        # pre-flight check now finds the file and proceeds.
+        QTimer.singleShot(0, self.run_process)
+
+    def _on_model_download_failed(self, msg):
+        entry = getattr(self._dl_worker, "entry", None)
+        url = getattr(entry, "url", "")
+        self.handle_process_error(
+            f"Model download failed: {msg}\n\n"
+            f"You can download it manually from:\n{url}\n"
+            "and either place it in the plugin's models folder "
+            f"({self.models_dir}) or select it via the Custom model "
+            "picker.")
 
     def load_layers_to_session(self):
         """Load outputs after processing finishes.

@@ -1,5 +1,122 @@
 # Configuration reference
 
+Two different things are configured here:
+
+- the **model registry** (`config.json`, repo root — shipped inside the QGIS
+  plugin): which models exist, where they download from, and how they verify;
+- the **pipeline `Config`** (`classes/Config.py`): tiling, workers, thresholds.
+
+## Model registry (`config.json`, schema v2)
+
+`config.json` is no longer a flat `{name: url}` map. It is a versioned
+registry (`"schema": 2`) parsed by `plugin_utils/model_registry.py` and
+consumed by the QGIS dialog, `plugin_utils/installer.py`, `winmol_batch.py`
+and `scripts/convert_models_to_onnx.py`. The loader still accepts a legacy
+flat map, and `Registry.flat_map()` re-serves `{id: url}` for anything that
+wants the old shape — but external scripts that `json.load` the file and
+iterate `.items()` must migrate.
+
+What an entry carries: stable `id` (the four classic ids **General, Beech,
+Spruce, Spruce_Deadwood are unchanged**), a human-readable
+`label`/`description`, the download `url`, the mandatory on-disk `file` name
+(always the URL basename; one naming rule for the plugin's `models/` dir
+*and* the batch CLI's `--model-dir`, ending the old key-vs-basename split),
+a checksum (`sha256` for the model-zoo assets, `md5` for the Zenodo HDF5
+originals), and metadata (`family`, `backend`, `precision`, `f1`, `size_mb`,
+`lossless`, `hidden`).
+
+**Every downloadable entry is digest-pinned.** There is no unverifiable
+download left in the registry, and
+`tests/test_model_registry.py::test_every_entry_has_a_digest` fails the
+build if an unpinned entry is added. Getting there required repointing the
+four classic ids (2026-07-21) from the older `models-onnx-v1` release of
+this repo — for which no checksums were ever published — onto the
+`models-v1` assets `model_UNet_{GenDS,SpecDS_Beech,SpecDS_Spruce,
+SpecDS_Spruce_Deadwood}_512.onnx`, which the zoo manifest states are
+conversions of the *same* upstream Keras HDF5 and numerically identical.
+**Consequence:** the on-disk names changed (`General.onnx` →
+`model_UNet_GenDS_512.onnx`, etc.), so a previously downloaded classic
+model is no longer recognized and is re-fetched once (124.6 MB each). The
+old release is untouched and still downloadable, but it is no longer
+referenced by the registry.
+
+**Defaults are ranked and device-aware.** `recommended` is an explicit
+ranked list, best first, and `recommended[0]` must equal `gui_default` (the
+loader rejects a registry where they disagree). Shipped ranking:
+
+1. `Spruce_Deadwood_int8` — INT8 Spruce + standing deadwood (SpecDS),
+   31.4 MB, the default.
+2. `UNet_PT_int8` — `unet_w05_int8_cpu.onnx`, 7.9 MB, TestDS F1 0.760.
+
+`Registry.default_entry(device)` computes the **effective** default: it
+keeps `recommended[0]`'s family (the domain choice) and takes that family's
+`cpu` (int8) variant on a CPU host or its `gpu` (fp16) variant on a GPU
+host. It never downloads and never touches the network beyond the local
+`detect_device()` probe. It deliberately bypasses `resolve`'s lossless-only
+gate, because here the registry has *itself* nominated an optimised entry —
+honouring the device is the declared intent, not a silent substitution. Any
+explicit selection (a GUI entry, `winmol_batch <MODEL>`, `--variant`)
+overrides it. The GUI lists the recommended families first and preselects
+the matching variant, so what is displayed is what runs.
+
+> **Caveat, stated honestly:** the classic `_int8` builds (including the
+> default) are described in the zoo manifest as "post-training static int8,
+> domain-calibrated" — they are **not** certified lossless there, and carry
+> `"lossless": false` here. Only the `_fp16` variants, and the PyTorch UNet
+> w05 int8, are certified lossless. The int8 Spruce+Deadwood default is a
+> product decision (31.4 MB, fast on CPU), not a measured-equivalence
+> claim. On a GPU host the effective default is the lossless fp16 variant.
+
+> **Naming, to stop a recurring mix-up:** there is no "SpecDS INT8 W05"
+> build. `w05` belongs only to the **PyTorch UNet** family (beech), asset
+> `unet_w05_int8_cpu.onnx` (entry `UNet_PT_int8`); `SpecDS` names the
+> classic per-species **Keras** models, which have no `w05` variant. The
+> runner-up above is the PyTorch `w05` asset.
+
+**Families and variants.** A family groups the precision variants of one
+trained model: `default` (fp32 reference), `cpu` (int8), `gpu` (fp16).
+Resolution rules (`Registry.resolve`):
+
+- An **explicit model id is never rewritten** — `General` always means the
+  fp32 GenDS model, on every device, under every `--variant`.
+- A **family id** (`unet_pt`, `classic_spruce`, `hrnet`, …) picks the family
+  default; with variant `auto` the device variant is substituted **only when
+  it is certified `lossless`** (the classic int8s are domain-calibrated, not
+  certified — auto never picks them; the PyTorch UNet int8/fp16 are lossless
+  and are picked). `--variant fp32|int8|fp16` forces a variant or errors if
+  the family lacks it.
+- Device for `auto` = `WINMOL_DEVICE` env (`gpu`/`cpu`) if set, else an
+  `nvidia-smi` probe. Apple-Silicon/CoreML machines report `cpu`; use
+  `WINMOL_DEVICE`/`WINMOL_ONNX_PROVIDERS` to steer if needed.
+
+**Sources.** All 22 ONNX entries (the classic four included, since the
+repoint above) come from the `models-v1` release of
+`cwinkelmann/WINMOL_segmentor_pt`, sha256-pinned from its
+SHA256SUMS (all share one contract — NCHW `[b,3,512,512]` float32 in [0,1] →
+`[b,1,512,512]`, sigmoid baked in, opset 17 — and load unchanged through
+`OnnxSegmenter`). Originals: Zenodo record 15907576
+(DOI 10.5281/zenodo.15907576), the four Keras `.hdf5`, md5-pinned, marked
+`hidden` (the plugin venv is ONNX-only; the CLI and the converter can still
+address them by id, e.g. `Spruce_Deadwood_hdf5`).
+
+**Downloads are on-demand and verified.** `preload` ships empty, so plugin
+startup does zero model network I/O; the dialog offers the download when you
+Run with a model that is not on disk, and `winmol_batch.py` fetches before
+processing (`--no-download` forbids it). All fetches stream to a `.part`
+file, verify the checksum, then atomically rename — a crash can only leave a
+`*.part`, never a truncated model that passes the old size>0 check. A cached
+file that *fails* its checksum is treated as stale and re-downloaded, so URL
+swaps in future registry updates actually take effect. Verified digests are
+memoized in `<model_dir>/.winmol_verified.json` (hash 374 MB once, then a
+`stat()` suffices).
+
+CLI: `winmol_batch.py --list-models` prints ids, backends, sizes, F1 and
+installed state; model names and family ids are case-insensitive
+(`general` still works). GUI: the dropdown shows one entry per family plus
+`Custom` (reserved id); the Variant selector picks fp32/int8/fp16.
+
+## Pipeline `Config`
+
 Defaults live in `classes/Config.py`. Override any of them without editing code:
 
 ```bash

@@ -29,18 +29,32 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
-import numpy as np              # noqa: E402
+import numpy as np                              # noqa: E402
+
+from plugin_utils import model_registry         # noqa: E402
 
 MODEL_DIR = os.path.join(REPO, "standalone", "model")
-# config.json key -> local Keras file (the four shipped Zenodo models)
-MODELS = {
-    "General": "model_UNet_GenDS_512_2023-02-27_211141.hdf5",
-    "Beech": "model_UNet_SpecDS_Beech_512_2023-02-28_042751.hdf5",
-    "Spruce": "model_UNet_SpecDS_Spruce_512_2023-02-27_061925.hdf5",
-    "Spruce_Deadwood":
-        "model_UNet_SpecDS_Spruce_Deadwood_512_2024-12-19_194758.hdf5",
-}
+CONFIG_PATH = os.path.join(REPO, "config.json")
 FIXTURE_CROP = os.path.join(REPO, "tests", "fixtures", "crop_input.tif")
+
+
+def hdf5_sources():
+    """config.json key -> registry entry for the original Keras models.
+
+    The registry's *_hdf5 entries (Zenodo record 15907576, DOI
+    10.5281/zenodo.15907576, md5-pinned) supersede the old hardcoded
+    filename map. The mapping key is the classic id — each hdf5 entry's
+    family default (General_hdf5 -> General, etc.).
+    """
+    reg = model_registry.load_registry(CONFIG_PATH)
+    sources = {}
+    for entry in reg.entries.values():
+        if entry.format != "hdf5":
+            continue
+        fam = reg.families.get(entry.family)
+        key = fam.default if fam else entry.id
+        sources[key] = entry
+    return sources
 
 
 def _real_tiles(n=4, size=512):
@@ -57,14 +71,24 @@ def _real_tiles(n=4, size=512):
     return np.ascontiguousarray(np.stack(tiles))
 
 
-def convert_one(name, out_dir, model_dir=MODEL_DIR):
+def convert_one(name, out_dir, model_dir=MODEL_DIR, sources=None,
+                download=False):
     import tensorflow as tf   # noqa: F401 (env parity)
     import tf2onnx
     from tensorflow import keras
 
-    hdf5 = os.path.join(model_dir, MODELS[name])
+    sources = sources if sources is not None else hdf5_sources()
+    entry = sources.get(name)
+    if entry is None:
+        print(f"[skip] {name}: no hdf5 source entry in the registry")
+        return None
+    hdf5 = os.path.join(model_dir, entry.file)
+    if not os.path.exists(hdf5) and download:
+        print(f"[fetch] {entry.file} <- {entry.url} (md5-verified)")
+        model_registry.ensure_model(entry, model_dir)
     if not os.path.exists(hdf5):
-        print(f"[skip] {name}: {hdf5} not found")
+        print(f"[skip] {name}: {hdf5} not found (source: {entry.url}; "
+              "re-run with --download to fetch it, md5-verified)")
         return None
     onnx_path = os.path.join(out_dir, f"{name}.onnx")
 
@@ -157,13 +181,19 @@ def main():
     ap.add_argument("--no-parity", action="store_true",
                     help="convert only, skip the fixture-based parity check "
                          "(used in the CI image build, which has no fixture)")
+    ap.add_argument("--download", action="store_true",
+                    help="fetch missing source .hdf5 from Zenodo record "
+                         "15907576 (374 MB each, md5-verified) instead of "
+                         "skipping them")
     args = ap.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
-    keys = [args.only] if args.only else list(MODELS)
+    sources = hdf5_sources()
+    keys = [args.only] if args.only else list(sources)
     worst_raw, worst_disagree = 0.0, 0.0
     for name in keys:
-        res = convert_one(name, args.out_dir, model_dir=args.model_dir)
+        res = convert_one(name, args.out_dir, model_dir=args.model_dir,
+                          sources=sources, download=args.download)
         if res is None:
             continue
         onnx_path, model = res

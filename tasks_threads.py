@@ -137,3 +137,49 @@ class EnvSetupWorker(QObject):
             self.done.emit(info.get("python") or "")
         except Exception as exc:
             self.failed.emit(str(exc))
+
+
+class ModelDownloadWorker(QObject):
+    """Fetches ONE registry model off the GUI thread via
+    plugin_utils.model_registry.ensure_model (streaming download to a
+    .part file, checksum verification, atomic rename). Emits progress
+    percent for the dialog's progress bar, log lines, and done(path) /
+    failed(message) at the end. Modeled on EnvSetupWorker; the dialog
+    must apply the same quit/wait/park teardown discipline."""
+
+    log = pyqtSignal(str)
+    progress = pyqtSignal(int)
+    done = pyqtSignal(str)      # verified local model path
+    failed = pyqtSignal(str)    # error message
+
+    def __init__(self, entry, models_dir):
+        super().__init__()
+        self.entry = entry
+        self.models_dir = models_dir
+        self._cancelled = False
+
+    def cancel(self):
+        """Best-effort flag. Network reads are timeout-bounded (30 s per
+        socket op in model_registry), so the worker returns within a
+        bounded time and teardown can wait it out."""
+        self._cancelled = True
+
+    def run(self):
+        try:
+            from .plugin_utils import model_registry
+
+            def _cb(done_bytes, total, _entry):
+                if total:
+                    self.progress.emit(
+                        min(99, int(done_bytes * 100 / total)))
+
+            self.log.emit(
+                f"Downloading {self.entry.label} "
+                f"({self.entry.file}) …")
+            path = model_registry.ensure_model(
+                self.entry, self.models_dir, progress=_cb)
+            self.progress.emit(100)
+            self.log.emit(f"Model ready: {path}")
+            self.done.emit(path)
+        except Exception as exc:
+            self.failed.emit(str(exc))

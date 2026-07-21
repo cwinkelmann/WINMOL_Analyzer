@@ -531,29 +531,50 @@ def _model_reporthook(progress, label):
 
 def download_models(plugin_dir, config_path=None, progress=None) -> list:
     """Download configured models into <plugin>/models. Tolerant: skips files
-    that exist, and returns the list of models that could NOT be fetched
-    (missing URL / download error) instead of raising, so a hosting gap never
-    bricks the plugin."""
+    that exist (verified against the registry checksum where one is pinned),
+    and returns the list of models that could NOT be fetched (missing URL /
+    download error / checksum mismatch) instead of raising, so a hosting gap
+    never bricks the plugin.
+
+    Backed by plugin_utils/model_registry. A legacy flat {name: url} config
+    keeps the historical fetch-everything behavior (key-based
+    ``models/<Name>.onnx`` naming, skip existing non-empty files). A schema-v2
+    registry fetches ONLY the entries named in its ``preload`` list — the
+    shipped registry has none, so plugin startup performs zero network I/O
+    and models download on demand when selected in the dialog."""
     models_dir = os.path.join(plugin_dir, MODELS_PATH)
     os.makedirs(models_dir, exist_ok=True)
     config_path = config_path or os.path.join(plugin_dir, "config.json")
     progress = _as_progress(progress)
     missing = []
     try:
-        with open(config_path) as f:
-            entries = json.load(f)
+        from . import model_registry
+        registry = model_registry.load_registry(config_path)
     except Exception:
         return missing
-    total = len(entries)
+    if registry.schema >= 2:
+        for name in registry.preload:
+            entry = registry.entries.get(name)
+            progress.phase(f"Downloading model {name} …")
+            try:
+                if entry is None:
+                    raise KeyError(name)
+                model_registry.ensure_model(entry, models_dir)
+                progress(f"Model {name} downloaded in "
+                         f"{progress.phase_elapsed():.0f}s.")
+            except Exception as exc:
+                progress(f"Model {name} could not be downloaded: {exc}")
+                missing.append(name)
+        return missing
+    total = len(registry.entries)
     if total:
         progress.phase(f"Downloading {total} model file(s) …")
-    for index, (name, url) in enumerate(entries.items(), start=1):
+    for index, entry in enumerate(registry.entries.values(), start=1):
+        name, url = entry.id, entry.url
         if not isinstance(url, str) or not url.lower().startswith("http"):
             missing.append(name)
             continue
-        ext = ".onnx" if url.lower().split("?")[0].endswith(".onnx") else \
-            os.path.splitext(url.split("?")[0])[1] or ".onnx"
-        dest = os.path.join(models_dir, f"{name}{ext}")
+        dest = os.path.join(models_dir, entry.file)
         if os.path.exists(dest) and os.path.getsize(dest) > 0:
             progress(f"Model {name} ({index} of {total}) already present.")
             continue
