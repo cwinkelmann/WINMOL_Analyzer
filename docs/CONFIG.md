@@ -115,6 +115,35 @@ installed state; model names and family ids are case-insensitive
 (`general` still works). GUI: the dropdown shows one entry per family plus
 `Custom` (reserved id); the Variant selector picks fp32/int8/fp16.
 
+## The plugin's Setup tab
+
+Environment creation, environment deletion and model downloads live on the
+**Setup** tab (`Detection | Setup | Log`), never on the detection tab and
+never on the GUI thread. Every decision behind it — which button is
+enabled, what the environment line says, why Run is blocked, what a
+deletion would remove — is a pure function in `plugin_utils/setup_state.py`
+plus `plugin_utils/model_status.py`, both Qt-free and unit-tested
+(`tests/test_setup_state.py`, `tests/test_model_status.py`,
+`tests/test_setup_tab_ui.py`). The long operations run on the two existing
+worker/QThread pairs (`_env_*` for build/repair/delete, `_dl_*` for
+download/verify/delete-model).
+
+Two conventions a future change must keep:
+
+* **Tabs are selected by widget, never by index.** `setCurrentIndex(1)`
+  used to mean "the Log tab"; with Setup inserted between Detection and
+  Log it would silently mean Setup. Use `_show_tab(page)`; an AST test
+  bans integer literals on `log_widget.setCurrentIndex`.
+* **i18n:** static user-visible strings belong in
+  `winmol_analyzer_dialog_base.ui`, where `pyuic` makes them
+  `lupdate`-extractable for free. Dynamically composed strings live as
+  module-level `TXT_*` format templates in `plugin_utils/setup_state.py`,
+  which must stay Qt-free and therefore must not call `tr()` — the dialog
+  is the only place allowed to do `self.tr(setup_state.TXT_…).format(…)`.
+  Paths, byte counts and file names are always named `{placeholders}`
+  outside the translatable span, never concatenated fragments, so a
+  translator can reorder them.
+
 ## Pipeline `Config`
 
 Defaults live in `classes/Config.py`. Override any of them without editing code:

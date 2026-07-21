@@ -149,3 +149,21 @@ def test_script_requires_its_own_manifest():
         assert os.path.exists(os.path.join(REPO_ROOT, entry)), (
             f"build_plugin_zip.sh requires {entry}, which no longer exists "
             f"in the repository — every tagged release build would abort")
+
+
+#: The Setup tab's Qt-free decision layer. It lands inside the already
+#: required plugin_utils/ directory, so this should pass unchanged — but
+#: a plugin that ships the dialog without them is a dialog that raises on
+#: import in QGIS, which no other test here would catch.
+SETUP_TAB_MODULES = [
+    "plugin_utils/setup_state.py",
+    "plugin_utils/model_status.py",
+    "plugin_utils/model_registry.py",
+    "plugin_utils/installer.py",
+    "tasks_threads.py",
+]
+
+
+@pytest.mark.parametrize("name", SETUP_TAB_MODULES)
+def test_setup_tab_modules_ship(package_names, name):
+    assert name in package_names, f"{name} missing from the plugin package"
