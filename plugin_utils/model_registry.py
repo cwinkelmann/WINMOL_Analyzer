@@ -15,16 +15,21 @@ the QGIS plugin). Two shapes are accepted:
   naming, no checksums).
 
 Sources of the shipped registry:
-* Classic four (General/Beech/Spruce/Spruce_Deadwood): the
-  ``models-onnx-v1`` release of cwinkelmann/WINMOL_Analyzer — ONNX
-  conversions of the original Keras models.
 * Model zoo: the ``models-v1`` release of cwinkelmann/WINMOL_segmentor_pt
-  (22 ONNX assets, sha256-pinned). ONNX contract for all of them: input
-  [batch,3,512,512] float32 in [0,1] NCHW, output [batch,1,512,512],
-  sigmoid baked in, opset 17, dynamic batch — loads unchanged through
-  utils/onnx_runtime.OnnxSegmenter.
+  (sha256-pinned ONNX). This now includes the classic four
+  (General/Beech/Spruce/Spruce_Deadwood), which were repointed from the
+  older, unchecksummed ``models-onnx-v1`` release of
+  cwinkelmann/WINMOL_Analyzer to the numerically-identical, pinned
+  conversions of the same Keras weights. ONNX contract for all of them:
+  input [batch,3,512,512] float32 in [0,1] NCHW, output
+  [batch,1,512,512], sigmoid baked in, opset 17, dynamic batch — loads
+  unchanged through utils/onnx_runtime.OnnxSegmenter.
 * Originals: Zenodo record 15907576 (DOI 10.5281/zenodo.15907576), the
   four Keras .hdf5 (374 MB each, md5-pinned, need TensorFlow).
+
+Every shipped entry is digest-pinned (sha256, or md5 for the Zenodo
+originals); ``Registry.unpinned()`` reports any that are not and a test
+guards the property.
 
 Import-safe off QGIS: stdlib only, no Qt/QGIS imports (same contract as
 installer.py) — unit-testable and usable from the batch CLI.
@@ -95,13 +100,16 @@ class Registry:
     """Parsed model registry: entries, families, and resolution rules."""
 
     def __init__(self, entries, families=None, schema=1,
-                 gui_default=None, preload=None, tile_px=512):
+                 gui_default=None, preload=None, tile_px=512,
+                 recommended=None):
         self.entries: Dict[str, ModelEntry] = dict(entries)
         self.families: Dict[str, Family] = dict(families or {})
         self.schema = schema
         self.gui_default = gui_default
         self.preload: List[str] = list(preload or [])
         self.tile_px = tile_px
+        #: Ranked entry ids, best first; recommended[0] == gui_default.
+        self.recommended: List[str] = list(recommended or [])
         self._entry_lookup = {k.lower(): k for k in self.entries}
         self._family_lookup = {k.lower(): k for k in self.families}
 
@@ -122,7 +130,7 @@ class Registry:
 
         * An explicit entry id is returned as-is — never rewritten by
           ``variant``/``device`` (so "General" always means the fp32
-          General.onnx, exactly as before the registry existed).
+          GenDS model, exactly as before the registry existed).
         * A family id picks the family default; with ``variant="auto"``
           the device variant (cpu->int8, gpu->fp16) is substituted ONLY
           when that variant is certified lossless, keeping results
@@ -171,6 +179,58 @@ class Registry:
             return self.entries[fam.gpu]
         raise ValueError(
             f"unknown variant {variant!r} (use auto/fp32/int8/fp16)")
+
+    def default_entry(self, device="auto") -> ModelEntry:
+        """The EFFECTIVE default model for ``device``.
+
+        The registry declares a ranked ``recommended`` list; entry 0 is
+        also ``gui_default``. That declaration fixes the *domain* (which
+        trained model), and this method fixes the *precision* for the
+        machine at hand: the declared default's family supplies the
+        int8 variant on CPU and the fp16 variant on GPU, falling back to
+        the declared entry itself when the family has no such variant.
+
+        This deliberately does NOT go through :meth:`resolve`'s
+        lossless-only gate. ``resolve`` protects users who picked a
+        *family* from a silent, results-changing precision swap; here the
+        registry has explicitly nominated an optimised entry as the
+        default, so honouring the device is the declared intent, not a
+        substitution behind the user's back. Any explicit selection (an
+        entry id from the GUI, ``winmol_batch <MODEL>``, or a forced
+        ``--variant``) bypasses this method entirely.
+
+        Never downloads and never touches the network beyond the local
+        ``detect_device()`` probe.
+        """
+        declared = None
+        for mid in list(self.recommended) + [self.gui_default]:
+            if mid and mid in self.entries:
+                declared = self.entries[mid]
+                break
+        if declared is None:
+            visible = self.visible()
+            if not visible:
+                raise KeyError("registry has no selectable model")
+            return visible[0]
+        fam = self.families.get(declared.family)
+        if fam is None:
+            return declared
+        if device == "auto":
+            device = detect_device()
+        cand_id = fam.cpu if device == "cpu" else fam.gpu
+        cand = self.entries.get(cand_id) if cand_id else None
+        return cand if cand is not None else declared
+
+    def recommended_entries(self) -> List[ModelEntry]:
+        """The declared ranked recommendations, best first."""
+        return [self.entries[mid] for mid in self.recommended
+                if mid in self.entries]
+
+    def unpinned(self) -> List[ModelEntry]:
+        """Downloadable entries with no sha256/md5 digest — i.e. whose
+        download cannot be integrity-verified. Must be empty."""
+        return [e for e in self.entries.values()
+                if e.url and not (e.sha256 or e.md5)]
 
     def flat_map(self) -> Dict[str, str]:
         """The legacy v1 shape {entry_id: url}, for consumers that still
@@ -230,6 +290,29 @@ def _parse_v1(raw, config_path):
             f"No model entries found in {config_path}. "
             "Expected {name: url}.")
     return Registry(entries, schema=1)
+
+
+def _parse_recommended(raw, entries, gui_default):
+    """Validate the ranked default list. Absent -> gui_default alone."""
+    recommended = raw.get("recommended")
+    if recommended is None:
+        # Older v2 registries: the single gui_default IS the ranking.
+        return [gui_default] if gui_default else []
+    if not isinstance(recommended, list):
+        raise ValueError("'recommended' must be a list of model ids")
+    for rid in recommended:
+        if rid not in entries:
+            raise ValueError(
+                f"recommended references unknown model {rid!r}")
+    if len(set(recommended)) != len(recommended):
+        raise ValueError("'recommended' has duplicate ids")
+    # One default, declared once: the ranked head and gui_default cannot
+    # disagree about what the GUI opens on.
+    if recommended and gui_default and recommended[0] != gui_default:
+        raise ValueError(
+            f"recommended[0] ({recommended[0]!r}) must equal "
+            f"gui_default ({gui_default!r})")
+    return recommended
 
 
 def _parse_v2(raw, config_path):
@@ -292,9 +375,15 @@ def _parse_v2(raw, config_path):
         if pid not in entries:
             raise ValueError(f"preload references unknown model {pid!r}")
 
+    gui_default = raw.get("gui_default")
+    if gui_default is not None and gui_default not in entries:
+        raise ValueError(
+            f"gui_default references unknown model {gui_default!r}")
+    recommended = _parse_recommended(raw, entries, gui_default)
+
     return Registry(entries, families, schema=int(raw["schema"]),
-                    gui_default=raw.get("gui_default"), preload=preload,
-                    tile_px=tile_px)
+                    gui_default=gui_default, preload=preload,
+                    tile_px=tile_px, recommended=recommended)
 
 
 # --- paths / device ---------------------------------------------------------
