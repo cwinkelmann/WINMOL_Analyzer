@@ -35,13 +35,14 @@ except Exception:
 
 # qgis.PyQt shims to the active Qt binding (PyQt5 on QGIS 3, PyQt6 on QGIS 4).
 from qgis.PyQt.QtWidgets import QFileDialog
-from qgis.PyQt.QtCore import QThread, QTimer
+from qgis.PyQt.QtCore import Qt, QThread, QTimer
 from qgis.core import (
     QgsProject, QgsVectorLayer, QgsRasterLayer, QgsSettings)
 from qgis.PyQt import QtWidgets, uic
 
 from .classes.Config import Config
 from .plugin_utils import installer
+from .plugin_utils.output_selection import gpkg_layers_for, process_type_for
 from .tasks_threads import Worker
 
 current_path = os.path.dirname(__file__)
@@ -91,7 +92,9 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.model_path = ""
         self.stem_path = ""
         self.trees_path = ""
-        self.process_type = "Stems"
+        # Resolved from the output checkboxes in set_selected_process_type()
+        # immediately before a run; never a hardcoded default.
+        self.process_type = None
 
         self.uav_layer_path = None
         self.uav_layer_name = None
@@ -132,7 +135,6 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         # dialog is visible (deferred so it doesn't block construction).
         if not self._env_ready():
             QTimer.singleShot(0, self.choose_environment)
-        self.process_type = None
 
         # Nodes output uses the Trees output path (no separate file/path field).
         # Hide/disable the old nodes output widgets if they exist in the .ui.
@@ -160,9 +162,16 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.output_checkBox_stem.stateChanged.connect(self.checkbox_changed_stem)
         self.output_checkBox_trees.stateChanged.connect(self.checkbox_changed_trees)
         self.output_checkBox_nodes.stateChanged.connect(self.checkbox_changed_nodes)
-        self.checkbox_changed_stem(2)
-        self.checkbox_changed_trees(1)
-        self.checkbox_changed_nodes(1)
+        # Prime the handlers from the widgets themselves, so the .ui stays
+        # the single source of truth for the default selection (all three
+        # products on). Order is load-bearing: stem gates trees, trees gates
+        # nodes -- priming out of order would cascade a box back off.
+        for _cb, _handler in (
+            (self.output_checkBox_stem, self.checkbox_changed_stem),
+            (self.output_checkBox_trees, self.checkbox_changed_trees),
+            (self.output_checkBox_nodes, self.checkbox_changed_nodes),
+        ):
+            _handler(Qt.Checked if _cb.isChecked() else Qt.Unchecked)
         self.close_button.clicked.connect(self.close_application)
         self.cancel_button.clicked.connect(self.cancel_process)
 
@@ -526,7 +535,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self.trees_path = self.output_lineEdit_trees.text()
 
     def checkbox_changed_stem(self, state):
-        is_checked = state == 2
+        is_checked = state == Qt.Checked
         self.output_lineEdit_stem.setEnabled(is_checked)
         self.output_toolButton_stem.setEnabled(is_checked)
         self.apply_style_to_line_edit(self.output_lineEdit_stem, is_checked)
@@ -541,7 +550,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self._update_derived_output_fields()
 
     def checkbox_changed_trees(self, state):
-        is_checked = state == 2
+        is_checked = state == Qt.Checked
 
         # Trees/Nodes outputs are derived; prevent manual path editing.
         self.output_checkBox_nodes.setEnabled(is_checked)
@@ -568,18 +577,13 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self.model_path = ""
 
     def set_selected_process_type(self):
-        stem_checked = self.output_checkBox_stem.isChecked()
-        trees_checked = self.output_checkBox_trees.isChecked()
-        nodes_checked = self.output_checkBox_nodes.isChecked()
-
-        if nodes_checked:
-            self.process_type = "Nodes"
-        elif trees_checked:
-            self.process_type = "Trees"
-        elif stem_checked:
-            self.process_type = "Stems"
-        else:
-            self.process_type = "Stems"
+        # One run covers every selected product: "Nodes" writes the stem-map
+        # raster *and* a GeoPackage with the stems, vectors and nodes layers.
+        self.process_type = process_type_for(
+            self.output_checkBox_stem.isChecked(),
+            self.output_checkBox_trees.isChecked(),
+            self.output_checkBox_nodes.isChecked(),
+        )
 
     def save_temp_layer(self, layer, layer_name: str, add_to_legend: bool = True):
         """
@@ -1193,13 +1197,15 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             print("No output GeoPackage found; skipping vector layer loading.")
             return
 
-        # Trees output: stems only
-        if self.output_checkBox_trees.isChecked():
-            self.load_gpkg_layers(gpkg, ["stems"])
-
-        # Nodes output: stems + nodes + vectors
-        if self.output_checkBox_nodes.isChecked():
-            self.load_gpkg_layers(gpkg, ["stems", "vectors", "nodes"])
+        # Trees output: stems only. Nodes output: stems + vectors + nodes.
+        # Computed as one list so a layer is never added to the project twice
+        # when both products are selected (which is now the default).
+        layers = gpkg_layers_for(
+            self.output_checkBox_trees.isChecked(),
+            self.output_checkBox_nodes.isChecked(),
+        )
+        if layers:
+            self.load_gpkg_layers(gpkg, layers)
 
     def _resolve_output_gpkg(self, path_prefix: str):
         """Return an existing output GeoPackage path for a given prefix.
