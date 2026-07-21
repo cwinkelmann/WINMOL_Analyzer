@@ -47,9 +47,11 @@ def test_winmol_run_is_tf_free_and_produces_outputs(tmp_path):
     env["WINMOL_ONNX_FORCE_CPU"] = "1"
     env["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
+    # "Nodes" is what the plugin's default selection (all three output
+    # products checked) resolves to: one run, stem map + every vector layer.
     proc = subprocess.run(
         [sys.executable, "-u", "winmol_run.py", MODEL, CROP,
-         str(stem_map), str(out_prefix), "Trees"],
+         str(stem_map), str(out_prefix), "Nodes"],
         cwd=REPO, env=env, capture_output=True, text=True, timeout=900)
 
     assert proc.returncode == 0, (
@@ -66,3 +68,10 @@ def test_winmol_run_is_tf_free_and_produces_outputs(tmp_path):
     import pyogrio
     n = len(pyogrio.read_dataframe(str(gpkg), layer="stems"))
     assert n > 0, "no stems detected"
+
+    # All three products from a single invocation: the stem-map raster plus
+    # the stems / vectors / nodes layers in one GeoPackage.
+    layers = set(pyogrio.list_layers(str(gpkg))[:, 0])
+    for expected in ("stems", "vectors", "nodes"):
+        assert expected in layers, (
+            f"layer '{expected}' missing from {gpkg}; got {sorted(layers)}")
