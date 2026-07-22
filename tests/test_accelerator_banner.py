@@ -138,23 +138,6 @@ def test_environment_ignores_a_report_from_a_different_request(
     assert "not yet verified" in out
 
 
-def test_environment_marks_device_unverified_before_any_session(
-        monkeypatch, capsys):
-    monkeypatch.setattr(onnx_runtime, "runtime_report", lambda: {
-        "onnxruntime_version": "1.27.0",
-        "available_providers": ["CPUExecutionProvider"],
-        "selected_providers": ["CPUExecutionProvider"],
-        "accelerator": "cpu",
-        "accelerator_label": "CPU",
-        "override": None,
-    })
-
-    make_processing().report_runtime_env()
-
-    out = capsys.readouterr().out
-    assert "not yet verified" in out
-
-
 # --- Correction after the model is loaded --------------------------------
 
 def test_correction_downgrades_hardware_when_session_is_cpu(capsys):

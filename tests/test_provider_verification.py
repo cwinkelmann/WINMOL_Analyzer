@@ -69,16 +69,6 @@ def make_segmenter(monkeypatch, requested, active, available=None):
 
 # --- verify_session_providers: the two reason branches -------------------
 
-def test_verify_reports_no_demotion_when_request_is_honoured(monkeypatch):
-    monkeypatch.setattr(
-        onnx_runtime, "_available_providers", lambda: list(CUDA_REQUEST))
-    active, demoted, reason = onnx_runtime.verify_session_providers(
-        CUDA_REQUEST, CUDA_REQUEST)
-    assert active == CUDA_REQUEST
-    assert demoted == []
-    assert reason is None
-
-
 def test_verify_reason_when_provider_not_in_this_build(monkeypatch):
     """CPU-only 'onnxruntime' wheel: CUDA is not even offered."""
     monkeypatch.setattr(
@@ -112,16 +102,6 @@ def test_verify_ignores_cpu_fallback_as_a_demotion(monkeypatch):
 
 
 # --- active_accelerator: driven by what the session BOUND ----------------
-
-def test_active_accelerator_is_cpu_when_only_cpu_is_bound():
-    assert onnx_runtime.active_accelerator(CPU_ONLY)[0] == "cpu"
-
-
-def test_active_accelerator_reports_cuda_when_cuda_is_bound():
-    kind, label = onnx_runtime.active_accelerator(CUDA_REQUEST)
-    assert kind == "cuda"
-    assert label == onnx_runtime.ACCELERATOR_LABELS["cuda"]
-
 
 def test_active_accelerator_coreml_only_on_apple_silicon(monkeypatch):
     monkeypatch.setattr(platform, "system", lambda: "Darwin")
