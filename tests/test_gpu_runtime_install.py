@@ -35,6 +35,11 @@ PROVIDERS_GPU_BUILD = ["TensorrtExecutionProvider", "CUDAExecutionProvider",
                        "CPUExecutionProvider"]
 PROVIDERS_COREML = ["CoreMLExecutionProvider", "CPUExecutionProvider"]
 
+# What a session BOUND, which is a different question from what the build
+# offers — and the only one whose answer is worth anything.
+SESSION_CUDA = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+SESSION_CPU = ["CPUExecutionProvider"]
+
 
 def _runner(stdout="", status=None):
     """A stand-in for installer's nvidia-smi call."""
@@ -339,8 +344,10 @@ def test_state_ii_gpu_present_but_cpu_runtime_warns_and_offers_the_fix():
 
 
 def test_state_iii_cuda_active_is_confirmed_positively():
+    """...and only a session that really came up on CUDA may confirm it."""
     status = ss.accelerator_status(
-        _probe(), _report(PROVIDERS_GPU_BUILD, packages=["onnxruntime-gpu"]))
+        _probe(), _report(PROVIDERS_GPU_BUILD, packages=["onnxruntime-gpu"],
+                          session=SESSION_CUDA))
     assert status.state == ss.ACCEL_GPU_ACTIVE
     assert status.can_install is False
     assert "RTX 4080 SUPER" in status.text
@@ -403,6 +410,100 @@ def test_timed_out_detection_reads_as_cpu_only_never_as_gpu():
     assert status.can_install is False
 
 
+# --- the machine that had a GPU runtime and used the CPU anyway ------------
+#
+# Measured on the Lenovo T14 / RTX 4080 SUPER box, immediately after the
+# plugin's own GPU install reported success:
+#
+#   onnxruntime-gpu 1.26.0 installed, onnxruntime absent
+#   get_available_providers() -> [Tensorrt, CUDA, CPU]
+#   InferenceSession(...).get_providers() -> ['CPUExecutionProvider']
+#       (W: "Failed to create CUDAExecutionProvider. Require cuDNN 9.* and
+#        CUDA 12.* ... make sure they're in the PATH")
+#   -> 10311 ms per tile, against 10.5 ms once the nvidia-*/lib directories
+#      are on the loader path.
+#
+# The Setup tab called that state "installed and active". These tests are
+# the reason it cannot again.
+
+MEASURED_BROKEN = dict(providers=PROVIDERS_GPU_BUILD,
+                       packages=["onnxruntime-gpu"], session=SESSION_CPU,
+                       version="1.26.0")
+
+
+def test_a_cuda_build_that_only_runs_on_the_cpu_is_never_called_active():
+    status = ss.accelerator_status(_probe(), _report(**MEASURED_BROKEN))
+    assert status.state != ss.ACCEL_GPU_ACTIVE
+    assert status.state == ss.ACCEL_GPU_BROKEN
+    assert status.can_install is False
+    assert "12 ms" not in status.text          # no speed that is not real
+    assert "fell back" in status.text
+
+
+def test_the_broken_state_names_the_loader_path_as_the_likely_cause():
+    """The remedy is not another 2.4 GB download."""
+    status = ss.accelerator_status(_probe(), _report(**MEASURED_BROKEN))
+    assert "loader path" in status.text
+    assert "docs/GPU.md" in status.text
+
+
+def test_cuda_that_was_never_exercised_is_unverified_not_active():
+    """Availability is not usability, and 'no evidence' is not 'broken'
+    either: re-offering the download would be cruel and wrong."""
+    status = ss.accelerator_status(
+        _probe(), _report(PROVIDERS_GPU_BUILD, packages=["onnxruntime-gpu"]))
+    assert status.state == ss.ACCEL_UNKNOWN
+    assert status.can_install is False
+    assert "nothing has run on it yet" in status.text
+
+
+@pytest.mark.parametrize("report", [
+    _report(**MEASURED_BROKEN),
+    _report(PROVIDERS_GPU_BUILD, packages=["onnxruntime-gpu"],
+            session=SESSION_CUDA),
+    _report(PROVIDERS_GPU_BUILD, packages=["onnxruntime-gpu"],
+            error="RuntimeError: LoadLibrary failed for cudnn64_9.dll"),
+])
+def test_the_verification_and_the_setup_tab_cannot_disagree(report):
+    """One check, two consumers: verify_gpu_runtime's verdict and the
+    accelerator state are derived from the same evidence, so 'installed
+    successfully' and 'gpu_active' can never come apart again."""
+    ok, _ = inst.gpu_verdict(report, checked_with_model=True)
+    state = ss.accelerator_status(_probe(), report).state
+    assert ok is (state == ss.ACCEL_GPU_ACTIVE)
+
+
+def test_a_session_bound_to_cuda_is_the_only_confirmation():
+    assert inst.provider_confirmed(
+        _report(PROVIDERS_GPU_BUILD, session=SESSION_CUDA),
+        inst.CUDA_PROVIDER) is True
+    assert inst.provider_confirmed(
+        _report(**MEASURED_BROKEN), inst.CUDA_PROVIDER) is False
+    assert inst.provider_confirmed(
+        _report(PROVIDERS_GPU_BUILD), inst.CUDA_PROVIDER) is False
+
+
+def test_an_unusable_runtime_is_never_diagnosed_as_the_string_none():
+    """The verification's own bug: ok=False with no error text produced
+    'onnxruntime could not be imported: None' — a reason that names
+    nothing, attached to a failure that was not an import failure."""
+    ok, message = inst.gpu_verdict(_report([], ok=False, error=None),
+                                   checked_with_model=True)
+    assert ok is False
+    assert "None" not in message
+    assert "no diagnosis" in message
+
+
+def test_a_cpu_fallback_is_not_reported_as_an_import_failure():
+    """The import SUCCEEDED on the measured machine; provider creation is
+    what failed, and the message has to say so or the user reinstalls the
+    wrong thing."""
+    _, message = inst.gpu_verdict(_report(**MEASURED_BROKEN),
+                                  checked_with_model=True)
+    assert "could not be imported" not in message
+    assert "fell back" in message
+
+
 # --- the offer, and the button that carries it -----------------------------
 
 def test_the_offer_names_the_gpu_the_size_and_the_measured_speedup():
@@ -427,7 +528,8 @@ def _info(**kw):
 def test_the_gpu_button_is_live_only_in_the_offerable_state():
     idle = ss.accelerator_status(_probe(), _report(PROVIDERS_CPU_BUILD))
     active = ss.accelerator_status(
-        _probe(), _report(PROVIDERS_GPU_BUILD, packages=["onnxruntime-gpu"]))
+        _probe(), _report(PROVIDERS_GPU_BUILD, packages=["onnxruntime-gpu"],
+                          session=SESSION_CUDA))
     assert ss.button_states(_info(), [], accel=idle)["env_gpu_button"]
     assert not ss.button_states(_info(), [], accel=active)["env_gpu_button"]
     # ...and dead until the probe has answered at all
@@ -463,10 +565,26 @@ def test_accelerator_from_machine_uses_the_child_interpreter():
     seen = []
     status = ss.accelerator_from_machine(
         "/env/bin/python", detect=lambda: _probe(),
-        probe_fn=lambda exe, **k: seen.append(exe) or _report(
-            PROVIDERS_GPU_BUILD, packages=["onnxruntime-gpu"]))
-    assert seen == ["/env/bin/python"]
+        probe_fn=lambda exe, **k: seen.append((exe, k)) or _report(
+            PROVIDERS_GPU_BUILD, packages=["onnxruntime-gpu"],
+            session=SESSION_CUDA))
+    assert [exe for exe, _ in seen] == ["/env/bin/python"]
     assert status.state == ss.ACCEL_GPU_ACTIVE
+
+
+def test_accelerator_from_machine_asks_for_a_real_session(monkeypatch):
+    """Without a model path the probe never builds a session, so the Setup
+    tab could only ever answer 'unverified'. The model on disk is what makes
+    the question answerable at all."""
+    monkeypatch.setattr(inst, "first_model_path", lambda d: "/m/spruce.onnx")
+    seen = {}
+    ss.accelerator_from_machine(
+        "/env/bin/python", plugin_dir="/plugin", detect=lambda: _probe(),
+        probe_fn=lambda exe, **k: seen.update(k) or _report(
+            PROVIDERS_GPU_BUILD, packages=["onnxruntime-gpu"],
+            session=SESSION_CUDA))
+    assert seen["model_path"] == "/m/spruce.onnx"
+    assert seen["want"] == inst.CUDA_PROVIDER
 
 
 # --- the dialog's wiring, pinned statically (no QGIS in CI) ----------------

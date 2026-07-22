@@ -71,3 +71,71 @@ def test_extra_is_applied_after_stripping(polluted):
 def test_does_not_mutate_the_parent_environment(polluted):
     child_env()
     assert "PYTHONHOME" in os.environ, "child_env mutated os.environ"
+
+
+# --- the CUDA/cuDNN loader path ------------------------------------------
+#
+# onnxruntime-gpu does not bundle CUDA: it depends on the nvidia-*-cu12
+# wheels, which unpack into <venv>/lib/python3.X/site-packages/nvidia/*/lib.
+# Nothing puts those seven directories on the loader path, so on the
+# measured RTX 4080 SUPER machine a correctly installed GPU runtime listed
+# CUDAExecutionProvider and then ran every session on the CPU.
+
+from plugin_utils.childenv import (_loader_path_var,  # noqa: E402
+                                   native_lib_extra, nvidia_lib_dirs)
+
+NVIDIA_COMPONENTS = ("cublas", "cuda_runtime", "cudnn", "cufft", "curand",
+                     "cusolver", "cusparse")
+
+
+@pytest.fixture
+def gpu_venv(tmp_path):
+    """A venv laid out the way pip leaves one after onnxruntime-gpu."""
+    site = tmp_path / "lib" / "python3.11" / "site-packages"
+    for name in NVIDIA_COMPONENTS:
+        (site / "nvidia" / name / "lib").mkdir(parents=True)
+    exe = tmp_path / "bin" / "python"
+    exe.parent.mkdir(parents=True, exist_ok=True)
+    exe.write_text("")
+    return str(exe)
+
+
+def test_finds_every_nvidia_wheel_library_directory(gpu_venv):
+    dirs = nvidia_lib_dirs(gpu_venv)
+    assert len(dirs) == len(NVIDIA_COMPONENTS)
+    assert all(os.path.isdir(d) for d in dirs)
+    assert any(d.endswith(os.path.join("cudnn", "lib")) for d in dirs)
+
+
+def test_a_cpu_only_environment_gets_no_loader_path_at_all(tmp_path):
+    """Nothing to add on a CPU wheel or on macOS — so nothing is added."""
+    exe = tmp_path / "bin" / "python"
+    exe.parent.mkdir(parents=True)
+    exe.write_text("")
+    assert nvidia_lib_dirs(str(exe)) == []
+    assert native_lib_extra(str(exe)) == {}
+    assert nvidia_lib_dirs(None) == []
+
+
+def test_the_users_existing_loader_path_is_prepended_to_never_replaced(
+        gpu_venv, monkeypatch):
+    var = _loader_path_var()
+    monkeypatch.setenv(var, "/opt/mine/lib")
+    value = native_lib_extra(gpu_venv)[var]
+    assert value.endswith(os.pathsep + "/opt/mine/lib")
+    assert value.split(os.pathsep)[0].endswith("lib")
+    assert "/opt/mine/lib" in value.split(os.pathsep)
+
+
+def test_child_env_puts_the_cuda_libraries_on_the_loader_path(gpu_venv):
+    var = _loader_path_var()
+    env = child_env(python_exe=gpu_venv)
+    assert "nvidia" in env[var]
+    # ...and only when asked about that interpreter.
+    assert "nvidia" not in child_env().get(var, "")
+
+
+def test_extra_still_wins_over_the_loader_path(gpu_venv):
+    var = _loader_path_var()
+    env = child_env({var: "/explicit"}, python_exe=gpu_venv)
+    assert env[var] == "/explicit"

@@ -28,8 +28,52 @@ ACCELERATOR_LABELS = {
 }
 
 
+#: Providers whose native libraries ship in separate wheels and therefore
+#: need :func:`preload_native_libs` before a session can be created.
+_CUDA_PROVIDERS = ("CUDAExecutionProvider", "TensorrtExecutionProvider")
+
+_PRELOADED = None
+
+
 class OnnxOutOfMemoryError(RuntimeError):
     """Raised on ONNX-runtime OOM; caught by the analyzer's batch-backoff."""
+
+
+def preload_native_libs(providers=None):
+    """Load the CUDA/cuDNN shared libraries before a session is created.
+
+    ``onnxruntime-gpu`` gets CUDA from the ``nvidia-*-cu12`` wheels, which
+    install into ``site-packages/nvidia/*/lib`` — not on any loader path. The
+    provider is then listed by ``get_available_providers()`` (that reports
+    what the build was COMPILED with) and still fails to initialise, so
+    onnxruntime falls back to the CPU with nothing but a warning. Measured on
+    an RTX 4080 SUPER: 10311 ms per tile instead of 10.5 ms — the GPU install
+    delivering nothing at all.
+
+    ``onnxruntime.preload_dlls()`` (>= 1.21) fixes that in-process, which is
+    why it is preferred over environment plumbing: no child env, no re-exec.
+    Returns True when it ran. Only called for CUDA/TensorRT, so the CPU wheel
+    and macOS/CoreML are untouched by construction; still guarded, because the
+    function does not exist on older wheels.
+    """
+    global _PRELOADED
+    providers = list(providers or [])
+    if providers and not any(p in _CUDA_PROVIDERS for p in providers):
+        return False
+    if _PRELOADED is not None:
+        return _PRELOADED
+    fn = getattr(ort, "preload_dlls", None)
+    if fn is None:
+        _PRELOADED = False
+        return False
+    try:
+        fn()
+        _PRELOADED = True
+    except Exception as exc:                     # never block inference
+        print(f"NOTE: onnxruntime.preload_dlls() failed ({exc}); relying on "
+              "the loader path for the CUDA libraries.", flush=True)
+        _PRELOADED = False
+    return _PRELOADED
 
 
 def _truthy(val):
@@ -213,6 +257,10 @@ class OnnxSegmenter:
                 os.environ.get("WINMOL_ONNX_PROFILE_PREFIX")
                 or "winmol_onnx_profile")
             so.profile_file_prefix = self._profile_prefix
+        # Before the session, not after: an unloadable libcudnn is the
+        # difference between 10 ms and 10 s a tile, and onnxruntime reports it
+        # as a warning on a session that works.
+        preload_native_libs(self.providers)
         self.session = ort.InferenceSession(
             str(model_path), sess_options=so, providers=self.providers)
         if self._profile_prefix:
