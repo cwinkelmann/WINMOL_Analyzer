@@ -1121,6 +1121,31 @@ def _select_child(gdf, tile_id, kept_local):
     return out
 
 
+def _log_merge_tile_read(tile_id, gpkg_path, stems, nodes, vectors,
+                         raster_path=None):
+    """Emit the per-tile merge counter line.
+
+    ``plugin_utils/run_progress.py`` COUNTS these lines to advance the merge
+    band of the plugin's progress bar, so the ``MERGE TILE READ | tile ...``
+    prefix has to stay visible at normal verbosity — suppressing it freezes
+    the bar with no test failure. The chatty payload (file path and per-layer
+    feature counts) is the part that was too noisy for a normal run, so that
+    stays behind ``debug``.
+    """
+    head = f"MERGE TILE READ | tile {tile_id}"
+    if not Log.is_debug():
+        Log.info(head)
+        return
+    tail = f" | raster {raster_path}" if raster_path is not None else ""
+    Log.debug(
+        f"{head} | file {gpkg_path} |"
+        f" stems {0 if stems is None else len(stems)} "
+        f"| nodes {0 if nodes is None else len(nodes)} |"
+        f" vectors {0 if vectors is None else len(vectors)}"
+        f"{tail}",
+    )
+
+
 def _process_tile(prefix, gpkg_path, raster_path, edge_buffer_m, target_crs,
                   ortho_bounds=None):
     tile_id = _tile_id_from_prefix(prefix)
@@ -1129,13 +1154,8 @@ def _process_tile(prefix, gpkg_path, raster_path, edge_buffer_m, target_crs,
         raster_path, edge_buffer_m, ortho_bounds=ortho_bounds)
 
     stems, nodes, vectors = _read_tile_gpkg(gpkg_path)
-    Log.debug(
-        f"MERGE TILE READ | tile {tile_id} | file {gpkg_path} |"
-        f" stems {0 if stems is None else len(stems)} "
-        f"| nodes {0 if nodes is None else len(nodes)} |"
-        f" vectors {0 if vectors is None else len(vectors)} "
-        f"| raster {raster_path}",
-    )
+    _log_merge_tile_read(tile_id, gpkg_path, stems, nodes, vectors,
+                         raster_path=raster_path)
     if stems is None or stems.empty:
         return None, target_crs
 
@@ -1164,12 +1184,7 @@ def _window_geom_from_profile(profile, window):
 
 def process_tile_gpkg(tile_job, gpkg_path, raster_profile, target_crs=None):
     stems, nodes, vectors = _read_tile_gpkg(gpkg_path)
-    Log.debug(
-        f"MERGE TILE READ | tile {tile_job.tile_id} | file {gpkg_path} |"
-        f" stems {0 if stems is None else len(stems)} "
-        f"| nodes {0 if nodes is None else len(nodes)} |"
-        f" vectors {0 if vectors is None else len(vectors)}",
-    )
+    _log_merge_tile_read(tile_job.tile_id, gpkg_path, stems, nodes, vectors)
     if stems is None or stems.empty:
         return None, target_crs
 

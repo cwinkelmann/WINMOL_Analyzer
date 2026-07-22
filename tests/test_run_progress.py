@@ -176,6 +176,31 @@ def test_producers_still_emit_the_parsed_formats(relpath, needle):
         "parses; update BOTH or the progress bar silently freezes.")
 
 
+def test_merge_tile_counter_survives_normal_verbosity(capsys):
+    """The merge counter must not be gated behind ``--debug``.
+
+    A source-level needle is not enough here: utils/Log.py can suppress a
+    line that is still present in the source, which freezes the merge band
+    of the bar without failing any other test.
+    """
+    from utils import IO as _IO
+    from utils import Log
+
+    previous = Log.current_level()
+    try:
+        Log.set_level("normal")
+        _IO._log_merge_tile_read("t_0_0", "/tmp/t.gpkg", [], [], [])
+        emitted = capsys.readouterr().out
+    finally:
+        Log.set_level(previous)
+
+    progress = RunProgress("Trees")
+    progress.feed("Prepared 2/2 vector tiles with foreground | skipped 0")
+    assert progress.feed(emitted.strip()) == 97, (
+        "utils/IO.py's MERGE TILE READ line is invisible at normal "
+        "verbosity; run_progress.py counts it to advance the merge band.")
+
+
 def test_worker_no_longer_counts_lines():
     with open(os.path.join(REPO, "tasks_threads.py"), encoding="utf-8") as fh:
         source = fh.read()
