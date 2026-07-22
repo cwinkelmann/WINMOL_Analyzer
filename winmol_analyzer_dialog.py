@@ -241,6 +241,53 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         # hide warning label
         self.uav_warning_label.hide()
 
+        # Last, once every runtime-built control has been added: the .ui's
+        # declared default size is only a wish, and on a short screen it
+        # used to push the Run button off the desktop.
+        self._fit_to_available_screen()
+
+    def _fit_to_available_screen(self):
+        """Clamp the just-built dialog to the screen it will open on.
+
+        Called exactly once, from the constructor, before the dialog is
+        ever shown — so it shrinks the .ui's declared default but never
+        fights a resize the user made afterwards. The tab pages live in
+        QScrollAreas, so shrinking hides nothing: Run, the button row and
+        the progress bar sit outside them and stay reachable.
+
+        Every Qt lookup here is optional. Under a headless test, an
+        offscreen platform plugin or a Qt build without QScreen this must
+        do nothing rather than raise.
+        """
+        try:
+            screen = None
+            handle = self.windowHandle()
+            if handle is not None:
+                screen = handle.screen()
+            if screen is None:
+                parent = self.parentWidget()
+                if parent is not None and parent.window() is not None:
+                    screen = getattr(parent.window(), "screen", lambda: None)()
+            if screen is None:
+                screen = QtWidgets.QApplication.primaryScreen()
+            if screen is None:
+                return
+            available = screen.availableGeometry()
+            # availableGeometry already excludes the macOS menu bar and the
+            # dock / Windows taskbar; this is the window frame on top of it.
+            chrome = 60
+            floor_w, floor_h = 480, 320
+            width = min(self.width(),
+                        max(available.width() - chrome, floor_w))
+            height = min(self.height(),
+                         max(available.height() - chrome, floor_h))
+            if (width, height) != (self.width(), self.height()):
+                self.resize(width, height)
+        except Exception:
+            # A dialog that opens slightly too tall is a nuisance; one that
+            # refuses to construct is a broken plugin.
+            pass
+
     def set_connections(self):
         self.run_button.clicked.connect(self.run_process)
         self.model_comboBox.currentIndexChanged.connect(
