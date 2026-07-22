@@ -123,6 +123,32 @@ TXT_ACCEL_GPU_UNUSABLE = (
     "{gpu} found, but WINMOL cannot use it here: {reason} Detection runs "
     "on the CPU, roughly 5 s per image tile.")
 
+#: The short line the DETECTION tab carries, so the offer is not hidden
+#: on a tab the user never opens. Deliberately one sentence: it sits above
+#: the input fields, next to a button that opens Setup.
+TXT_NUDGE_GPU_IDLE = (
+    "{gpu} is sitting idle — the installed runtime is CPU-only, so "
+    "detection takes roughly 5 s per image tile instead of 12 ms.")
+
+#: The pre-run interruption. This is the one that matters: a user who
+#: never opens the Setup tab otherwise learns about the idle GPU only
+#: after waiting out a run that took hours instead of minutes.
+TXT_PRERUN_TITLE = "This run will use the CPU, not your GPU"
+TXT_PRERUN_GPU_IDLE = (
+    "{gpu} is in this machine, but WINMOL's environment has the CPU-only "
+    "inference runtime, so this detection will run on the CPU.\n\n"
+    "Measured on this hardware: about 12 ms per image tile on the GPU "
+    "against roughly 5 s on the CPU. That is the difference between a run "
+    "of minutes and a run of hours.\n\n"
+    "Installing the GPU runtime downloads about 2.4 GB once. Nothing else "
+    "about the environment changes, and this detection is not started "
+    "until the install finishes — press Run again afterwards.\n\n"
+    "Running on the CPU is a fine answer, and it is remembered: this "
+    "question is not asked again. The Setup tab keeps an “Install GPU "
+    "runtime” button for whenever you change your mind.")
+TXT_PRERUN_INSTALL = "Install the GPU runtime (2.4 GB)"
+TXT_PRERUN_RUN_ANYWAY = "Run on the CPU anyway"
+
 TXT_GPU_OFFER = (
     "{gpu} detected.\n\nInstall the GPU runtime (about 2.4 GB to "
     "download)?\n\nDetection is several hundred times faster on it — "
@@ -595,6 +621,130 @@ def accelerator_from_machine(python_exe, plugin_dir=None,
             "version": None, "error": "no compute environment yet",
             "session_providers": None}
     return accelerator_status(probe, report)
+
+
+# --- the proactive offer ----------------------------------------------------
+#
+# Everything above answers "what will run this?". This section answers the
+# two questions that make the answer REACHABLE, and both are pure functions
+# of an AcceleratorStatus that some worker thread already measured:
+#
+#   * accel_nudge_text  — what the Detection tab says, so the offer is not
+#     buried on a tab the user has no reason to open;
+#   * pre_run_decision  — whether pressing Run should stop and ask first.
+#
+# Neither ever measures anything. They take the CACHED status the dialog is
+# already holding, which is what keeps them off the list of calls banned
+# from the GUI thread (tests/test_setup_tab_ui.py::BANNED_CALLS).
+
+#: pre_run_decision kinds.
+PRERUN_NONE = "none"
+PRERUN_GPU_IDLE = "gpu_idle"
+
+#: The states that get a proactive nudge at all. Only one qualifies, and
+#: the reason the others do not is worth writing down:
+#:
+#: * ``cpu_only``   — no GPU. There is nothing the user can do, so saying
+#:                    it twice is nagging, not information.
+#: * ``coreml``     — already on the Apple GPU; no download would help.
+#: * ``gpu_active`` — already using the GPU. Nothing to offer.
+#: * ``gpu_broken`` / ``gpu_unusable`` — a GPU we must NOT sell a 2.4 GB
+#:                    download for; ``can_install`` is False for both and
+#:                    the Setup tab already names the real reason.
+#: * ``unknown``    — the probe has not landed. Claiming anything here
+#:                    would be a guess, and a guess must never stop a run.
+NUDGE_STATES = (ACCEL_GPU_IDLE,)
+
+
+@dataclass
+class PreRunDecision:
+    """Whether Run should interrupt, and with what.
+
+    ``kind`` is :data:`PRERUN_NONE` for every case in which the run must
+    simply proceed — which includes the case that matters most for
+    responsiveness: the accelerator probe has not answered yet. A user
+    who pressed Run is not made to wait on a subprocess that measures
+    something they might not even need to hear.
+    """
+
+    kind: str = PRERUN_NONE
+    title: str = ""
+    text: str = ""
+    install_label: str = ""
+    run_label: str = ""
+    token: str = ""
+    gpu_label: str = ""
+
+    @property
+    def asks(self) -> bool:
+        """True when the dialog must put a question on screen."""
+        return self.kind != PRERUN_NONE
+
+
+def accelerator_token(accel) -> str:
+    """The value persisted when the user chooses "run on the CPU anyway".
+
+    State plus GPU name rather than a bare "yes, dismissed": a dismissal
+    is an answer about THIS machine in THIS configuration. Drop a
+    different card in, and the question is worth asking once more.
+    """
+    if accel is None:
+        return ""
+    return f"{accel.state}|{accel.gpu_label}"
+
+
+def should_nudge(accel) -> bool:
+    """True when a surface outside the Setup tab should say something.
+
+    ``can_install`` is required as well as the state, so the nudge and the
+    Setup tab's button can never disagree about whether there is an action
+    behind the sentence.
+    """
+    return bool(accel is not None
+                and accel.state in NUDGE_STATES
+                and accel.can_install)
+
+
+def accel_nudge_text(accel) -> str:
+    """The Detection tab's one-line warning, or '' when there is none."""
+    if not should_nudge(accel):
+        return ""
+    return TXT_NUDGE_GPU_IDLE.format(gpu=accel.gpu_label or "An NVIDIA GPU")
+
+
+def pre_run_decision(accel, dismissed=None) -> PreRunDecision:
+    """What pressing Run should do about an idle GPU.
+
+    ``accel`` is the dialog's CACHED :class:`AcceleratorStatus` (None
+    while the probe is still running); ``dismissed`` is whatever was
+    persisted under ``installer.QSETTINGS_GPU_PROMPT_KEY`` last time the
+    user said "run on the CPU anyway".
+
+    Three rules, in order:
+
+    1. No measurement, no question. An unfinished probe means the run
+       starts — never a stall on the GUI thread waiting for nvidia-smi.
+    2. Only ``gpu_idle`` asks; see :data:`NUDGE_STATES` for why each of
+       the other states stays silent. A machine with no GPU is never
+       nagged about one.
+    3. An answer is an answer. Once the token for this machine has been
+       stored, the question is not asked again — the Setup tab's button
+       is the way back.
+    """
+    if not should_nudge(accel):
+        return PreRunDecision()
+    token = accelerator_token(accel)
+    if dismissed and str(dismissed) == token:
+        return PreRunDecision()
+    label = accel.gpu_label or "An NVIDIA GPU"
+    return PreRunDecision(
+        kind=PRERUN_GPU_IDLE,
+        title=TXT_PRERUN_TITLE,
+        text=TXT_PRERUN_GPU_IDLE.format(gpu=label),
+        install_label=TXT_PRERUN_INSTALL,
+        run_label=TXT_PRERUN_RUN_ANYWAY,
+        token=token,
+        gpu_label=label)
 
 
 # --- models ----------------------------------------------------------------
