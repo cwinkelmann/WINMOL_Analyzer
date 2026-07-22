@@ -319,7 +319,46 @@ batch in the first place prevents that.
 * an out-of-memory fallback lowers the working ceiling, so nothing larger is
   ever retried.
 
-Every one of those outcomes is printed as an explicit stop reason.
+Every one of those outcomes is printed as an explicit stop reason, and every
+stop reason **names the limit that actually bound the sweep** — the CoreML
+cap, the configured `_max_gpu`/`_max_cpu` ceiling, the memory ceiling, the
+candidate cap, the sample pool, the user pin, or one of the stop rules above.
+The limits that did *not* bind are printed after it as context. On an Apple
+Silicon box that reads:
+
+```
+Prediction micro-batch autotune: bound by the CoreML cap b2
+(Config.prediction_batch_max_coreml -- measured: larger batches are not faster
+on this accelerator); the configured cap allows b16, memory would allow b21
+(4.4 GB free per unified memory (psutil available), 60% budget, ~128 MB/tile),
+... Nothing to tune, using b2.
+```
+
+That is a deliberate, measurement-backed decision (fp32 `Spruce_Deadwood` on
+an M2: b1 184.0, b2 171.6, b4 182.8 ms/image — flat within ~7 %, b2 best), not
+a disabled feature. The earlier message advertised only the memory ceiling,
+which was the one constraint that did not apply, and read as a silent no-op.
+
+**3. The search is upward-only.** The sweep starts at the batch the planner
+chose and only ever grows it (`range(initial, max + 1)`), so the planner's
+value is a **floor**: if the true optimum were *below* it, the autotune could
+not find it. This is a known, accepted limitation rather than a bug —
+
+* the planner has already applied the device caps (including the CoreML one)
+  before handing the batch over, so the starting point is considered, not a
+  guess;
+* probing downwards costs most where it would help least: on CoreML each
+  distinct batch size forces a model recompile, and the measured curve there
+  is flat, so b1 is not the answer a downward search would find;
+* every stop rule is defined as *larger is more expensive* — patience and the
+  runaway guard only fire above the current best, and the memory ceiling has
+  no downward meaning — so a two-sided search would need all of them
+  redesigned;
+* `prediction_batch_override` already pins any batch ≥ 1 verbatim, which is
+  the supported way to run below the planner's value.
+
+The sweep announces the direction (`upward from b4 only`) so this is visible
+in the log rather than implied.
 
 Against a user's measured RTX-4080 sweep (b4 = 0.340, b5 = 0.337, b6 = 0.330,
 b7 = 0.471, b8 = 0.561, b9 = 1.135 s/tile) the old rule timed **seven**

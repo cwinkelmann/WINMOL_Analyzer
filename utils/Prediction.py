@@ -1,7 +1,37 @@
 #!/usr/bin/env python
 
 ################################################################################
-"""Imports"""
+"""Tiled U-Net inference, streamed straight to the stem-map raster.
+
+Batch-size autotune -- the search is UPWARD-ONLY, by design
+-----------------------------------------------------------
+``_prediction_batch_candidates`` returns ``range(initial, max + 1)``: the
+sweep starts at the batch ``classes/ExecutionPlan.py`` chose and only ever
+grows it. The planner's value is therefore a FLOOR, and an optimum below it
+is unreachable by measurement. That is a deliberate trade, not an oversight:
+
+* the planner has already applied the device caps (including the CoreML one)
+  before it hands a batch over, so ``initial`` is a considered lower bound
+  rather than a guess;
+* probing downwards costs most where it would help least -- on CoreML every
+  distinct batch size forces a model recompile, and the measured curve there
+  is flat (fp32 Spruce_Deadwood on an M2: b1 184.0, b2 171.6, b4 182.8
+  ms/image), so b1 is not the answer we would find;
+* all four stop rules are defined as "larger is more expensive": patience and
+  the runaway guard only fire above the current best, and the memory ceiling
+  is an upper bound with no downward meaning. A two-sided search would need
+  all of them redesigned for a case with no measured benefit;
+* the escape hatch already exists -- ``Config.prediction_batch_override``
+  pins any batch >= 1 verbatim and skips the sweep entirely.
+
+Every skip/stop message names the cap that actually bound the sweep (see
+``_batch_limits`` / ``_describe_batch_limits``); the caps that did not bind
+are printed as context so "nothing to tune" never reads as a silent no-op.
+
+NOTE ``plugin_utils/run_progress.py`` parses the ``autotune candidate i/n``
+and ``Written tile d/t`` prefixes emitted here -- changing either silently
+freezes the QGIS progress bar.
+"""
 import os
 import queue
 import threading
@@ -331,18 +361,16 @@ def _memory_batch_ceiling(config, initial_batch: int) -> dict:
     }
 
 
-def _describe_memory_ceiling(budget: dict, label: str) -> str:
-    """One honest line about where the ceiling came from."""
+def _describe_memory_budget(budget: dict) -> str:
+    """Where the memory ceiling came from, without the label."""
     if budget.get('blind'):
-        return (f"{label} autotune: free memory unknown "
-                f"({budget['source']}); capping at "
-                f"b{budget['ceiling']}")
+        return (f"free memory unknown ({budget['source']}), "
+                f"blind headroom +{AUTOTUNE_BLIND_HEADROOM}")
     return (
-        f"{label} autotune: memory ceiling b{budget['ceiling']} "
-        f"({budget['free_bytes'] / _GB:.1f} GB free per "
+        f"{budget['free_bytes'] / _GB:.1f} GB free per "
         f"{budget['source']}, "
         f"{budget['fraction'] * 100:.0f}% budget, "
-        f"~{budget['bytes_per_tile'] / (1024 ** 2):.0f} MB/tile)"
+        f"~{budget['bytes_per_tile'] / (1024 ** 2):.0f} MB/tile"
     )
 
 
@@ -355,26 +383,134 @@ def _batch_ceiling_attr(config) -> str:
     return 'prediction_batch_max_gpu'
 
 
-def _configured_batch_max(config, initial_batch: int) -> int:
-    """The configured ceiling for this device, ignoring free memory."""
+def _batch_limits(config, initial_batch, budget=None, sample_count=None):
+    """Every cap on how far the sweep may go, in tie-break order.
+
+    Each entry is ``{'key', 'value', 'name', 'allows', 'detail'}``, where
+    ``value`` is the largest batch that cap permits. :func:`_binding_limit`
+    picks the smallest, FIRST match -- so the deliberate, measurement-backed
+    device caps win a tie against the incidental ones (memory, sample pool),
+    which is what a reader needs to be told about.
+
+    ``budget`` (from :func:`_memory_batch_ceiling`) and ``sample_count`` are
+    optional: omit them and only the configured caps are reported, which is
+    what :func:`_configured_batch_max` wants.
+    """
     initial = max(1, int(initial_batch))
-    value = getattr(config, _batch_ceiling_attr(config), None)
-    if value is None:
-        value = getattr(config, 'prediction_batch_max_gpu', initial)
-    try:
-        value = int(value)
-    except (TypeError, ValueError):
-        value = initial
-    value = max(initial, value)
-    # On CoreML larger batches are strictly slower per image, so sweeping up to
-    # prediction_batch_max_gpu only burns time measuring known losers (see
+    limits = []
+
+    # On CoreML larger batches are strictly slower per image, so sweeping up
+    # to prediction_batch_max_gpu only burns time measuring known losers (see
     # Config.prediction_batch_max_coreml).
     hardware = getattr(config, 'hardware', None)
     if getattr(hardware, 'accelerator', None) == 'coreml':
         cap = getattr(config, 'prediction_batch_max_coreml', 2)
+        try:
+            cap = None if cap is None else max(initial, int(cap))
+        except (TypeError, ValueError):
+            cap = None
         if cap is not None:
-            value = max(initial, min(value, int(cap)))
-    return value
+            limits.append({
+                'key': 'coreml',
+                'value': cap,
+                'name': f"the CoreML cap b{cap}",
+                'allows': f"CoreML allows b{cap}",
+                'detail': ('Config.prediction_batch_max_coreml -- measured: '
+                           'larger batches are not faster on this '
+                           'accelerator'),
+            })
+
+    attr = _batch_ceiling_attr(config)
+    value = getattr(config, attr, None)
+    if value is None:
+        attr = 'prediction_batch_max_gpu'
+        value = getattr(config, attr, initial)
+    try:
+        value = max(initial, int(value))
+    except (TypeError, ValueError):
+        value = initial
+    limits.append({
+        'key': 'configured',
+        'value': value,
+        'name': f"the configured cap b{value}",
+        'allows': f"the configured cap allows b{value}",
+        'detail': f"Config.{attr}",
+    })
+
+    if budget:
+        ceiling = max(1, int(budget.get('ceiling', initial)))
+        detail = _describe_memory_budget(budget)
+        limits.append({
+            'key': 'memory',
+            'value': ceiling,
+            'name': f"the memory ceiling b{ceiling}",
+            # The memory numbers are the ones users check by hand, so they
+            # travel with the line whether or not this cap bound.
+            'allows': f"memory would allow b{ceiling} ({detail})",
+            'detail': detail,
+        })
+
+    max_candidates = getattr(
+        config, 'prediction_batch_autotune_max_candidates', None)
+    try:
+        max_candidates = int(max_candidates)
+    except (TypeError, ValueError):
+        max_candidates = 0
+    if max_candidates >= 1:
+        last = initial + max_candidates - 1
+        limits.append({
+            'key': 'candidates',
+            'value': last,
+            'name': f"the candidate cap b{last}",
+            'allows': f"the candidate cap allows b{last}",
+            'detail': (f"{max_candidates} candidate(s) from b{initial}, "
+                       "Config.prediction_batch_autotune_max_candidates"),
+        })
+
+    if sample_count is not None:
+        count = max(1, int(sample_count))
+        limits.append({
+            'key': 'samples',
+            'value': count,
+            'name': f"the sample pool b{count}",
+            'allows': f"the sample pool allows b{count}",
+            'detail': f"only {count} sample tile(s) were collected to time",
+        })
+
+    return limits
+
+
+def _binding_limit(limits):
+    """The cap that actually decides how far the sweep goes."""
+    binding = None
+    for limit in limits:
+        if binding is None or limit['value'] < binding['value']:
+            binding = limit
+    return binding
+
+
+def _describe_batch_limits(limits, label, binding=None) -> str:
+    """One line naming the cap that bound, with the rest as context."""
+    binding = binding or _binding_limit(limits)
+    text = (f"{label} autotune: bound by {binding['name']} "
+            f"({binding['detail']})")
+    others = ', '.join(
+        limit['allows'] for limit in limits if limit is not binding)
+    if others:
+        text = f"{text}; {others}"
+    return text
+
+
+#: Limit keys that are configured device ceilings rather than run-time
+#: circumstances -- ``_configured_batch_max`` is exactly their minimum.
+_CONFIGURED_LIMIT_KEYS = ('coreml', 'configured')
+
+
+def _configured_batch_max(config, initial_batch: int) -> int:
+    """The configured ceiling for this device, ignoring free memory."""
+    return min(limit['value']
+               for limit in _batch_limits(config, initial_batch)
+               if limit['key'] in _CONFIGURED_LIMIT_KEYS)
 
 
 def _prediction_batch_candidates(
@@ -385,6 +521,11 @@ def _prediction_batch_candidates(
     ``ceiling`` is the memory-derived cap; omit it and only the configured
     ceilings apply (the pre-memory-awareness behaviour, kept for callers that
     only want the configured range).
+
+    The search is deliberately UPWARD-ONLY: the list starts at the planner's
+    batch and never goes below it, so ``initial_batch`` is a floor and an
+    optimum beneath it cannot be found. See the module docstring for why, and
+    use ``Config.prediction_batch_override`` to pin a smaller batch by hand.
     """
     initial = max(1, int(initial_batch))
     max_batch = _configured_batch_max(config, initial)
@@ -641,8 +782,8 @@ def _sweep_batch_candidates(
     for index, cand in enumerate(candidates, start=1):
         if oom_ceiling is not None and cand > oom_ceiling:
             stop_reason = (
-                f"working ceiling lowered to b{oom_ceiling} after an "
-                "out-of-memory fallback"
+                f"stopped by the OOM guard: working ceiling lowered to "
+                f"b{oom_ceiling} after an out-of-memory fallback"
             )
             break
 
@@ -685,7 +826,10 @@ def _sweep_batch_candidates(
             # further past the cliff.
             oom_ceiling = used
             if rules['stop_on_oom']:
-                stop_reason = f"stopped after OOM fallback at candidate {cand}"
+                stop_reason = (
+                    f"stopped by the OOM guard at b{cand} "
+                    "(Config.prediction_batch_autotune_stop_on_oom)"
+                )
                 break
 
         # Degradation beats patience: past the memory cliff the times
@@ -693,16 +837,19 @@ def _sweep_batch_candidates(
         # machine-wide freeze.
         if degraded:
             stop_reason = (
-                f"aborted at b{cand}: {per_tile / best_per_tile:.1f}x the "
-                f"best ({best_per_tile:.3f}s/tile at b{best_batch}) "
-                "-- degradation guard"
+                f"stopped by the degradation guard at b{cand}: "
+                f"{per_tile / best_per_tile:.1f}x the best "
+                f"({best_per_tile:.3f}s/tile at b{best_batch}), "
+                "Config.prediction_batch_autotune_degrade_factor"
             )
             break
 
         if stale_steps >= rules['patience'] and cand > best_batch:
             stop_reason = (
-                f"stopped after {stale_steps} non-improving step(s) "
-                f"(< {rules['min_improve_s']:.2f}s/tile gain)"
+                f"stopped by the patience rule after {stale_steps} "
+                f"non-improving step(s) "
+                f"(< {rules['min_improve_s']:.2f}s/tile gain, "
+                "Config.prediction_batch_autotune_patience)"
             )
             break
 
@@ -715,8 +862,10 @@ def _sweep_batch_candidates(
                 and np.isfinite(best_per_tile)
                 and per_tile > best_per_tile * runaway):
             stop_reason = (
-                f"stopped: b{used} is {per_tile / best_per_tile:.1f}x slower "
-                f"than the best (b{best_batch}); larger batches only get worse"
+                f"stopped by the runaway guard: b{used} is "
+                f"{per_tile / best_per_tile:.1f}x slower than the best "
+                f"(b{best_batch}); larger batches only get worse "
+                "(Config.prediction_batch_autotune_runaway_factor)"
             )
             break
 
@@ -737,8 +886,9 @@ def _autotune_batch_size(
     override = _batch_override(config)
     if override is not None:
         print(
-            f"{label} autotune: skipped, batch pinned to b{override} "
-            "by the user",
+            f"{label} autotune: bound by the user pin "
+            f"(Config.prediction_batch_override); skipped, batch pinned to "
+            f"b{override} by the user.",
             flush=True,
         )
         return override
@@ -789,14 +939,21 @@ def _autotune_batch_size(
 
     rules = _autotune_rules(config)
 
+    # Which cap ends the sweep, and what the others would have allowed. The
+    # user's report was that "memory ceiling b20 ... nothing to tune, using
+    # b2" reads as a broken autotune: it advertised the cap that did NOT
+    # bind and never named the CoreML one that did.
+    limits = _batch_limits(config, initial, budget, len(sample_tiles))
+    binding = _binding_limit(limits)
+
     candidates = [
         c for c in _prediction_batch_candidates(config, initial, ceiling)
         if c <= len(sample_tiles)
     ]
     if len(candidates) <= 1:
         print(
-            f"{_describe_memory_ceiling(budget, label)}; "
-            f"nothing to tune, using b{initial}.",
+            f"{_describe_batch_limits(limits, label, binding)}. "
+            f"Nothing to tune, using b{initial}.",
             flush=True,
         )
         return initial
@@ -806,13 +963,12 @@ def _autotune_batch_size(
     # far it may go and why, then tick per candidate so neither the log nor
     # the progress bar looks like a hang (plugin_utils/run_progress.py parses
     # the candidate lines -- do not change that prefix).
-    allowed_max = min(
-        ceiling, _configured_batch_max(config, initial), len(sample_tiles))
-    print(_describe_memory_ceiling(budget, label), flush=True)
+    print(_describe_batch_limits(limits, label, binding), flush=True)
     print(
         f"{label} autotune: timing {len(candidates)} batch size(s) "
         f"b{candidates[0]}-b{candidates[-1]} x {rules['repeats']} "
-        f"repeat(s) (of b{initial}-b{allowed_max} allowed); "
+        f"repeat(s) (of b{initial}-b{binding['value']} allowed, "
+        f"upward from b{initial} only); "
         f"stop rules: gain < {rules['min_improve_s']:.2f}s/tile "
         f"x{rules['patience']}, abort at {rules['degrade_factor']:.2f}x the "
         "best. This runs once and the result is cached.",
@@ -822,13 +978,12 @@ def _autotune_batch_size(
     best_batch, best_per_tile, results, stop_reason = _sweep_batch_candidates(
         sample_tiles, sample_masks, model, config, candidates, rules, label)
 
-    # The sweep ran out of candidates rather than stopping on its own: say
-    # which cap ended it.
-    if stop_reason is None:
-        if candidates[-1] < allowed_max:
-            stop_reason = f"candidate cap of {len(candidates)} reached"
-        elif ceiling < _configured_batch_max(config, initial):
-            stop_reason = f"memory ceiling b{ceiling} reached"
+    # The sweep ran out of candidates rather than stopping on its own: name
+    # the cap that ended it, never one that merely happened to be in force.
+    if stop_reason is None and candidates[-1] >= binding['value']:
+        name = binding['name']
+        name = name[4:] if name.startswith('the ') else name
+        stop_reason = f"{name} reached -- {binding['detail']}"
 
     if results:
         summary_parts = []
