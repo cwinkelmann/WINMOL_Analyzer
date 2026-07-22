@@ -15,6 +15,7 @@ from shapely.strtree import STRtree
 from classes.Part import Part
 from classes.Stem import Stem
 from classes.Timer import Timer
+from utils import Log
 from utils.Geometry import ang
 from utils.IO import get_bounds_from_profile
 
@@ -132,8 +133,8 @@ def connect_stems(stems: List[Stem], config) -> List[Stem]:
 
     t = Timer()
     t.start()
-    print("#######################################################")
-    print("Gathering stem segments")
+    Log.debug("#######################################################")
+    Log.debug("Gathering stem segments")
 
     cycle_nbr = 1
     c_count = 0
@@ -144,7 +145,7 @@ def connect_stems(stems: List[Stem], config) -> List[Stem]:
 
     while global_change:
         global_change = False
-        print("Cycle ", cycle_nbr)
+        Log.debug("Cycle ", cycle_nbr)
         cycle_stems = list(stems)
         if not cycle_stems:
             break
@@ -232,16 +233,16 @@ def connect_stems(stems: List[Stem], config) -> List[Stem]:
     connected_stems, dup_count_2 = remove_duplicates(connected_stems)
     duplicates_count += dup_count_2
 
-    print("")
-    print(count_stem_parts, "stem segments analyzed")
-    print(c_count, "stem segments appended to other stems")
-    print(duplicates_count, "duplicates are removed")
-    print(out_count, "stem fragments with a length less than ",
-          config.min_length, "m are filtered out")
-    print("final number of stems", len(connected_stems))
+    Log.debug("")
+    Log.debug(count_stem_parts, "stem segments analyzed")
+    Log.debug(c_count, "stem segments appended to other stems")
+    Log.debug(duplicates_count, "duplicates are removed")
+    Log.debug(out_count, "stem fragments with a length less than ",
+              config.min_length, "m are filtered out")
+    Log.debug("final number of stems", len(connected_stems))
     t.stop()
-    print("#######################################################")
-    print("")
+    Log.debug("#######################################################")
+    Log.debug("")
     return connected_stems
 
 
@@ -407,8 +408,8 @@ def build_stem_parts(segments: List[Part]):
 
     t = Timer()
     t.start()
-    print("#######################################################")
-    print("Build stem segments")
+    Log.debug("#######################################################")
+    Log.debug("Build stem segments")
     stems = []
     for i in range(len(segments)):
         if segments[i].start[1] >= segments[i].stop[1]:
@@ -427,26 +428,26 @@ def build_stem_parts(segments: List[Part]):
                     [], [], [])
         stems.append(stem)
 
-    print(len(stems), "stems segments build")
+    Log.debug(len(stems), "stems segments build")
 
     t.stop()
-    print("#######################################################")
-    print("")
+    Log.debug("#######################################################")
+    Log.debug("")
     return stems
 
 
 def rebuild_endnodes_from_stems(stems: List[Stem]) -> List[Point]:
     t = Timer()
     t.start()
-    print("#######################################################")
-    print("Rebuild endnodes from stems")
+    Log.debug("#######################################################")
+    Log.debug("Rebuild endnodes from stems")
     nodes = []
     for s in stems:
         nodes.append(s.start.coords)
         nodes.append(s.stop.coords)
     t.stop()
-    print("#######################################################")
-    print("")
+    Log.debug("#######################################################")
+    Log.debug("")
     return nodes
 
 
@@ -507,8 +508,8 @@ def restore_geoinformation(stems: List[Stem], config, profile):
     t = Timer()
     t.start()
 
-    print("#######################################################")
-    print("Restoring geoinformation")
+    Log.debug("#######################################################")
+    Log.debug("Restoring geoinformation")
 
     px_size_x = abs(profile['transform'][0])
     px_size_y = abs(profile['transform'][4])
@@ -530,6 +531,6 @@ def restore_geoinformation(stems: List[Stem], config, profile):
             )
 
     t.stop()
-    print("#######################################################")
-    print("")
+    Log.debug("#######################################################")
+    Log.debug("")
     return stems

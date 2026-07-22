@@ -78,7 +78,7 @@ def _vector_summary(
     timings,
     output_path,
 ):
-    print(
+    Log.debug(
         f'VECTOR TILE {tile_label} | fg {fg_count} | segments '
         f'{segment_count} | stems {stem_count} | skel '
         f'{timings["skel_s"]:.3f}s restore {timings["restore_s"]:.3f}s '
@@ -217,10 +217,9 @@ def _run_vector_pipeline(
     timings['write_s'] = time.perf_counter() - t0
     timings['total_s'] = time.perf_counter() - total_t0
     output_exists = bool(output_path) and os.path.exists(output_path)
-    print(
+    Log.debug(
         f'VECTOR TILE {tile_label} | output_exists {output_exists} | path '
         f'{output_path}',
-        flush=True,
     )
 
     if bool(getattr(config, 'vector_summary_log', True)):

@@ -18,6 +18,7 @@ from shapely.geometry import LineString, Point
 
 from classes.Stem import Stem
 from classes.Timer import Timer
+from utils import Log
 from utils.Geometry import create_vector
 
 # System epsilon
@@ -59,14 +60,14 @@ def quantify_stems(stems: List[Stem], pred, profile, config=None):
     stems_ = []
     stems__ = []
 
-    print("#######################################################")
-    print("Quantifying stems")
+    Log.debug("#######################################################")
+    Log.debug("Quantifying stems")
     if not stems:
-        print("0 measurements of diameters where conducted")
-        print("Volume of  0  stems calculated")
+        Log.debug("0 measurements of diameters where conducted")
+        Log.debug("Volume of  0  stems calculated")
         t.stop()
-        print("#######################################################")
-        print("")
+        Log.debug("#######################################################")
+        Log.debug("")
         return []
     stems = get_diameters(stems, pred, profile, config=config)
     workers = min(_worker_count(config), max(len(stems), 1))
@@ -91,10 +92,10 @@ def quantify_stems(stems: List[Stem], pred, profile, config=None):
             for stem in pool.imap_unordered(quantify_stem, stems_):
                 stems__.append(stem)
 
-    print("Volume of ", len(stems__), " stems calculated")
+    Log.debug("Volume of ", len(stems__), " stems calculated")
     t.stop()
-    print("#######################################################")
-    print("")
+    Log.debug("#######################################################")
+    Log.debug("")
     return stems__
 
 
@@ -114,7 +115,7 @@ def get_diameters(stems: List[Stem], pred, profile, config=None):
         diam_count = diam_count + len(measured_stem.segment_diameter_list)
 
     def error_callback(error):
-        print(error, flush=True)
+        Log.error(error)
 
     workers = min(_worker_count(config), max(len(stems), 1))
 
@@ -173,7 +174,7 @@ def get_diameters(stems: List[Stem], pred, profile, config=None):
                 for r_ in r:
                     r_.wait()
 
-    print(diam_count, " measurements of diameters where conducted")
+    Log.debug(diam_count, " measurements of diameters where conducted")
     return measured_stems
 
 

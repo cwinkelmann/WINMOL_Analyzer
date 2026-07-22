@@ -373,7 +373,6 @@ if __name__ == '__main__':
 
     tt = Timer()
     tt.start()
-    print("Start timer")
     model_path = str(sys.argv[1])
     uav_path = str(sys.argv[2])
     stem_path = str(sys.argv[3])
@@ -403,5 +402,4 @@ if __name__ == '__main__':
     else:
         image_processor.run_tree_pipeline(plan)
 
-    print("Stop timer")
-    tt.stop()
+    print(f"Total runtime: {tt.stop():.1f} s")
