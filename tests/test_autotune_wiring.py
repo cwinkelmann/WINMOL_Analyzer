@@ -45,6 +45,12 @@ def env(tmp_path, monkeypatch):
     cache = tmp_path / "autotune.json"
     monkeypatch.setenv(ac.ENV_CACHE_PATH, str(cache))
     monkeypatch.delenv(ac.ENV_MODE, raising=False)
+    # These tests are about the CACHE, not about the memory ceiling: pin the
+    # free-memory probe so the sweep is bounded by the configured range and
+    # not by whatever the machine running the suite happens to have free.
+    monkeypatch.setattr(
+        Pred, "_free_memory_bytes",
+        lambda config: (64 * float(1024 ** 3), "stub"))
     return {"model": Model(model_file), "cache": cache}
 
 
@@ -55,8 +61,11 @@ def timings(monkeypatch):
 
     def _fake(sample_tiles, sample_masks, model, config, cand, repeats=1):
         calls.append(cand)
-        # 3 is the optimum: monotonically better up to 3, worse after.
-        per_tile = abs(cand - 3) * 0.1 + 0.1
+        # 3 is the optimum: monotonically better up to 3, worse after. The
+        # steps are 0.5 s so they clear the real 0.2 s/tile improvement bar
+        # (tests/test_autotune_stopping.py owns the stop rules; these tests
+        # must exercise the shipped defaults, not a threshold of their own).
+        per_tile = abs(cand - 3) * 0.5 + 0.1
         return cand, per_tile, False
 
     monkeypatch.setattr(Pred, "_time_batch_candidate", _fake)

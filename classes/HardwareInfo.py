@@ -138,11 +138,16 @@ class HardwareInfo:
         except Exception:
             return []
 
+    @classmethod
+    def _detect_gpu_memory_gb_nvidia_smi(cls) -> List[float]:
+        return cls._query_gpu_memory_gb('memory.total')
+
     @staticmethod
-    def _detect_gpu_memory_gb_nvidia_smi() -> List[float]:
+    def _query_gpu_memory_gb(field: str) -> List[float]:
+        """``nvidia-smi --query-gpu=<field>`` in GB; ``[]`` on any failure."""
         try:
             result = subprocess.run(
-                ['nvidia-smi', '--query-gpu=memory.total',
+                ['nvidia-smi', f'--query-gpu={field}',
                  '--format=csv,noheader,nounits'],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -163,6 +168,28 @@ class HardwareInfo:
             return values
         except Exception:
             return []
+
+    @classmethod
+    def free_gpu_memory_gb(cls) -> List[float]:
+        """Per-visible-GPU FREE memory, in GB. Empty list when unknown.
+
+        ``gpu_memory_gb`` reports memory.TOTAL, which is the wrong number for
+        a safety cap: a desktop GPU is also driving the display and may
+        already be hosting another process. This asks for memory.free and
+        applies the same CUDA_VISIBLE_DEVICES filtering, so callers see only
+        the devices this process may use.
+
+        Treat the answer as an upper bound, never as permission -- another
+        process can allocate between the probe and the run, and WDDM reports
+        a shared pool. The OOM fallback in Prediction stays the second line
+        of defence.
+        """
+        values = cls._query_gpu_memory_gb('memory.free')
+        if not values:
+            return []
+        _, filtered = cls._apply_cuda_visible_devices(
+            [''] * len(values), values)
+        return filtered
 
     @staticmethod
     def _cuda_hidden_via_env() -> bool:

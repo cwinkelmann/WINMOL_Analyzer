@@ -74,6 +74,20 @@ def _cfg(config: Any, key: str, default: Any) -> Any:
     return getattr(config, key, default)
 
 
+def _batch_override(config: Any) -> Any:
+    """``Config.prediction_batch_override`` as a positive int, or None.
+
+    Kept in sync with ``utils.Prediction._batch_override``: the planner has to
+    honour the pin, and the autotune has to skip itself for the same value.
+    """
+    raw = _cfg(config, 'prediction_batch_override', None)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 1 else None
+
+
 def _meters_to_pixels(
     tile_overlap_m: float,
     pixel_size_x: float,
@@ -324,6 +338,14 @@ def build_execution_plan(
     )
     prediction_mode = _resolve_prediction_mode(config, scen)
     vector_mode = 'none' if process_type == 'Stems' else 'tiled'
+
+    # The user's manual pin wins over every scenario default above. It has to
+    # be applied HERE, after the branches: each of them assigns
+    # prediction_batch_size unconditionally, so a value written onto the
+    # config would otherwise be silently discarded.
+    batch_override = _batch_override(config)
+    if batch_override is not None:
+        prediction_batch_size = batch_override
 
     return ExecutionPlan(
         process_type=process_type,
