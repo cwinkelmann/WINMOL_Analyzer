@@ -57,17 +57,26 @@ class WINMOLAnalyzer:
         self.iface = iface
         # initialize plugin directory
         self.plugin_dir = os.path.dirname(__file__)
-        # initialize locale
-        locale = QSettings().value('locale/userLocale')[0:2]
-        locale_path = os.path.join(
-            self.plugin_dir,
-            'i18n',
-            'WINMOLAnalyze_{}.qm'.format(locale))
+        # Initialize locale. This runs inside __init__, which classFactory
+        # calls, so ANY exception here stops the plugin loading at all — no
+        # toolbar icon, no menu, nothing to recover from. QSettings.value()
+        # returns None for a missing key, and the previous `[0:2]` on that
+        # raised TypeError on profiles where 'locale/userLocale' is unset.
+        # There is no i18n directory in this repo and none is packaged, so a
+        # translation can never load; the whole block is best-effort.
+        try:
+            locale = str(QSettings().value('locale/userLocale', '') or '')[0:2]
+            locale_path = os.path.join(
+                self.plugin_dir,
+                'i18n',
+                'WINMOLAnalyze_{}.qm'.format(locale))
 
-        if os.path.exists(locale_path):
-            self.translator = QTranslator()
-            self.translator.load(locale_path)
-            QCoreApplication.installTranslator(self.translator)
+            if locale and os.path.exists(locale_path):
+                self.translator = QTranslator()
+                self.translator.load(locale_path)
+                QCoreApplication.installTranslator(self.translator)
+        except Exception:  # noqa: BLE001 - never block plugin load
+            pass
 
         # Declare instance attributes
         self.actions = []

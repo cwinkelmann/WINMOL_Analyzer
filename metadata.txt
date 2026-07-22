@@ -8,9 +8,14 @@ name=WINMOL Analyzer
 qgisMinimumVersion=3.22
 description=Plugin to detect stems from UAV
 version=0.6.1
-# The plugin uses qgis.PyQt shims throughout, so it is Qt6-ready. supportsQt6
-# declares this to QGIS 4; validate on a QGIS 4 build before a Qt6-only release.
-supportsQt6=True
+# NOT Qt6-ready, and saying so is the honest default. The dialog uses ~22
+# UNSCOPED Qt enums (Qt.Checked, Qt.UserRole, QMessageBox.Yes, ...) which
+# PyQt6 removed; qgis.PyQt's Qt6 branch restores classes but NOT enum
+# members, so the dialog raises AttributeError on construction under Qt6 —
+# the icon appears, clicking it fails. Flip to True only after qualifying
+# those enums (Qt.CheckState.Checked etc., which also work on PyQt5) AND
+# exercising the plugin on a real Qt6 QGIS build.
+supportsQt6=False
 author=Hochschule für nachhaltige Entwicklung Eberswalde | mundialis GmbH & Co. KG | terrestris GmbH & Co. KG
 email=Stefan.Reder@hnee.de
 
