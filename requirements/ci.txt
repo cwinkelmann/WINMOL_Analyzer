@@ -1,11 +1,17 @@
-# CI test environment — exact pins matching tests/fixtures/manifest.json.
+# THE CI TEST ENVIRONMENT — exact pins matching tests/fixtures/manifest.json.
+#
+# WHO: docker/ci/Dockerfile, and anyone reproducing a CI failure byte for byte.
+# WHEN: only for that. To simply run the analyzer, install cpu.txt instead —
+#      this file pins an older onnxruntime and omits psutil on purpose.
+#
 # The golden fixtures are only bit-reproducible under these versions
 # (skeletonize/GEOS/scipy implementations).
+#
 # fiona 1.10 breaks geopandas-0.14's fiona READ path (docs/CODE_REVIEW_2.md
 # A-8) but ships wheels for both x86_64 and aarch64; the test suite reads
 # GeoPackages exclusively via pyogrio and only WRITES through fiona, which
 # works — matches the local dev environment (fiona 1.10.1).
--r base.txt
+-r core.txt
 numpy==1.26.4
 pandas==2.2.3
 fiona==1.10.1
@@ -15,3 +21,11 @@ pyproj==3.6.1
 # (CI runners) and aarch64 (local Apple-Silicon docker validation).
 onnxruntime==1.19.2
 pytest==8.*
+
+# INVARIANT, DO NOT "SIMPLIFY" THIS TO `-r cpu.txt`.
+# Two things would break. (1) cpu.txt pins onnxruntime>=1.17, which resolves
+# well past the 1.19.2 the golden stem map was generated with. (2) cpu.txt
+# carries psutil, and utils/Prediction.py takes a DIFFERENT autotune path when
+# psutil is importable (measured free RAM instead of AUTOTUNE_BLIND_HEADROOM) —
+# the fixtures were generated on the blind-headroom path, so adding psutil here
+# changes what CI measures. Hanging off core.txt is what keeps both true.

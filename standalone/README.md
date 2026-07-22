@@ -21,8 +21,12 @@ Verify that the GPU is working
 Clone the repo and install the requirements:
 
     git clone https://github.com/StefanReder/WINMOL_Analyzer
-    pip install -r requirements/base.txt
-    
+    pip install -r requirements/notebook.txt
+
+`notebook.txt` is `requirements/cpu.txt` (the geo stack + onnxruntime, what the
+analyzer itself needs) plus the `matplotlib`/`ipykernel` extras these notebooks
+import in their first cells. See `requirements/README.md` for the other files.
+
 [optional] Add the conda env as ipykernel to jupyter 
   
     python -m ipykernel install --user --name=WINMOL_Analyzer

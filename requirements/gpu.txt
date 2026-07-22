@@ -1,25 +1,28 @@
-# CUDA compute environment (docker/gpu/Dockerfile).
+# THE CUDA TWIN OF cpu.txt — same environment, GPU inference runtime.
 #
-# Same geo stack as base.txt, but onnxruntime-gpu in place of onnxruntime —
-# they both provide the `onnxruntime` module and MUST NOT be co-installed, so
-# never combine this file with base.txt, plugin.txt or ci.txt.
+# WHO: the CUDA container (docker/gpu/Dockerfile), and the venv the QGIS plugin
+#      builds when nvidia-smi reports a usable driver (plugin_utils/gpu_probe.py
+#      decides; plugin_utils/installer.py installs).
+# WHEN: NVIDIA GPU on Linux or Windows x86_64. Everything else installs cpu.txt.
 #
-# The notebook/plotting extras in base.txt (ipykernel, matplotlib) are
-# deliberately omitted: nothing on the compute path imports them, and they drag
-# in ipython, jupyter_client, pyzmq, debugpy and tornado.
--r geo.txt
+#     pip install -r requirements/gpu.txt
+#
+# MUST NOT BE COMBINED WITH cpu.txt OR ci.txt. onnxruntime and onnxruntime-gpu
+# both provide the `onnxruntime` module, and pip will happily leave both
+# installed — the loser's shared libraries then shadow the winner's and imports
+# fail in ways that look like a broken CUDA install. plugin_utils/installer.py
+# uninstalls the other distribution before pip runs; that is not
+# belt-and-braces, it is the documented requirement.
+#
+# Hence `-r core.txt`: core.txt carries the geo stack and NO runtime, so this
+# file and cpu.txt can share it without either one leaking a runtime into the
+# other. The notebook/plotting extras live in notebook.txt and are deliberately
+# absent here — nothing on the compute path imports them, and they drag in
+# ipython, jupyter_client, pyzmq, debugpy and tornado.
+-r core.txt
 
-# The [cuda,cudnn] extras pull the CUDA userspace in as wheels, so the image
-# does not need an nvidia/cuda base and cannot mismatch one. The host driver
-# plus nvidia-container-toolkit supply the rest.
-#
-# VERSION PINNING IS DELIBERATE AND HARDWARE-DEPENDENT. onnxruntime-gpu 1.27
-# moved its extras to CUDA 13 (nvidia-*-cu13); earlier releases use cu12. If the
-# target machine's driver is too old for CUDA 13, pin a cu12-era release here
-# instead. Blackwell (sm_120) in particular needs a recent CUDA — verify on the
-# hardware with the provider check in docker/gpu/README.md before trusting any
-# timing.
-onnxruntime-gpu[cuda,cudnn]
+# The CUDA runtime, its version window, and the reasoning behind both.
+-r cuda.txt
 
 # Without psutil, HardwareInfo._detect_total_ram_gb() returns 0.0 and the run
 # logs "RAM=0.0 GB". Cosmetic on CUDA — the figure only feeds that log line and

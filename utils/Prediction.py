@@ -262,8 +262,10 @@ def _batch_override(config):
 def _available_ram_bytes():
     """Free host RAM in bytes, or None when psutil is unavailable.
 
-    psutil is in requirements/plugin.txt and requirements/gpu.txt but NOT in
-    requirements/base.txt, so this must degrade rather than raise.
+    psutil is in requirements/cpu.txt and requirements/gpu.txt but NOT in
+    requirements/ci.txt — deliberately, so the CI image keeps taking the
+    blind-headroom path the golden fixtures were generated under. This must
+    therefore degrade rather than raise.
     """
     try:
         import psutil

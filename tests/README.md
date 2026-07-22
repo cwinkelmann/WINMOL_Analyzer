@@ -19,6 +19,15 @@ pytest                    # everything (~2-3 min with the model present)
 pytest -m "not slow"      # fast loop: stage tests only, no TF (<30 s)
 ```
 
+The tools come from `requirements/dev.txt` (flake8 + pytest), installed on top
+of a normal `requirements/cpu.txt` environment. `requirements/ci.txt` is the
+exactly-pinned alternative — see `requirements/README.md`.
+
+`tests/test_standalone_pipeline.py` is the one module that imports TensorFlow at
+module scope; CI runs with `--ignore` for it. To run it locally install
+`requirements/convert.txt` (which pins TF 2.16.2), plus `tensorflow-metal==1.2.0`
+on Apple Silicon — the test skips itself without a TF-visible GPU.
+
 The conftest re-execs pytest with `PYTHONHASHSEED=0` if needed — pipeline
 output depends on set-iteration order (review A-4), so the fixtures are only
 reproducible under that seed.
@@ -55,7 +64,7 @@ build) at `/opt/winmol/model/` — no model file in git. Two jobs:
   entries skip).
 
 **Bootstrap:** the image workflow triggers on changes to
-`docker/ci/**` / `requirements/{base,ci}.txt`, or manually via
+`docker/ci/**` / `requirements/{core,ci}.txt`, or manually via
 *Actions → CI test image → Run workflow*. On the very first push the tests
 job may race the image build — run the image workflow first (or re-run the
 failed tests job once the image exists). Rebuilding the image is only needed

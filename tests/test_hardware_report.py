@@ -4,7 +4,7 @@ Regression cover for two user-visible lies on a Mac:
 
   * ``Hardware detected: CPUs=8, RAM=24.0 GB, GPUs=0`` — the Metal probe was
     gated on the ``tensorflow-metal`` package, which can never be installed in
-    the TF-free plugin venv (requirements/plugin.txt), so the accelerator that
+    the TF-free plugin venv (requirements/cpu.txt), so the accelerator that
     actually runs inference (onnxruntime + CoreML) was reported as absent.
   * ``Tensorflow error: ...`` / ``Check CUDA environment`` — a TensorFlow/CUDA
     banner printed by a runtime that uses neither.
@@ -86,7 +86,7 @@ def test_metal_detection_does_not_need_tensorflow(monkeypatch):
     """It must fire in the TF-free plugin venv, where the old gate could not.
 
     Simulated by making the tensorflow-metal metadata lookup fail, which is
-    exactly the state of requirements/plugin.txt.
+    exactly the state of requirements/cpu.txt.
     """
     import importlib.metadata as md
     fake_platform(monkeypatch, "Darwin", "arm64")
