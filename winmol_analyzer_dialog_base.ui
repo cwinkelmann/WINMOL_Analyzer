@@ -21,6 +21,33 @@
   </property>
   <layout class="QVBoxLayout" name="verticalLayout_7">
    <item>
+    <layout class="QHBoxLayout" name="horizontalLayout_run">
+     <item>
+      <spacer name="horizontalSpacer_run">
+       <property name="orientation">
+        <enum>Qt::Horizontal</enum>
+       </property>
+       <property name="sizeHint" stdset="0">
+        <size>
+         <width>40</width>
+         <height>20</height>
+        </size>
+       </property>
+      </spacer>
+     </item>
+     <item>
+      <widget class="QPushButton" name="run_button">
+       <property name="toolTip">
+        <string>Start a detection with the parameters below.</string>
+       </property>
+       <property name="text">
+        <string>Run</string>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+   <item>
     <widget class="QTabWidget" name="log_widget">
      <property name="autoFillBackground">
       <bool>false</bool>
@@ -1114,9 +1141,15 @@ the model, the execution provider or the hardware changes.</string>
       </widget>
      </item>
      <item row="1" column="3">
-      <widget class="QPushButton" name="run_button">
+      <widget class="QPushButton" name="export_button">
+       <property name="enabled">
+        <bool>false</bool>
+       </property>
+       <property name="toolTip">
+        <string>Save the last run's outputs (stem map / stems) to a folder. Runs without an output path go to a temp folder until exported.</string>
+       </property>
        <property name="text">
-        <string>Run</string>
+        <string>Export…</string>
        </property>
       </widget>
      </item>

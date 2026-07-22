@@ -256,19 +256,79 @@ def test_the_output_defaults_are_untouched_and_still_on_detection():
         assert checked is not None and checked.text == "true"
 
 
+def _ancestor_names(root, element):
+    parents = _parents(root)
+    names, node = [], parents.get(element)
+    while node is not None:
+        names.append(node.get("name"))
+        node = parents.get(node)
+    return names
+
+
 def test_the_shared_button_row_stayed_outside_the_tabs():
     root = _root()
-    parents = _parents(root)
     grid = _named(root)["gridLayout_3"][0]
-    ancestors = []
-    node = parents.get(grid)
-    while node is not None:
-        ancestors.append(node.get("name"))
-        node = parents.get(node)
+    ancestors = _ancestor_names(root, grid)
     assert "tab" not in ancestors and "tab_setup" not in ancestors
-    for name in ("progress_bar", "run_button", "cancel_button",
+    for name in ("progress_bar", "export_button", "cancel_button",
                  "close_button", "help_button"):
         assert name in _subtree_names(grid)
+
+
+# --- Run at the top, Export at the bottom (BUGS.md "Button positions") ------
+
+def _outer_items(root):
+    """The direct children of the dialog's outermost QVBoxLayout, top to
+    bottom, as the name of the single widget/layout each <item> holds."""
+    outer = _named(root)["verticalLayout_7"][0]
+    out = []
+    for item in outer.findall("item"):
+        for child in item:
+            if child.get("name"):
+                out.append(child.get("name"))
+    return out
+
+
+def test_run_sits_above_the_tabs_and_export_below_them():
+    """The user's words: "Run should be at the top / Export at the
+    bottom". Positions are asserted relative to the tab widget, so a
+    later insertion above or below cannot quietly invert them."""
+    root = _root()
+    order = _outer_items(root)
+    assert order.index("horizontalLayout_run") < order.index("log_widget"), \
+        "the Run row must come before the tabs"
+    assert order.index("gridLayout_3") > order.index("log_widget"), \
+        "the shared button row must come after the tabs"
+    assert "run_button" in _subtree_names(
+        _named(root)["horizontalLayout_run"][0])
+    assert "run_button" not in _subtree_names(_named(root)["gridLayout_3"][0])
+    assert "export_button" not in _subtree_names(
+        _named(root)["horizontalLayout_run"][0])
+
+
+def test_run_and_export_are_outside_the_tabs():
+    """Both must stay reachable from every tab."""
+    root = _root()
+    for name in ("run_button", "export_button"):
+        ancestors = _ancestor_names(root, _named(root)[name][0])
+        assert "tab" not in ancestors and "tab_setup" not in ancestors, \
+            f"{name} is trapped inside a tab page"
+
+
+def test_export_is_declared_disabled_and_wired_once():
+    """It used to be built in Python and inserted at the top; it is a
+    declared widget now, so the initial disabled state lives in the .ui
+    and the click goes through set_connections like every sibling."""
+    widget = _named(_root())["export_button"][0]
+    enabled = widget.find("property[@name='enabled']/bool")
+    assert enabled is not None and enabled.text == "false", (
+        "Export must start dead — there is nothing to export before a run")
+    assert widget.find("property[@name='text']/string").text.endswith("…"), \
+        "Export opens a folder chooser; keep the ellipsis convention"
+    source = open(DIALOG_FILE, encoding="utf-8").read()
+    assert source.count("self.export_button.clicked.connect") == 1
+    assert "QtWidgets.QPushButton(\"Export" not in source, (
+        "the hand-built Export bar is gone; the .ui owns the button")
 
 
 # --- AST: the wiring --------------------------------------------------------
