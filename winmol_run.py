@@ -25,6 +25,7 @@ from classes.ExecutionPlan import build_execution_plan
 from classes.HardwareInfo import HardwareInfo
 from classes.Timer import Timer
 from utils import IO
+from utils import Log
 from utils import Skeletonization as Skel
 from utils import Vectorization as Vec
 from utils import Quantification as Quant
@@ -111,16 +112,16 @@ def _force_cpu_only(model_path=None):
         return None
     try:
         tf.config.set_visible_devices([], 'GPU')
-        print('Configured TensorFlow for CPU-only prediction.')
+        print("Configured TensorFlow for CPU-only prediction.")
     except RuntimeError as exc:
-        print(f'CPU-only TensorFlow setup failed: {exc}')
+        print(f"CPU-only TensorFlow setup failed: {exc}")
     return tf
 
 
 class ImageProcessing:
     def __init__(self, model_path, uav_path, stem_path,
                  trees_path, process_type):
-        print("Initialization")
+        print("Initializing WINMOL Analyzer")
         self.model_path = model_path
         self.uav_path = uav_path
         self.stem_path = stem_path
@@ -128,6 +129,9 @@ class ImageProcessing:
         self.process_type = process_type
         self.config = Config()
         self.apply_env_config_overrides()
+        # Resolve verbosity once the overrides are in, and export it so the
+        # spawned vector-tile workers inherit the same level.
+        Log.configure_from_config(self.config)
 
     def apply_env_config_overrides(self):
         raw = os.environ.get("WINMOL_CONFIG_OVERRIDES_JSON", "").strip()
@@ -168,7 +172,7 @@ class ImageProcessing:
         # Only the NVIDIA path has per-device names worth listing.
         if getattr(hardware, 'accelerator', 'cpu') == 'cuda' \
                 and hardware.gpu_names:
-            print("Visible GPUs:", hardware.gpu_names)
+            print(f"Visible GPUs: {hardware.gpu_names}")
         return hardware
 
     def build_plan(self, hardware=None):
@@ -178,7 +182,7 @@ class ImageProcessing:
         plan = build_execution_plan(
             self.config, hardware, raster_info, self.process_type)
 
-        print('Execution plan:')
+        print("Execution plan:")
         print(f"  process_type     = {plan.process_type}")
         print(f"  prediction_mode  = {plan.prediction_mode}")
         print(f"  vector_mode      = {plan.vector_mode}")
@@ -235,7 +239,7 @@ class ImageProcessing:
 
         print("\nLoading Model...")
         model = IO.load_model_from_path(self.model_path)
-        print("\nPerforming Prediction with Resampling in stream mode...")
+        print("\nPerforming prediction with resampling (stream mode)...")
         profile = Pred.predict_stream_to_raster(
             self.uav_path,
             self.stem_path,
@@ -245,18 +249,24 @@ class ImageProcessing:
         return (None, profile, self.stem_path)
 
     def trees_processing(self, pred, profile):
-        print("\nFinding Stem Segments...")
+        print("\nFinding stem segments...")
         segments = Skel.find_segments(pred, self.config, profile)
-        print("\nRestoring Geoinformation...")
+        print("\nRestoring geoinformation...")
         segments = Vec.restore_geoinformation(segments, self.config, profile)
-        print("\nBuilding Stem Parts...")
+        print("\nBuilding stem parts...")
         stems = Vec.build_stem_parts(segments)
-        print("\nConnecting Stem Parts...")
+        print("\nConnecting stem parts...")
         stems = Vec.connect_stems(stems, self.config)
-        print("\nRebuilding End Nodes...")
+        print("\nRebuilding end nodes...")
         Vec.rebuild_endnodes_from_stems(stems)
-        print("\nQuantifying Stems...")
+        print("\nQuantifying stems...")
         stems = Quant.quantify_stems(stems, pred, profile, config=self.config)
+        # Un-tiled path: connect_stems ran once over the whole raster, so
+        # this count is the run's answer. The tiled path's answer is the
+        # merge stage's "Total stems written" instead.
+        print("")
+        print("STEM SUMMARY (final result for this run)")
+        print(f"Total stems:           {len(stems)}")
         return stems
 
     def run_vector_phase(self, plan, pred_path=None, pred=None, profile=None):
@@ -302,7 +312,7 @@ class ImageProcessing:
                 f"with foreground | skipped_empty {skipped_tiles}"
             )
             if not tile_paths:
-                print("No foreground tiles found for vector stage.")
+                print("No foreground tiles found for the vector stage.")
                 return None
             from utils.VectorTilePipeline import process_prediction_tiles
 
@@ -399,12 +409,12 @@ class ImageProcessing:
         else:
             self.report_runtime_env()
         print("Command-line arguments:")
-        print("Model Path:", self.model_path)
-        print("Image Path:", self.uav_path)
-        print("Semantic Stem Map Path:", self.stem_path)
-        print("Process type:", self.process_type)
+        print(f"Model path: {self.model_path}")
+        print(f"Image path: {self.uav_path}")
+        print(f"Semantic stem map path: {self.stem_path}")
+        print(f"Process type: {self.process_type}")
         if self.trees_path:
-            print("Detected Wind-thrown Trees Path:", self.trees_path)
+            print(f"Detected wind-thrown trees path: {self.trees_path}")
         self.config.display()
 
     def main(self):
@@ -426,7 +436,6 @@ if __name__ == '__main__':
 
     tt = Timer()
     tt.start()
-    print("Start timer")
     model_path = str(sys.argv[1])
     uav_path = str(sys.argv[2])
     stem_path = str(sys.argv[3])
@@ -456,5 +465,4 @@ if __name__ == '__main__':
     else:
         image_processor.run_tree_pipeline(plan)
 
-    print("Stop timer")
-    tt.stop()
+    print(f"Total runtime: {tt.stop():.1f} s")

@@ -25,6 +25,7 @@ from collections.abc import Mapping
 from pyproj import CRS
 from pathlib import Path
 
+from utils import Log
 import utils.Quantification as Quant
 from classes.Stem import Stem
 
@@ -245,7 +246,7 @@ def _load_onnx_model(model_path):
             "environment. Install it: `pip install onnxruntime`. "
             f"Original import error: {e}"
         ) from e
-    print(f"Loading ONNX model via OnnxSegmenter: {model_path}")
+    Log.info(f"Loading ONNX model via OnnxSegmenter: {model_path}")
     return OnnxSegmenter(model_path)
 
 
@@ -285,11 +286,11 @@ def load_orthomosaic_with_resampling(path, config):
 
 def load_stem_map(path):
     if path.endswith('.tif') or path.endswith('.tiff'):
-        print("#######################################################")
-        print("#######################################################")
-        print("")
-        print(path)
-        print("")
+        Log.debug("#" * 55)
+        Log.debug("#" * 55)
+        Log.debug("")
+        Log.debug(f"Loading stem map: {path}")
+        Log.debug("")
         with rasterio.open(path) as src:
             pred = src.read(1)
             profile = src.profile
@@ -735,7 +736,7 @@ def _fiona_write_layer(path, layer_name, gdf, crs, append=False):
             except Exception:
                 crs_wkt = None
 
-    print(
+    Log.debug(
         f"Fiona schema for layer '{layer_name}': {schema} | mode {mode} | "
         f"layer_exists {layer_exists}",
     )
@@ -806,8 +807,8 @@ def _write_layers_to_temp_gpkg(  # noqa: C901
                 first = False
             return tmp_path
         except Exception as e:
-            print("pyogrio GeoPackage write failed, "
-                  f"falling back to Fiona: {e}")
+            Log.warn("pyogrio GeoPackage write failed, "
+                     f"falling back to Fiona: {e}")
             try:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
@@ -816,8 +817,8 @@ def _write_layers_to_temp_gpkg(  # noqa: C901
 
     first = True
     for name, gdf in prepared:
-        print(f"Writing GPKG layer '{name}' with {len(gdf)} features")
-        print(f"Layer '{name}' dtypes: {dict(gdf.dtypes.astype(str))}")
+        Log.debug(f"Writing GPKG layer '{name}' with {len(gdf)} features")
+        Log.debug(f"Layer '{name}' dtypes: {dict(gdf.dtypes.astype(str))}")
         try:
             if first:
                 if os.path.exists(tmp_path):
@@ -862,7 +863,7 @@ def write_all_layers_to_gpkg(stems, profile, path_prefix):
         crs=crs,
         final_path=final_path,
     )
-    print("Geopackage written to temporary file:", tmp_path)
+    Log.debug(f"Geopackage written to temporary file: {tmp_path}")
     return _safe_finalize_gpkg(tmp_path, final_path)
 
 
@@ -922,10 +923,9 @@ def _read_gpkg_layer(gpkg_path, layer_names):
                 gdf = gpd.GeoDataFrame(geometry=[], crs=crs)
             else:
                 gdf = gpd.GeoDataFrame.from_features(feats, crs=crs)
-            print(
+            Log.debug(
                 f"MERGE READ OK | file {gpkg_path} |"
                 f" layer {ln} | rows {len(gdf)}",
-                flush=True,
             )
             return gdf
         except Exception as exc:
@@ -935,14 +935,12 @@ def _read_gpkg_layer(gpkg_path, layer_names):
         tried = ", ".join(
             f"{ln}: {type(exc).__name__}: {exc}" for ln, exc in errors
         )
-        print(
+        Log.warn(
             f"MERGE READ FAIL | file {gpkg_path} | tried [{tried}]",
-            flush=True,
         )
     else:
-        print(
+        Log.warn(
             f"MERGE READ FAIL | file {gpkg_path} | tried []",
-            flush=True,
         )
     return gpd.GeoDataFrame(geometry=[])
 
@@ -1067,18 +1065,17 @@ def _remove_existing_output(path):
     try:
         os.remove(path)
     except PermissionError:
-        print(
+        Log.warn(
             f"MERGE OUTPUT LOCKED | keeping existing file and writing"
             f" fallback if needed: {path}",
-            flush=True,
         )
 
 
 def _globalize_stems(stems, tile_id, filter_geom):
     id_col = _pick_id_col(stems)
     if not id_col:
-        print(f"MERGE FILTER | tile {tile_id} |"
-              f" missing stem id column", flush=True)
+        Log.warn(f"MERGE FILTER | tile {tile_id} |"
+                 f" missing stem id column")
         return gpd.GeoDataFrame(), set()
 
     stems = stems.copy()
@@ -1090,18 +1087,16 @@ def _globalize_stems(stems, tile_id, filter_geom):
     if filter_geom is not None:
         kept_mask = stems.intersects(filter_geom)
         stems = stems[kept_mask].copy()
-        print(
+        Log.debug(
             f"MERGE FILTER | tile {tile_id} | before {before} |"
             f" after {len(stems)} "
             f"| filter_empty {getattr(filter_geom, 'is_empty', False)} "
             f"| filter_bounds {getattr(filter_geom, 'bounds', None)}",
-            flush=True,
         )
     else:
-        print(
+        Log.debug(
             f"MERGE FILTER | tile {tile_id} | before {before} |"
             f" after {before} | filter none",
-            flush=True,
         )
 
     kept_local = set(stems["_stem_id_local"].tolist())
@@ -1134,13 +1129,12 @@ def _process_tile(prefix, gpkg_path, raster_path, edge_buffer_m, target_crs,
         raster_path, edge_buffer_m, ortho_bounds=ortho_bounds)
 
     stems, nodes, vectors = _read_tile_gpkg(gpkg_path)
-    print(
+    Log.debug(
         f"MERGE TILE READ | tile {tile_id} | file {gpkg_path} |"
         f" stems {0 if stems is None else len(stems)} "
         f"| nodes {0 if nodes is None else len(nodes)} |"
         f" vectors {0 if vectors is None else len(vectors)} "
         f"| raster {raster_path}",
-        flush=True,
     )
     if stems is None or stems.empty:
         return None, target_crs
@@ -1170,12 +1164,11 @@ def _window_geom_from_profile(profile, window):
 
 def process_tile_gpkg(tile_job, gpkg_path, raster_profile, target_crs=None):
     stems, nodes, vectors = _read_tile_gpkg(gpkg_path)
-    print(
+    Log.debug(
         f"MERGE TILE READ | tile {tile_job.tile_id} | file {gpkg_path} |"
         f" stems {0 if stems is None else len(stems)} "
         f"| nodes {0 if nodes is None else len(nodes)} |"
         f" vectors {0 if vectors is None else len(vectors)}",
-        flush=True,
     )
     if stems is None or stems.empty:
         return None, target_crs
@@ -1229,13 +1222,12 @@ def merge_selected_tile_results(
     if merge_root.exists():
         recursive_candidates = \
             sorted(str(p) for p in merge_root.rglob('*.gpkg'))
-    print(
+    Log.debug(
         f"MERGE DISCOVERY | root {merge_root} |"
         f" gpkg_files {len(recursive_candidates)}",
-        flush=True,
     )
     for candidate in recursive_candidates[:5]:
-        print(f'MERGE INPUT | {candidate}', flush=True)
+        Log.debug(f'MERGE INPUT | {candidate}')
 
     for tile_job, gpkg_path in tile_records:
         out, target_crs = process_tile_gpkg(
@@ -1261,7 +1253,7 @@ def merge_selected_tile_results(
         written_gpkg = _write_merged(
             output_gpkg, merged_stems, merged_nodes, merged_vectors)
         print("")
-        print("MERGE SUMMARY")
+        print("MERGE SUMMARY (final result for this run)")
         print(f"Tiles processed:       {tile_count}")
         print(f"Total stems written:   {total_stems}")
         print(f"Total nodes written:   {total_nodes}")
@@ -1269,7 +1261,7 @@ def merge_selected_tile_results(
         print(f"Output saved to: {written_gpkg}")
     else:
         print("")
-        print("MERGE SUMMARY")
+        print("MERGE SUMMARY (final result for this run)")
         print("Tiles processed:       0")
         print("Total stems written:   0")
         print("Total nodes written:   0")
@@ -1485,10 +1477,9 @@ def _reconstruct_edge_stems_for_tiled_merge(
             idx = []
         edge_indices.update(idx)
 
-    print(
+    Log.debug(
         f"MERGE EDGE CONNECT | candidates {len(edge_indices)} |"
         f" total {len(stems_gdf)} | edge_buffer_m {edge_buffer_m}",
-        flush=True,
     )
 
     all_stems = _stems_from_gdf(stems_gdf)
@@ -1512,8 +1503,9 @@ def _reconstruct_edge_stems_for_tiled_merge(
     else:
         recon_cfg = config
 
-    connected_edge_stems = \
-        Vec.connect_stems(list(original_edge_stems), recon_cfg)
+    connected_edge_stems = Vec.connect_stems(
+        list(original_edge_stems), recon_cfg,
+        scope="Merge edge reconnect")
 
     # Quantify the direct connect_stems outputs so their lengths/volumes are
     # consistent with the merged geometry. connect_stems now merges the
@@ -1532,15 +1524,14 @@ def _reconstruct_edge_stems_for_tiled_merge(
             n_unmeasured += 1
             quantified_edge_stems.append(stem)
     if n_unmeasured:
-        print(f"MERGE EDGE CONNECT | {n_unmeasured} merged stems kept "
-              f"without re-quantified measures (diameter/path mismatch)",
-              flush=True)
+        Log.warn(f"{n_unmeasured} merged stems kept without "
+                 f"re-quantified measures (diameter/path mismatch)")
 
     final_stems = inner_stems + quantified_edge_stems
     print(
         f"MERGE EDGE CONNECT | inner {len(inner_stems)} | "
         f"connected_edge {len(quantified_edge_stems)} | "
-        f"final {len(final_stems)}",
+        f"stems {len(final_stems)}",
         flush=True,
     )
     return _stems_to_layer_gdfs(final_stems, target_crs, config=recon_cfg)
@@ -1571,13 +1562,12 @@ def merge_and_filter_tiled_results(
     tiles = _detect_tiles(work_dir, output_gpkg)
     recursive_candidates = \
         sorted(str(p) for p in Path(work_dir).rglob('*.gpkg'))
-    print(
+    Log.debug(
         f"MERGE DISCOVERY | root {work_dir} |"
         f" gpkg_files {len(recursive_candidates)}",
-        flush=True,
     )
     for candidate in recursive_candidates[:5]:
-        print(f'MERGE INPUT | {candidate}', flush=True)
+        Log.debug(f'MERGE INPUT | {candidate}')
     if not tiles:
         raise FileNotFoundError(f"No .gpkg files found in: {work_dir}")
 
@@ -1640,10 +1630,9 @@ def merge_and_filter_tiled_results(
         try:
             written_layers = list(fiona.listlayers(written_gpkg))
         except Exception as exc:
-            print(
+            Log.error(
                 f"MERGE VERIFY FAIL | file {written_gpkg} "
                 f"| {type(exc).__name__}: {exc}",
-                flush=True,
             )
 
         final_stem_count = 0 if stems_gdf is None else len(stems_gdf)
@@ -1651,7 +1640,7 @@ def merge_and_filter_tiled_results(
         final_vector_count = 0 if vectors_gdf is None else len(vectors_gdf)
 
         print("")
-        print("MERGE SUMMARY")
+        print("MERGE SUMMARY (final result for this run)")
         print(f"Tiles processed:       {tile_count}")
         print(f"Total stems written:   {final_stem_count}")
         print(f"Total nodes written:   {final_node_count}")
@@ -1660,7 +1649,7 @@ def merge_and_filter_tiled_results(
         print(f"Output saved to: {written_gpkg}")
     else:
         print("")
-        print("MERGE SUMMARY")
+        print("MERGE SUMMARY (final result for this run)")
         print("Tiles processed:       0")
         print("Total stems written:   0")
         print("Total nodes written:   0")

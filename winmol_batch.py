@@ -376,6 +376,16 @@ def main(argv: List[str]) -> int:
         ),
     )
     parser.add_argument(
+        "--log-level",
+        choices=["quiet", "normal", "debug"],
+        default=None,
+        help=(
+            "Verbosity of every child run (default: $WINMOL_LOG_LEVEL or "
+            "'normal'). 'debug' restores the per-tile MERGE/VECTOR "
+            "diagnostics."
+        ),
+    )
+    parser.add_argument(
         "--list-models",
         action="store_true",
         help=(
@@ -385,6 +395,11 @@ def main(argv: List[str]) -> int:
     )
 
     args = parser.parse_args(argv)
+
+    if args.log_level:
+        # Children copy os.environ, so this reaches winmol_run.py and, from
+        # there, the spawned vector-tile workers.
+        os.environ["WINMOL_LOG_LEVEL"] = args.log_level
 
     if args.list_models:
         _print_models(registry, args.model_dir)

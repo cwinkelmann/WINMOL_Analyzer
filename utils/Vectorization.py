@@ -15,6 +15,7 @@ from shapely.strtree import STRtree
 from classes.Part import Part
 from classes.Stem import Stem
 from classes.Timer import Timer
+from utils import Log
 from utils.Geometry import ang
 from utils.IO import get_bounds_from_profile
 
@@ -125,15 +126,26 @@ def _remove_duplicates_against_base(
 
 
 # Spatial-index accelerated version of connect_stems
-def connect_stems(stems: List[Stem], config) -> List[Stem]:
+def connect_stems(stems: List[Stem], config, scope: str = None) -> List[Stem]:
+    """Join stem parts into stems.
+
+    ``scope`` names the piece of work this call covers, and only affects
+    logging. The tiled vector stage runs one call per tile and passes the
+    tile label, so its counts are visibly per-tile intermediates rather
+    than the run's answer (the run's answer is the merge stage's
+    ``Total stems written``). Leave it ``None`` for the un-tiled path,
+    where the call does cover the whole raster.
+    """
     max_distance = config.max_distance
     max_tree_height = config.max_tree_height
     tolerance_angle = config.tolerance_angle
 
+    prefix = f"{scope}: " if scope else ""
+
     t = Timer()
     t.start()
-    print("#######################################################")
-    print("Gathering stem segments")
+    Log.debug("#######################################################")
+    Log.debug(f"{prefix}Gathering stem segments")
 
     cycle_nbr = 1
     c_count = 0
@@ -144,7 +156,7 @@ def connect_stems(stems: List[Stem], config) -> List[Stem]:
 
     while global_change:
         global_change = False
-        print("Cycle ", cycle_nbr)
+        Log.debug(f"{prefix}Cycle {cycle_nbr}")
         cycle_stems = list(stems)
         if not cycle_stems:
             break
@@ -232,16 +244,22 @@ def connect_stems(stems: List[Stem], config) -> List[Stem]:
     connected_stems, dup_count_2 = remove_duplicates(connected_stems)
     duplicates_count += dup_count_2
 
-    print("")
-    print(count_stem_parts, "stem segments analyzed")
-    print(c_count, "stem segments appended to other stems")
-    print(duplicates_count, "duplicates are removed")
-    print(out_count, "stem fragments with a length less than ",
-          config.min_length, "m are filtered out")
-    print("final number of stems", len(connected_stems))
+    Log.debug("")
+    Log.debug(f"{prefix}Stem segments analyzed: {count_stem_parts}")
+    Log.debug(f"{prefix}Segments appended to other stems: {c_count}")
+    Log.debug(f"{prefix}Duplicates removed: {duplicates_count}")
+    Log.debug(f"{prefix}Fragments shorter than {config.min_length} m "
+              f"filtered out: {out_count}")
+    if scope:
+        # Deliberately not "final": this is one tile of many, and the
+        # run's answer is the merge stage's "Total stems written".
+        Log.debug(f"{scope}: {len(connected_stems)} stems after connect "
+                  f"(per-tile intermediate, not the run total)")
+    else:
+        Log.debug(f"Stems after connect: {len(connected_stems)}")
     t.stop()
-    print("#######################################################")
-    print("")
+    Log.debug("#######################################################")
+    Log.debug("")
     return connected_stems
 
 
@@ -407,8 +425,8 @@ def build_stem_parts(segments: List[Part]):
 
     t = Timer()
     t.start()
-    print("#######################################################")
-    print("Build stem segments")
+    Log.debug("#######################################################")
+    Log.debug("Building stem parts")
     stems = []
     for i in range(len(segments)):
         if segments[i].start[1] >= segments[i].stop[1]:
@@ -427,26 +445,26 @@ def build_stem_parts(segments: List[Part]):
                     [], [], [])
         stems.append(stem)
 
-    print(len(stems), "stems segments build")
+    Log.debug(f"Stem parts built: {len(stems)}")
 
     t.stop()
-    print("#######################################################")
-    print("")
+    Log.debug("#######################################################")
+    Log.debug("")
     return stems
 
 
 def rebuild_endnodes_from_stems(stems: List[Stem]) -> List[Point]:
     t = Timer()
     t.start()
-    print("#######################################################")
-    print("Rebuild endnodes from stems")
+    Log.debug("#######################################################")
+    Log.debug("Rebuilding end nodes from stems")
     nodes = []
     for s in stems:
         nodes.append(s.start.coords)
         nodes.append(s.stop.coords)
     t.stop()
-    print("#######################################################")
-    print("")
+    Log.debug("#######################################################")
+    Log.debug("")
     return nodes
 
 
@@ -507,8 +525,8 @@ def restore_geoinformation(stems: List[Stem], config, profile):
     t = Timer()
     t.start()
 
-    print("#######################################################")
-    print("Restoring geoinformation")
+    Log.debug("#######################################################")
+    Log.debug("Restoring geoinformation")
 
     px_size_x = abs(profile['transform'][0])
     px_size_y = abs(profile['transform'][4])
@@ -530,6 +548,6 @@ def restore_geoinformation(stems: List[Stem], config, profile):
             )
 
     t.stop()
-    print("#######################################################")
-    print("")
+    Log.debug("#######################################################")
+    Log.debug("")
     return stems
