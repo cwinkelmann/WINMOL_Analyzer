@@ -289,7 +289,7 @@ def load_stem_map(path):
         Log.debug("#" * 55)
         Log.debug("#" * 55)
         Log.debug("")
-        Log.debug(path)
+        Log.debug(f"Loading stem map: {path}")
         Log.debug("")
         with rasterio.open(path) as src:
             pred = src.read(1)
@@ -1253,7 +1253,7 @@ def merge_selected_tile_results(
         written_gpkg = _write_merged(
             output_gpkg, merged_stems, merged_nodes, merged_vectors)
         print("")
-        print("MERGE SUMMARY")
+        print("MERGE SUMMARY (final result for this run)")
         print(f"Tiles processed:       {tile_count}")
         print(f"Total stems written:   {total_stems}")
         print(f"Total nodes written:   {total_nodes}")
@@ -1261,7 +1261,7 @@ def merge_selected_tile_results(
         print(f"Output saved to: {written_gpkg}")
     else:
         print("")
-        print("MERGE SUMMARY")
+        print("MERGE SUMMARY (final result for this run)")
         print("Tiles processed:       0")
         print("Total stems written:   0")
         print("Total nodes written:   0")
@@ -1503,8 +1503,9 @@ def _reconstruct_edge_stems_for_tiled_merge(
     else:
         recon_cfg = config
 
-    connected_edge_stems = \
-        Vec.connect_stems(list(original_edge_stems), recon_cfg)
+    connected_edge_stems = Vec.connect_stems(
+        list(original_edge_stems), recon_cfg,
+        scope="Merge edge reconnect")
 
     # Quantify the direct connect_stems outputs so their lengths/volumes are
     # consistent with the merged geometry. connect_stems now merges the
@@ -1530,7 +1531,7 @@ def _reconstruct_edge_stems_for_tiled_merge(
     print(
         f"MERGE EDGE CONNECT | inner {len(inner_stems)} | "
         f"connected_edge {len(quantified_edge_stems)} | "
-        f"final {len(final_stems)}",
+        f"stems {len(final_stems)}",
         flush=True,
     )
     return _stems_to_layer_gdfs(final_stems, target_crs, config=recon_cfg)
@@ -1639,7 +1640,7 @@ def merge_and_filter_tiled_results(
         final_vector_count = 0 if vectors_gdf is None else len(vectors_gdf)
 
         print("")
-        print("MERGE SUMMARY")
+        print("MERGE SUMMARY (final result for this run)")
         print(f"Tiles processed:       {tile_count}")
         print(f"Total stems written:   {final_stem_count}")
         print(f"Total nodes written:   {final_node_count}")
@@ -1648,7 +1649,7 @@ def merge_and_filter_tiled_results(
         print(f"Output saved to: {written_gpkg}")
     else:
         print("")
-        print("MERGE SUMMARY")
+        print("MERGE SUMMARY (final result for this run)")
         print("Tiles processed:       0")
         print("Total stems written:   0")
         print("Total nodes written:   0")

@@ -159,7 +159,10 @@ def _run_vector_pipeline(
         )
 
     t0 = time.perf_counter()
-    stems = Vec.connect_stems(stems, config)
+    # Name the tile so connect_stems' counts read as per-tile
+    # intermediates: this runs once per tile, and the run's answer is
+    # the merge stage's "Total stems written".
+    stems = Vec.connect_stems(stems, config, scope=f'Tile {tile_label}')
     timings['connect_s'] = time.perf_counter() - t0
     if not stems:
         timings['total_s'] = time.perf_counter() - total_t0
@@ -417,8 +420,10 @@ def _print_vector_summary(
     print(f'Tiles with foreground: {total - totals["empty_tiles"]}')
     print(f'Tiles written:         {totals["written_tiles"]}')
     print(f'Tiles without output:  {totals["no_output_tiles"]}')
-    print(f'Total segments:        {totals["segment_count"]}')
-    print(f'Total stems:           {totals["stem_count"]}')
+    print(f'Segments (all tiles):  {totals["segment_count"]}')
+    # Summed over tiles, before the merge stage dedups across seams --
+    # so this is not the run's stem count. See "Total stems written".
+    print(f'Stems before merge:    {totals["stem_count"]}')
     print(f'Elapsed:               {elapsed:.3f}s')
     print(
         f'Avg timed tile:        {totals["total_s"] / timed_tiles:.3f}s '

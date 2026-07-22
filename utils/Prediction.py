@@ -710,7 +710,7 @@ def predict_stream_to_raster(
             raise producer.error
     IO.finalize_raster(tmp_path, output_stem_map)
 
-    print(total_tiles, " tiles analyzed")
+    print(f"Tiles analyzed: {total_tiles}")
     t.stop()
     print("#######################################################")
     print("")
@@ -764,7 +764,7 @@ def predict_with_resampling_per_tile(img, profile, model, config):
     prediction = np.ascontiguousarray((prediction > 0) & mask, dtype=np.uint8)
 
     profile['transform'] = layout['out_transform']
-    print(layout['x_tiles'] * layout['y_tiles'], " tiles analyzed")
+    print(f"Tiles analyzed: {layout['x_tiles'] * layout['y_tiles']}")
     t.stop()
     print("#######################################################")
     print("")

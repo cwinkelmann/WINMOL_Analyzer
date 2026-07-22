@@ -63,8 +63,8 @@ def quantify_stems(stems: List[Stem], pred, profile, config=None):
     Log.debug("#######################################################")
     Log.debug("Quantifying stems")
     if not stems:
-        Log.debug("0 measurements of diameters where conducted")
-        Log.debug("Volume of  0  stems calculated")
+        Log.debug("Diameter measurements taken: 0")
+        Log.debug("Volumes calculated for 0 stems")
         t.stop()
         Log.debug("#######################################################")
         Log.debug("")
@@ -92,7 +92,7 @@ def quantify_stems(stems: List[Stem], pred, profile, config=None):
             for stem in pool.imap_unordered(quantify_stem, stems_):
                 stems__.append(stem)
 
-    Log.debug("Volume of ", len(stems__), " stems calculated")
+    Log.debug(f"Volumes calculated for {len(stems__)} stems")
     t.stop()
     Log.debug("#######################################################")
     Log.debug("")
@@ -174,7 +174,7 @@ def get_diameters(stems: List[Stem], pred, profile, config=None):
                 for r_ in r:
                     r_.wait()
 
-    Log.debug(diam_count, " measurements of diameters where conducted")
+    Log.debug(f"Diameter measurements taken: {diam_count}")
     return measured_stems
 
 
