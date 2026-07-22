@@ -94,11 +94,16 @@ def cropped_ortho(tmp_path):
     return str(out)
 
 
-def test_model_forward_pass_runs_on_metal(
-    metal_gpu, model_path, standalone_mod
-):
-    """The U-Net loads and its forward pass executes on the Metal GPU."""
-    model = standalone_mod.keras.models.load_model(model_path, compile=False)
+def test_model_forward_pass_runs_on_metal(metal_gpu, model_path):
+    """The U-Net loads and its forward pass executes on the Metal GPU.
+
+    Loads through tf.keras directly: the TF-free ONNX migration removed the
+    `keras` re-export from the standalone module, so going through
+    standalone_mod raised AttributeError and left this test permanently red.
+    The intent — a real forward pass on the Metal PluggableDevice — is
+    unchanged; only the loader it reaches for.
+    """
+    model = tf.keras.models.load_model(model_path, compile=False)
     x = np.random.rand(1, 512, 512, 3).astype("float32")
     with tf.device("/GPU:0"):
         y = model(x, training=False)
