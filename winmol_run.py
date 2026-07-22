@@ -173,6 +173,17 @@ class ImageProcessing:
         if getattr(hardware, 'accelerator', 'cpu') == 'cuda' \
                 and hardware.gpu_names:
             print(f"Visible GPUs: {hardware.gpu_names}")
+        # The RTX-4080 case: the GPU is right there, but the installed
+        # onnxruntime has no CUDA provider, so the run silently crawled on the
+        # CPU. Name the hardware and the remedy instead of staying quiet.
+        unusable = list(getattr(hardware, 'unusable_gpu_names', []) or [])
+        if unusable:
+            print(
+                f"WARNING: nvidia-smi reports {unusable} but this onnxruntime "
+                "build cannot use them (CPUExecutionProvider only), so "
+                "inference will run on the CPU. Install onnxruntime-gpu to "
+                "use them — see docs/GPU.md."
+            )
         return hardware
 
     def build_plan(self, hardware=None):
@@ -219,6 +230,37 @@ class ImageProcessing:
         self.config.prediction_producer_workers = plan.producer_workers
         self.config.progress_interval_s = plan.progress_interval_s
 
+    def _correct_accelerator_after_load(self, model):
+        """Reconcile the banner with the session that actually got built.
+
+        "Hardware detected: ..." is printed before the model is loaded, so it
+        can only state an EXPECTATION. Once onnxruntime has bound its
+        providers we know the truth; if it differs, say so and downgrade the
+        recorded hardware so nothing downstream keeps sizing a GPU run for a
+        CPU session.
+        """
+        active_kind = getattr(model, 'accelerator', None)
+        if not active_kind:
+            return
+        hardware = getattr(self.config, 'hardware', None)
+        expected = getattr(hardware, 'accelerator', None) if hardware else None
+        if expected is None or active_kind == expected:
+            return
+        label = getattr(model, 'accelerator_label', active_kind)
+        expected_label = getattr(hardware, 'accelerator_label', expected)
+        print(
+            f"Correction: inference is running on {label} "
+            f"(expected {expected_label})."
+        )
+        hardware.accelerator = active_kind
+        hardware.accelerator_label = label
+        if active_kind == 'cpu':
+            if getattr(hardware, 'gpu_names', None):
+                hardware.unusable_gpu_names = list(hardware.gpu_names)
+            hardware.gpu_names = []
+            hardware.gpu_memory_gb = []
+            hardware.gpu_count = 0
+
     def run_prediction_phase(self, plan):
         if plan.prediction_mode == 'multi_gpu_stream' and plan.gpu_workers > 1:
             from utils.PredictWorkers import run_multi_gpu_prediction
@@ -243,6 +285,7 @@ class ImageProcessing:
 
         print("\nLoading Model...")
         model = IO.load_model_from_path(self.model_path)
+        self._correct_accelerator_after_load(model)
         print("\nPerforming prediction with resampling (stream mode)...")
         profile = Pred.predict_stream_to_raster(
             self.uav_path,
@@ -387,7 +430,26 @@ class ImageProcessing:
             if report['override']:
                 selected += f" (forced by {report['override']})"
             print(selected)
-            print(f"  Device: {report['accelerator_label']}")
+            # Prefer the OBSERVED session over the requested list. A requested
+            # provider that failed to bind would otherwise be reported as the
+            # device, which is exactly the lie this guards against.
+            #
+            # Only trust the observation if it describes THIS provider
+            # request: a report left behind by a session built under a
+            # different configuration (batch runs load a model per image) says
+            # nothing about the run being reported now.
+            active = onnx_runtime.last_active_report()
+            if active is not None and (
+                    list(active.get('requested_providers') or [])
+                    != list(report['selected_providers'])):
+                active = None
+            if active is not None:
+                print("  Active providers: "
+                      + ", ".join(active['active_providers']))
+                print(f"  Device: {active['accelerator_label']} (verified)")
+            else:
+                print(f"  Device: {report['accelerator_label']} "
+                      "(expected; not yet verified against a session)")
 
         driver = _nvidia_driver_version()
         if driver:
