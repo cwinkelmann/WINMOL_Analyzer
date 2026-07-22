@@ -314,6 +314,17 @@ def build_execution_plan(
             _cfg(config, 'progress_interval_s_multi_gpu', 20.0)
         )
 
+    # Apple Silicon: cap the micro-batch. The tiers above size the batch from
+    # (unified) memory, which on CoreML buys nothing -- per-image cost rises
+    # with batch size instead of falling (see Config.prediction_batch_max_coreml
+    # for the measurements). Applied after every branch so it covers whichever
+    # prediction_mode was chosen.
+    if getattr(hardware, 'accelerator', None) == 'coreml':
+        coreml_cap = _cfg(config, 'prediction_batch_max_coreml', 2)
+        if coreml_cap is not None:
+            prediction_batch_size = max(
+                1, min(int(prediction_batch_size), int(coreml_cap)))
+
     vector_tile_workers, vector_inner_workers = _vector_worker_split(
         config,
         hw_cpu,

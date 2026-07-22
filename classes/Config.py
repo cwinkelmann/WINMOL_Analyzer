@@ -38,6 +38,21 @@ class Config(object):
     prediction_batch_autotune_min_improve = 0.005
     prediction_batch_autotune_stop_on_oom = True
     prediction_batch_autotune_quiet = True
+    # Abandon the sweep as soon as a candidate is this much slower than the
+    # best seen. `patience` alone is not enough when the curve degrades
+    # monotonically: on CoreML/CPU every larger batch is worse AND costs more
+    # to measure, so patience=4 keeps timing ever more expensive losers (a
+    # user reported b4..b9 rising 0.340 -> 1.135 s/tile without stopping).
+    # 0 disables the guard.
+    prediction_batch_autotune_runaway_factor = 1.5
+    # CoreML (Apple Silicon) prices batching very differently from CUDA: it
+    # runs 69 of this U-Net's 74 nodes, but per-image cost RISES monotonically
+    # with batch size. Measured on Spruce.onnx (M2, onnxruntime 1.27):
+    #   b1 0.228  b2 0.285  b6 0.435  b8 0.498  s/image
+    # i.e. the memory-derived default of 4-8 is ~2x slower per tile than b1.
+    # Batch size does not affect output (verified: max abs diff 0.0 b1/b4/b8),
+    # so this is a pure throughput cap. Set None to disable.
+    prediction_batch_max_coreml = 2
     progress_interval_s_cpu = 45.0
     progress_interval_s_gpu = 60.0
     progress_interval_s_multi_gpu = 20.0
