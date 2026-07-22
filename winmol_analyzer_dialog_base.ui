@@ -176,7 +176,20 @@
                 </property>
                </widget>
               </item>
-              <item row="3" column="0">
+              <item row="3" column="0" colspan="5">
+               <widget class="QLabel" name="env_accel_label">
+                <property name="styleSheet">
+                 <string notr="true">color: gray;</string>
+                </property>
+                <property name="text">
+                 <string>Checking which processor will run the detection…</string>
+                </property>
+                <property name="wordWrap">
+                 <bool>true</bool>
+                </property>
+               </widget>
+              </item>
+              <item row="4" column="0">
                <widget class="QPushButton" name="env_create_button">
                 <property name="text">
                  <string>Create environment for me</string>
@@ -186,21 +199,21 @@
                 </property>
                </widget>
               </item>
-              <item row="3" column="1">
+              <item row="4" column="1">
                <widget class="QPushButton" name="env_choose_button">
                 <property name="text">
                  <string>Choose interpreter…</string>
                 </property>
                </widget>
               </item>
-              <item row="3" column="2">
+              <item row="4" column="2">
                <widget class="QPushButton" name="env_repair_button">
                 <property name="text">
                  <string>Reinstall dependencies</string>
                 </property>
                </widget>
               </item>
-              <item row="3" column="3">
+              <item row="4" column="3">
                <spacer name="horizontalSpacer_setup_env">
                 <property name="orientation">
                  <enum>Qt::Horizontal</enum>
@@ -213,14 +226,27 @@
                 </property>
                </spacer>
               </item>
-              <item row="3" column="4">
+              <item row="4" column="4">
                <widget class="QPushButton" name="env_delete_button">
                 <property name="text">
                  <string>Delete environment…</string>
                 </property>
                </widget>
               </item>
-              <item row="4" column="0" colspan="3">
+              <item row="5" column="0" colspan="3">
+               <widget class="QPushButton" name="env_gpu_button">
+                <property name="toolTip">
+                 <string>Replace the CPU-only inference runtime with the CUDA
+    one (onnxruntime-gpu, about 2.4 GB to download). Measured on an RTX 4080
+    SUPER: 12 ms per image tile against 5.3 s on the CPU. Enabled only when an
+    NVIDIA GPU is present and the installed runtime cannot use it.</string>
+                </property>
+                <property name="text">
+                 <string>Install GPU runtime…</string>
+                </property>
+               </widget>
+              </item>
+              <item row="6" column="0" colspan="3">
                <widget class="QPushButton" name="autotune_clear_button">
                 <property name="toolTip">
                  <string>Forget the measured prediction batch size. It is

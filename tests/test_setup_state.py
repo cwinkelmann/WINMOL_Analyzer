@@ -508,7 +508,8 @@ def test_deletion_plan_lists_only_what_exists(tmp_path):
     assert plan["clears_setting"] is False
 
 
-@pytest.mark.parametrize("module", ["setup_state.py", "model_status.py"])
+@pytest.mark.parametrize("module", ["setup_state.py", "model_status.py",
+                                    "gpu_probe.py"])
 def test_the_decision_modules_import_nothing_from_qt(module):
     """They must stay usable on a machine with no QGIS — that is the
     whole reason the Setup tab's logic lives outside the dialog."""

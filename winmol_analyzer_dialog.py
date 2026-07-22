@@ -59,6 +59,7 @@ SETUP_BUTTONS = (
     "env_choose_button",
     "env_repair_button",
     "env_delete_button",
+    "env_gpu_button",
     "models_download_button",
     "models_download_default_button",
     "models_verify_button",
@@ -163,6 +164,11 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         # seconds of a frozen GUI if done here.
         self._env_info_cache = None
         self._env_usage_cache = None
+        # Which processor will run the detection, per the last probe. None
+        # means "not measured yet" and is displayed as such: nvidia-smi and
+        # the child's provider list are both subprocesses, so an honest
+        # answer is only ever available from EnvProbeWorker.
+        self._accel_cache = None
         # Read-only environment probe. Deliberately NOT part of _busy_kind():
         # it creates and deletes nothing, so it must never disable a button
         # or block a run. It IS reaped by _shutdown_threads.
@@ -329,6 +335,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         ("env_choose_button", "clicked", "_choose_interpreter"),
         ("env_repair_button", "clicked", "_setup_repair_env"),
         ("env_delete_button", "clicked", "_setup_delete_env"),
+        ("env_gpu_button", "clicked", "_setup_install_gpu_runtime"),
         ("autotune_clear_button", "clicked", "_setup_clear_autotune"),
         ("models_variants_checkBox", "stateChanged", "_refresh_model_tree"),
         ("models_refresh_button", "clicked", "_setup_rescan"),
@@ -1580,6 +1587,10 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         if force:
             self._env_info_cache = None
             self._env_usage_cache = None
+            # The accelerator verdict is a property of the environment that
+            # just changed, so a stale one would keep claiming CUDA over an
+            # env that no longer has it.
+            self._accel_cache = None
         if self._env_info_cache is None:
             self._env_info_cache = setup_state.env_seed(
                 self._plugin_dir(), self.python_exe, self.env)
@@ -1595,6 +1606,19 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         show a size" rather than as an error.
         """
         return self._env_usage_cache or {}
+
+    def _accel_status(self):
+        """The :class:`setup_state.AcceleratorStatus` from the last probe.
+
+        Never measured here — deciding it costs an nvidia-smi call and a
+        child-interpreter launch, which is exactly the kind of work that
+        has frozen this dialog twice. Until EnvProbeWorker reports, the
+        pure ``accelerator_status(None, None)`` says "checking…" and
+        claims nothing.
+        """
+        if self._accel_cache is None:
+            return setup_state.accelerator_status()
+        return self._accel_cache
 
     # --- the read-only environment probe -------------------------------
 
@@ -1644,6 +1668,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             return
         self._env_info_cache = result.get("info")
         self._env_usage_cache = result.get("usage") or {}
+        self._accel_cache = result.get("accel")
         self._refresh_setup_state()
 
     def _on_env_probe_failed(self, msg):
@@ -1713,19 +1738,48 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             f"Installing dependencies into {exe}. This can take several "
             "minutes; progress appears below…", target_exe=exe)
 
-    def _create_environment(self):
+    def _confirm_gpu_runtime(self):
+        """Ask whether to install the CUDA runtime. True only on an
+        explicit Yes.
+
+        Reads the CACHED accelerator verdict — no nvidia-smi, no child
+        interpreter, nothing that could block the GUI thread. When the
+        machine has no usable NVIDIA GPU (or the probe has not landed yet)
+        there is no question to ask and the answer is False.
+        """
+        status = self._accel_status()
+        if not status.can_install:
+            return False
+        reply = QtWidgets.QMessageBox.question(
+            self, self.tr(setup_state.TXT_GPU_OFFER_TITLE),
+            self.tr(setup_state.TXT_GPU_OFFER).format(gpu=status.gpu_label),
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.Yes)
+        chosen = reply == QtWidgets.QMessageBox.Yes
+        self._append_setup_detail(
+            f"Installing the GPU runtime for {status.gpu_label}."
+            if chosen else
+            "Installing the CPU-only runtime. You can add the GPU runtime "
+            "later from the Setup tab.")
+        return chosen
+
+    def _create_environment(self, gpu=False):
         """Build the compute environment (download Python 3.11 if needed, make
         the venv, pip-install deps) on a background thread so QGIS stays
         responsive. Progress streams to the log."""
         self._start_env_worker(
-            "Setting up the WINMOL environment (Python 3.11 + onnxruntime + "
-            "geo libraries). First run downloads a few hundred MB and can "
-            "take several minutes; progress appears below…")
+            "Setting up the WINMOL environment (Python 3.11 + "
+            + ("onnxruntime-gpu" if gpu else "onnxruntime")
+            + " + geo libraries). First run downloads "
+            + ("about 2.4 GB" if gpu else "a few hundred MB")
+            + " and can take several minutes; progress appears below…",
+            gpu=gpu)
 
-    def _start_env_worker(self, banner, target_exe=None):
+    def _start_env_worker(self, banner, target_exe=None, gpu=False):
         """Run an environment build on the env thread pair."""
         from .tasks_threads import EnvSetupWorker
-        worker = EnvSetupWorker(self._plugin_dir(), target_exe=target_exe)
+        worker = EnvSetupWorker(self._plugin_dir(), target_exe=target_exe,
+                                gpu=gpu)
         return self._start_env_job(worker, banner, self._on_env_ready,
                                    self._on_env_failed)
 
@@ -2079,6 +2133,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self._set_label("env_path_label", info.exe or "")
         self._set_label("env_detail_label",
                         setup_state.env_detail_text(info, self._env_usage()))
+        self._set_label("env_accel_label", self._accel_status().text)
         self._model_rows = self._scan_models()
         self._refresh_model_tree()      # ...which applies the interlock
         self._apply_blocking_reason(info)
@@ -2263,7 +2318,8 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             row.entry_id if row is not None else None,
             run_active=self._run_active,
             env_busy=self._env_thread is not None,
-            dl_busy=self._dl_thread is not None)
+            dl_busy=self._dl_thread is not None,
+            accel=self._accel_status())
         for name in SETUP_BUTTONS + SETUP_INPUTS:
             widget = getattr(self, name, None)
             if widget is None:
@@ -2296,7 +2352,53 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         if self._busy():
             self._refuse_while_busy()
             return
-        self._create_environment()
+        # Asked BEFORE the build, not bolted on afterwards: an NVIDIA box
+        # that gets the CPU runtime here has to download the whole
+        # environment twice. The question is skipped entirely when the
+        # answer could only be "no".
+        self._create_environment(gpu=self._confirm_gpu_runtime())
+
+    def _setup_install_gpu_runtime(self):
+        """Swap the CPU-only inference runtime for the CUDA one.
+
+        Explicit by construction. 2.4 GB is not something to start on a
+        user's behalf, so the confirmation names the GPU, the download
+        size and the measured speed-up, and "No" is a real answer that
+        leaves a perfectly working CPU environment in place.
+
+        The marker is invalidated first for the same reason
+        _setup_repair_env does it: setup_environment short-circuits on a
+        valid sentinel, so the install would otherwise be a no-op.
+        """
+        if self._busy():
+            self._refuse_while_busy()
+            return
+        status = self._accel_status()
+        if not status.can_install:
+            self._append_setup_detail(status.text)
+            return
+        if not self._confirm_gpu_runtime():
+            return
+        installer.invalidate_marker(installer.venv_location(
+            self._plugin_dir()))
+        self._env_info_cache = None
+        self._accel_cache = None
+        self._start_env_worker(
+            f"Installing the GPU runtime for {status.gpu_label} "
+            "(onnxruntime-gpu, about 2.4 GB). pip streams its progress "
+            "below and QGIS stays usable…",
+            target_exe=self._byo_interpreter(), gpu=True)
+
+    def _byo_interpreter(self):
+        """The user's own interpreter when that is what we are pointed at,
+        else None so the managed venv is rebuilt instead. Installing the
+        GPU runtime has to land in the SAME environment the detection runs
+        in, whichever of the two that is."""
+        exe = (self.python_exe or "").strip()
+        if not exe:
+            return None
+        venv = installer.venv_location(self._plugin_dir())
+        return None if installer.path_is_inside(exe, venv) else exe
 
     def _setup_clear_autotune(self):
         """Forget the persisted prediction batch-size measurement.
@@ -2333,13 +2435,22 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         # (the guard above is the first statement of every _setup_* slot;
         #  an AST test pins that, because the button interlock alone is
         #  reachable around — models_treeWidget's double-click was.)
-        installer.invalidate_marker(installer.venv_location(
-            self._plugin_dir()))
+        venv = installer.venv_location(self._plugin_dir())
+        # Which runtime this environment was built with, read BEFORE the
+        # sentinel is dropped: a repair that quietly reinstalled the CPU
+        # runtime over a working CUDA one would undo a 2.4 GB download the
+        # user asked for, and look like a random slowdown afterwards. Pure
+        # file I/O, so it is safe here.
+        gpu = installer.marker_variant(venv) == "gpu"
+        installer.invalidate_marker(venv)
         self._env_info_cache = None
+        self._accel_cache = None
         self._start_env_worker(
-            "Reinstalling the WINMOL dependencies. pip can take up to 60 "
-            "min on a slow link; it is safe to leave running and QGIS "
-            "stays usable…")
+            "Reinstalling the WINMOL "
+            + ("GPU " if gpu else "")
+            + "dependencies. pip can take up to 60 min on a slow link; it "
+            "is safe to leave running and QGIS stays usable…",
+            gpu=gpu)
 
     def _setup_delete_env(self):
         """Delete the managed environment, with an explicit confirmation
