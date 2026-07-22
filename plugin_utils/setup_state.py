@@ -485,8 +485,9 @@ def requirements_choice(probe) -> str:
     wedged, macOS, ARM — is a unit test rather than a machine somebody
     has to own.
     """
-    return "plugin-gpu.txt" if (probe is not None
-                                and probe.present) else "plugin.txt"
+    return (installer.GPU_REQUIREMENTS if (probe is not None
+                                           and probe.present)
+            else installer.CPU_REQUIREMENTS)
 
 
 def gpu_offer_text(probe) -> str:

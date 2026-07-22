@@ -434,7 +434,7 @@ class ImageProcessing:
 
         Models are ONNX and run through onnxruntime; TensorFlow/CUDA versions
         say nothing about that, and TensorFlow being absent is the normal,
-        expected state of the plugin environment (requirements/plugin.txt).
+        expected state of the plugin environment (requirements/cpu.txt).
         """
         print("Environment:")
         try:

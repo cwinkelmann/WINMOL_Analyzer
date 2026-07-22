@@ -8,7 +8,7 @@ name: Plugin environment (Windows / macOS / Linux)
 # provisions everything from scratch on each OS.
 #
 # isolation   -- the env-leak regression net. Stdlib only, ~1 min, BLOCKING.
-# deps        -- really pip-installs requirements/plugin.txt and exercises the
+# deps        -- really pip-installs requirements/cpu.txt and exercises the
 #                GDAL vendored inside the rasterio/pyogrio wheels.
 
 on:
@@ -87,7 +87,7 @@ jobs:
       - name: Create the compute venv the way the plugin does
         run: python -m venv winmol_venv
 
-      - name: Install requirements/plugin.txt
+      - name: Install requirements/cpu.txt
         # The real check: onnxruntime + the geo stack must resolve to binary
         # wheels on every platform. --only-binary means a missing wheel fails
         # loudly here instead of silently trying to compile GDAL on a user's
@@ -98,7 +98,7 @@ jobs:
           else PY=winmol_venv/bin/python; fi
           echo "PY=$PY" >> "$GITHUB_ENV"
           "$PY" -m pip install --upgrade pip
-          "$PY" -m pip install --only-binary=:all: -r requirements/plugin.txt
+          "$PY" -m pip install --only-binary=:all: -r requirements/cpu.txt
 
       - name: Verify the vendored GDAL actually works
         # rasterio and pyogrio each bundle their own GDAL/PROJ. This opens the

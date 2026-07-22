@@ -36,9 +36,13 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends libexpat1 \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=convert /opt/winmol/model_onnx/ /opt/winmol/model_onnx/
-# geo.txt too: base.txt is `-r geo.txt` + the CPU runtime, so omitting it here
-# would break the build with a missing-file error.
-COPY requirements/geo.txt requirements/base.txt requirements/ci.txt /tmp/req/
+# THIS IMAGE INSTALLS WHAT USERS INSTALL. ci.txt is `-r cpu.txt` + pytest, and
+# cpu.txt is `-r core.txt`, so the whole chain must be COPYed: pip resolves
+# each include relative to the file, and a missing one fails the build.
+# Any change to the `-r` graph must be mirrored here -- see
+# requirements/README.md, "The four environments", for why the chain ends at
+# cpu.txt and not at core.txt.
+COPY requirements/core.txt requirements/cpu.txt requirements/ci.txt /tmp/req/
 RUN pip install --no-cache-dir -r /tmp/req/ci.txt \
  && rm -rf /tmp/req
 # Golden fixtures are only reproducible under a fixed hash seed (review A-4);

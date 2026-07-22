@@ -17,7 +17,7 @@ on:
   pull_request:
     paths:
       - "docker/gpu/**"
-      - "requirements/geo.txt"
+      - "requirements/core.txt"
       - "requirements/gpu.txt"
       - ".github/workflows/gpu-image.yml"
   workflow_dispatch:

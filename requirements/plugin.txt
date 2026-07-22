@@ -1,9 +1,0 @@
-# QGIS plugin compute environment — TF-free, ONNX inference only.
-#
-# The plugin creates a venv from this file (or the user points at an existing
-# interpreter). base.txt already pins the geo stack + onnxruntime; onnxruntime
-# and the rasterio/geopandas/shapely wheels install cleanly on macOS, Linux and
-# Windows with no CUDA/Metal toolchain. NO TensorFlow.
--r base.txt
-# used by the dialog to report available RAM (optional; degrades gracefully)
-psutil>=5.9

@@ -44,7 +44,15 @@ RUN apt-get update \
 
 # Dependencies first, in their own layer, so code changes do not reinstall the
 # ~2 GB of CUDA wheels.
-COPY requirements/geo.txt requirements/gpu.txt /tmp/req/
+# core.txt too: gpu.txt is `-r core.txt` + the CUDA wheel + psutil, and pip
+# resolves that include relative to the file, so omitting it breaks the build
+# with a missing-file error -- see requirements/README.md.
+#
+# This is the SAME file the QGIS plugin installs on an NVIDIA machine, so
+# container/plugin parity on the GPU path holds by construction: there is no
+# second declaration that could drift. That was not true of the plugin-gpu.txt
+# era -- the container's copy of the CUDA window had already lost its ceiling.
+COPY requirements/core.txt requirements/gpu.txt /tmp/req/
 RUN pip install --no-cache-dir -r /tmp/req/gpu.txt \
  && rm -rf /tmp/req
 

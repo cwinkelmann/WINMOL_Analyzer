@@ -2,14 +2,14 @@
 
 The plugin never runs inference in QGIS's own interpreter; it shells out to
 ``winmol_run.py`` in a separate Python environment that has the compute deps
-(requirements/plugin.txt — onnxruntime + the geo stack, NO TensorFlow).
+(requirements/cpu.txt — onnxruntime + the geo stack, NO TensorFlow).
 
 Two ways to get that environment:
   1. Point the plugin at an EXISTING interpreter (QgsSettings key
      ``winmol/python_executable``) — a conda env, the CI docker image's python,
      any venv with the deps. Most robust.
   2. Let the plugin create a venv next to itself (``winmol_venv``) and
-     pip-install requirements/plugin.txt once.
+     pip-install requirements/cpu.txt once.
 
 Design notes (fixing the old flaky installer):
 - Import-safe without QGIS/PyQt: Qt and QgsSettings are imported lazily inside
@@ -88,21 +88,28 @@ def repo_requirements_dir() -> Path:
     return Path(_PLUGIN_DIR, "requirements")
 
 
+#: The two installable compute environments, by the file that defines them.
+#: See requirements/README.md: cpu.txt is core.txt + onnxruntime, gpu.txt is
+#: core.txt + onnxruntime-gpu. Named here once so a rename has one place to
+#: happen; tests/test_requirements_layout.py asserts both exist. These are the
+#: same two files the CI and CUDA images build from, which is what makes a CI
+#: run evidence about the environment this installer creates.
+CPU_REQUIREMENTS = "cpu.txt"
+GPU_REQUIREMENTS = "gpu.txt"
+
+
 def plugin_requirements_path(gpu=False) -> Path:
     """The requirements file the compute environment is built from.
 
     ``gpu=True`` selects the CUDA twin (onnxruntime-gpu). It falls back to
-    the CPU file when plugin-gpu.txt is missing, so an incomplete checkout
+    the CPU file when gpu.txt is missing, so an incomplete checkout
     installs a working CPU environment rather than nothing at all.
     """
     if gpu:
-        path = repo_requirements_dir().joinpath("plugin-gpu.txt")
+        path = repo_requirements_dir().joinpath(GPU_REQUIREMENTS)
         if path.exists():
             return path
-    path = repo_requirements_dir().joinpath("plugin.txt")
-    if not path.exists():   # fall back to base if plugin.txt is absent
-        path = repo_requirements_dir().joinpath("base.txt")
-    return path
+    return repo_requirements_dir().joinpath(CPU_REQUIREMENTS)
 
 
 # --- which runtime does this machine want? ----------------------------------
@@ -279,7 +286,7 @@ def cuda_capability_hint(executable) -> str:
     """Warn when an NVIDIA GPU is present but unusable by this environment.
 
     The default environment installs the CPU-only 'onnxruntime' wheel
-    (requirements/plugin.txt -> base.txt), so CUDA is simply not available --
+    (requirements/cpu.txt), so CUDA is simply not available --
     no amount of driver or CUDA toolkit fixes that, because 'onnxruntime-gpu'
     is a different package. Returns "" when there is nothing to say.
 
@@ -322,19 +329,38 @@ def _requirements_hash() -> str:
     return _file_hash(plugin_requirements_path())
 
 
-def _variant_hashes() -> dict:
-    """``{'cpu': hash, 'gpu': hash}`` — the requirement files a sentinel
-    may legitimately record.
+#: Digests of the requirement files shipped BEFORE the requirements/ tidy-up
+#: renamed plugin.txt -> cpu.txt and plugin-gpu.txt -> gpu.txt.
+#:
+#: The sentinel stores the hash of the file it was installed from, so a
+#: rename alone would declare every existing environment stale. The closures
+#: those files installed are a SUPERSET of today's — same pins, plus the
+#: notebook extras (ipykernel, matplotlib) that moved to notebook.txt, and
+#: not one version of the 29 packages that remain changed — so those venvs
+#: are still valid. Accepting them here is what stops the upgrade asking
+#: every existing user to re-download a few hundred MB (CPU) or ~2.4 GB
+#: (GPU) for an environment that already works. They get the slimmer one on
+#: their next genuine reinstall.
+LEGACY_REQ_HASHES = {
+    "cpu": ("ace1011007ef1edc",),    # plugin.txt, v0.6.0.1 .. v0.6.1-rc4
+    "gpu": ("b84b6df907e74baa",),    # plugin-gpu.txt, v0.6.1-rc2 .. rc4
+}
 
-    A GPU environment is installed from plugin-gpu.txt, so its marker
-    carries that file's hash; comparing it only against plugin.txt would
-    declare every GPU install "incomplete" on the next dialog open and
-    offer to reinstall it forever.
+
+def _variant_hashes() -> dict:
+    """``{'cpu': (hash, ...), 'gpu': (hash, ...)}`` — the requirement files
+    a sentinel may legitimately record, current digest first.
+
+    A GPU environment is installed from gpu.txt, so its marker carries that
+    file's hash; comparing it only against cpu.txt would declare every GPU
+    install "incomplete" on the next dialog open and offer to reinstall it
+    forever. Each variant also accepts its :data:`LEGACY_REQ_HASHES`, so a
+    file rename does not force a reinstall either.
     """
-    hashes = {"cpu": _requirements_hash()}
-    gpu_path = repo_requirements_dir().joinpath("plugin-gpu.txt")
+    hashes = {"cpu": (_requirements_hash(),) + LEGACY_REQ_HASHES["cpu"]}
+    gpu_path = repo_requirements_dir().joinpath(GPU_REQUIREMENTS)
     if gpu_path.exists():
-        hashes["gpu"] = _file_hash(gpu_path)
+        hashes["gpu"] = (_file_hash(gpu_path),) + LEGACY_REQ_HASHES["gpu"]
     return hashes
 
 
@@ -351,8 +377,8 @@ def marker_variant(venv_path):
             stored = json.load(f).get("req_hash")
     except Exception:
         return None
-    for variant, digest in _variant_hashes().items():
-        if stored == digest:
+    for variant, digests in _variant_hashes().items():
+        if stored in digests:
             return variant
     return None
 
@@ -898,7 +924,7 @@ def uninstall_conflicting_runtime(python_exe, gpu, progress=None) -> bool:
     """Remove the runtime that must not coexist with the one we install.
 
     onnxruntime and onnxruntime-gpu both provide the ``onnxruntime``
-    module (see the header of requirements/gpu.txt). With both installed,
+    module (see requirements/README.md). With both installed,
     whichever wrote the files last wins and the other's dangling shared
     libraries produce import errors that read like a broken CUDA install.
     pip will not resolve this for us — the two are unrelated names.
@@ -930,7 +956,7 @@ def install_requirements(venv_path, progress=None, gpu=False) -> None:
 
 
 def install_requirements_into(python_exe, progress=None, gpu=False) -> None:
-    """pip-install requirements/plugin.txt into an arbitrary interpreter.
+    """pip-install requirements/cpu.txt into an arbitrary interpreter.
 
     Used both for the managed venv and for an interpreter the user picked in
     the dialog. Streams pip's own output so a multi-minute install visibly
@@ -938,7 +964,7 @@ def install_requirements_into(python_exe, progress=None, gpu=False) -> None:
     indistinguishable from a hang, and ``--progress-bar off`` stops the \\r
     bar spam that a QPlainTextEdit cannot render usefully.
 
-    ``gpu=True`` installs requirements/plugin-gpu.txt instead — the same
+    ``gpu=True`` installs requirements/gpu.txt instead — the same
     environment with onnxruntime-gpu[cuda,cudnn] (about 2.4 GB) in place of
     onnxruntime. Either way the OTHER runtime is uninstalled first; that is
     a correctness requirement, not tidiness.
@@ -1293,7 +1319,7 @@ def setup_environment(venv_path, base_python=None, download=True,
     only on a real environment failure (venv/pip/deps); callers convert that
     to a retry.
 
-    ``gpu=True`` builds the CUDA environment (requirements/plugin-gpu.txt,
+    ``gpu=True`` builds the CUDA environment (requirements/gpu.txt,
     about 2.4 GB). It is passed in rather than detected here: the user has
     to be ASKED before that download starts, and the caller is the one that
     can ask. :func:`detect_gpu` is the detection half.

@@ -1,4 +1,0 @@
-# Windows native GPU via CUDA is only supported up to TensorFlow 2.10, and only on Python <= 3.10.
-# For newer QGIS/Python (3.11/3.12), TensorFlow on native Windows is CPU-only.
-tensorflow==2.10.1; python_version < "3.11"
-tensorflow==2.16.2; python_version >= "3.11"

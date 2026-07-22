@@ -19,7 +19,7 @@ re-tune automatically when any of those change.
 Design constraints
 ------------------
 * **Stdlib only, no Qt/QGIS** — it must import inside the TensorFlow-free
-  compute venv (``requirements/plugin.txt``) *and* inside QGIS's own Python,
+  compute venv (``requirements/cpu.txt``) *and* inside QGIS's own Python,
   the same contract as ``installer.py`` / ``model_registry.py``.
 * **Never fatal.** A missing, truncated, wrong-version or hostile cache file
   degrades to "no cached entry" and a failed write degrades to a logged no-op.

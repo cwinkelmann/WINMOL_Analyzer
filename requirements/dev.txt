@@ -1,0 +1,16 @@
+# THE LOCAL LINT / TEST TOOLCHAIN.
+#
+# WHO: contributors, on top of an environment that already has cpu.txt (or
+#      ci.txt) installed. This file adds tools, not dependencies.
+# WHEN: before running `flake8` (the only automated check in CI, configured in
+#      setup.cfg) or `pytest tests`.
+#
+#     pip install -r requirements/cpu.txt -r requirements/dev.txt
+#
+# CI itself does not install this file: the lint job uses the py-actions/flake8
+# action and the test job runs inside the ci image. Keep the tools in sync with
+# .github/workflows/on-pull-request.yml if that ever changes.
+flake8
+flake8-builtins
+flake8-isort
+pytest

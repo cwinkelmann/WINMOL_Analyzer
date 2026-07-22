@@ -1,25 +1,77 @@
-# CUDA compute environment (docker/gpu/Dockerfile).
+# THE CUDA TWIN OF cpu.txt — same environment, GPU inference runtime.
 #
-# Same geo stack as base.txt, but onnxruntime-gpu in place of onnxruntime —
-# they both provide the `onnxruntime` module and MUST NOT be co-installed, so
-# never combine this file with base.txt, plugin.txt or ci.txt.
+# WHO: the CUDA container (docker/gpu/Dockerfile), and the venv the QGIS plugin
+#      builds when nvidia-smi reports a usable driver (plugin_utils/gpu_probe.py
+#      decides; plugin_utils/installer.py installs).
+# WHEN: NVIDIA GPU on Linux or Windows x86_64. Everything else installs cpu.txt.
 #
-# The notebook/plotting extras in base.txt (ipykernel, matplotlib) are
-# deliberately omitted: nothing on the compute path imports them, and they drag
-# in ipython, jupyter_client, pyzmq, debugpy and tornado.
--r geo.txt
+#     pip install -r requirements/gpu.txt
+#
+# MUST NOT BE COMBINED WITH cpu.txt OR ci.txt. onnxruntime and onnxruntime-gpu
+# both provide the `onnxruntime` module, and pip will happily leave both
+# installed — the loser's shared libraries then shadow the winner's and imports
+# fail in ways that look like a broken CUDA install. plugin_utils/installer.py
+# uninstalls the other distribution before pip runs; that is not
+# belt-and-braces, it is the documented requirement.
+#
+# Hence `-r core.txt`: core.txt carries the geo stack and NO runtime, so this
+# file and cpu.txt can share it without either one leaking a runtime into the
+# other. The notebook/plotting extras live in notebook.txt and are deliberately
+# absent here — nothing on the compute path imports them, and they drag in
+# ipython, jupyter_client, pyzmq, debugpy and tornado.
+-r core.txt
 
-# The [cuda,cudnn] extras pull the CUDA userspace in as wheels, so the image
-# does not need an nvidia/cuda base and cannot mismatch one. The host driver
-# plus nvidia-container-toolkit supply the rest.
+# THE CUDA RUNTIME, AND THE ONLY PLACE IN THIS REPO THAT NAMES IT.
 #
-# VERSION PINNING IS DELIBERATE AND HARDWARE-DEPENDENT. onnxruntime-gpu 1.27
-# moved its extras to CUDA 13 (nvidia-*-cu13); earlier releases use cu12. If the
-# target machine's driver is too old for CUDA 13, pin a cu12-era release here
-# instead. Blackwell (sm_120) in particular needs a recent CUDA — verify on the
-# hardware with the provider check in docker/gpu/README.md before trusting any
-# timing.
-onnxruntime-gpu[cuda,cudnn]
+# This line lived in its own cuda.txt until gpu.txt and plugin-gpu.txt were
+# merged. cuda.txt existed to single-source the version window between those
+# two files; with only one file left there is nothing to keep in sync, and the
+# hop had a cost: every `-r` names a file that MUST be present in the shipped
+# plugin ZIP at install time, so each one is another way a mis-packaged
+# archive fails halfway through pip on a user's machine. Fewer hops, fewer
+# failure modes. tests/test_requirements_layout.py still asserts that the
+# string below appears in exactly ONE file in this directory.
+#
+# THE VERSION WINDOW IS LOAD-BEARING AT BOTH ENDS, AND HARDWARE-DEPENDENT.
+#
+# The [cuda,cudnn] extras ship the CUDA userspace as wheels (cuBLAS, cuDNN,
+# cuFFT, cuRAND, nvrtc, cuda_runtime, nvJitLink), so the host needs an NVIDIA
+# DRIVER and nothing else — no system CUDA toolkit, and no LD_LIBRARY_PATH:
+# onnxruntime >= 1.26 preloads the wheel libraries itself. Measured cost about
+# 2.4 GB on disk; measured benefit on an RTX 4080 SUPER with the 512x512
+# Spruce_Deadwood fp16 model: 12.4 ms per tile on CUDAExecutionProvider against
+# 5265.7 ms on CPUExecutionProvider.
+#
+# CEILING (<1.27): onnxruntime-gpu 1.27 moved its extras to CUDA 13
+# (nvidia-*-cu13) and fails at import with `ImportError: libcudart.so.13` on a
+# cu12 machine (reproduced on an RTX 4080, driver 580). The cap keeps the
+# resolver on the cu12-era 1.26 line, which is what was verified end to end.
+#
+# FLOOR (>=1.26): an unsatisfiable EXTRA is a pip warning, never an error.
+# Without a floor, a narrow wheel-tag set makes pip backtrack to 1.20.2, print
+# "does not provide the extra 'cuda'", install ZERO nvidia wheels and exit 0 —
+# a build that claims success and then runs on the CPU. The floor turns that
+# silent degradation into a resolver failure.
+#
+# Raise the window only after re-running the provider check in
+# docker/gpu/README.md on the target hardware. Blackwell (sm_120) in particular
+# needs a recent CUDA — verify, do not assume.
+#
+# TO ADD CUDA TO AN ENVIRONMENT THAT ALREADY HAS cpu.txt: this is a SWAP, not
+# an addition. Uninstall the CPU wheel FIRST, then install this file (pip will
+# find core.txt already satisfied):
+#
+#     <venv>/bin/pip uninstall -y onnxruntime
+#     <venv>/bin/pip install -r requirements/gpu.txt
+#
+# Then verify CUDA is actually offered — installing is not the same as working:
+#
+#     <venv>/bin/python -c \
+#       "import onnxruntime as ort; print(ort.get_available_providers())"
+#
+# 'CUDAExecutionProvider' must appear in that list. If it does not, the wheel
+# and your driver/CUDA runtime do not match; see docs/GPU.md.
+onnxruntime-gpu[cuda,cudnn]>=1.26,<1.27
 
 # Without psutil, HardwareInfo._detect_total_ram_gb() returns 0.0 and the run
 # logs "RAM=0.0 GB". Cosmetic on CUDA — the figure only feeds that log line and

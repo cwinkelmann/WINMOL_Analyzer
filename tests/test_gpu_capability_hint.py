@@ -1,6 +1,6 @@
 """The plugin must say when a present NVIDIA GPU is unusable by its env.
 
-requirements/plugin.txt -> base.txt installs `onnxruntime`, the CPU-only wheel.
+requirements/cpu.txt installs `onnxruntime`, the CPU-only wheel.
 `onnxruntime-gpu` is a separate package, so a plugin-installed NVIDIA box can
 never reach CUDA no matter what driver is present. The install is deliberately
 NOT changed (that would drag a large CUDA dependency into every environment) —
