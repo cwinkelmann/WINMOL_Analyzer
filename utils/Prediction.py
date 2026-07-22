@@ -260,7 +260,15 @@ def _free_memory_bytes(config):
         if usable:
             # The smallest visible device bounds the run: the same batch size
             # is used on all of them.
-            return min(usable) * _GB, 'nvidia-smi memory.free'
+            gpu_free = min(usable) * _GB
+            host = _available_ram_bytes()
+            if host is not None and 0 < host < gpu_free:
+                # Bound by BOTH. A run planned for CUDA whose session
+                # silently fell back to the CPU provider allocates on the
+                # host, and that is exactly the box that froze: plenty of
+                # VRAM free, no VRAM in use, and the arena eating RAM.
+                return host, 'psutil available RAM (below free VRAM)'
+            return gpu_free, 'nvidia-smi memory.free'
         return None, 'nvidia-smi did not report free GPU memory'
 
     available = _available_ram_bytes()

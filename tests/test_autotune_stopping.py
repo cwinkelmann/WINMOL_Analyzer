@@ -232,9 +232,24 @@ def test_the_candidate_list_is_capped_in_length():
 def test_the_free_probe_prefers_nvidia_smi_on_cuda(monkeypatch):
     monkeypatch.setattr(
         HardwareInfo, "free_gpu_memory_gb", staticmethod(lambda: [11.0, 8.0]))
+    monkeypatch.setattr(Pred, "_available_ram_bytes", lambda: 64 * GB)
     free, source = Pred._free_memory_bytes(_config())
     assert free == pytest.approx(8.0 * GB), "the smallest device bounds it"
     assert "memory.free" in source
+
+
+def test_host_ram_still_bounds_a_cuda_run(monkeypatch):
+    """The frozen box had VRAM free and was allocating on the host.
+
+    A run planned for CUDA whose onnxruntime session silently falls back to
+    the CPU provider spends host RAM, so the ceiling has to respect both.
+    """
+    monkeypatch.setattr(
+        HardwareInfo, "free_gpu_memory_gb", staticmethod(lambda: [16.0]))
+    monkeypatch.setattr(Pred, "_available_ram_bytes", lambda: 2 * GB)
+    free, source = Pred._free_memory_bytes(_config())
+    assert free == pytest.approx(2 * GB)
+    assert "psutil" in source
 
 
 def test_the_free_probe_degrades_without_psutil(monkeypatch):

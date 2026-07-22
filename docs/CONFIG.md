@@ -252,7 +252,10 @@ bytes_per_tile = img_h * img_w * (n_channels + num_classes) * 4 * activation_fac
 * *FREE*, not total: `nvidia-smi --query-gpu=memory.free` on CUDA (the
   smallest visible device bounds the run), `psutil.virtual_memory().available`
   on CPU, and that times `UNIFIED_MEMORY_GPU_SHARE` on Apple Silicon, where
-  the CPU and the GPU share one pool.
+  the CPU and the GPU share one pool. A CUDA run is bounded by **both** VRAM
+  and host RAM: a session that silently falls back to the CPU provider
+  allocates on the host, which is exactly the box that froze — plenty of VRAM
+  free, none of it in use.
 * `prediction_batch_autotune_memory_fraction` = **0.6** — never ask for more
   than 60 % of what is free *right now*, leaving headroom for the producer
   threads, the raster writer and the OS.
