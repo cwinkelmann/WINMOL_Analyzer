@@ -4,6 +4,7 @@ import sys
 from qgis.PyQt.QtCore import QObject, pyqtSignal
 
 from .plugin_utils.childenv import child_env
+from .plugin_utils.run_progress import RunProgress
 
 
 class Worker(QObject):
@@ -17,15 +18,22 @@ class Worker(QObject):
     update_signal = pyqtSignal(str)
     progress_signal = pyqtSignal(int)
 
-    def __init__(self, command):
+    def __init__(self, command, env_extra=None):
         super().__init__()
         self.command = command
+        # Extra environment for the compute child on top of child_env()'s
+        # sanitised copy — currently WINMOL_AUTOTUNE_CACHE, which points the
+        # child at the plugin's managed cache instead of a HOME-derived one.
+        self.env_extra = dict(env_extra or {})
         self._popen = None
         self._cancelled = False
 
     def run_process(self):
-        total_expected = self.get_total_lines()
-        total_lines = 0
+        # Progress comes from the done/total counters winmol_run.py already
+        # prints, mapped onto phase bands — NOT from a line count. See
+        # plugin_utils/run_progress.py for why (the old heuristic sat at
+        # ~78 % before the first inference).
+        progress = RunProgress(self.command[-1])
         self.progress_signal.emit(0)
         try:
             startupinfo = None
@@ -47,13 +55,14 @@ class Worker(QObject):
                 universal_newlines=True,
                 bufsize=1,
                 startupinfo=startupinfo,
-                env=child_env(),
+                env=child_env(self.env_extra or None),
             )
             for line in iter(self._popen.stdout.readline, ""):
-                self.update_signal.emit(line.rstrip("\n"))
-                total_lines += 1
-                self.progress_signal.emit(
-                    min(99, int(total_lines / max(total_expected, 1) * 100)))
+                text = line.rstrip("\n")
+                self.update_signal.emit(text)
+                percent = progress.feed(text)
+                if percent is not None:
+                    self.progress_signal.emit(percent)
 
             self._popen.stdout.close()
             return_code = self._popen.wait()
@@ -65,7 +74,7 @@ class Worker(QObject):
         if self._cancelled:
             self.error.emit("Analysis cancelled.")
         elif return_code == 0:
-            self.progress_signal.emit(100)
+            self.progress_signal.emit(progress.finish(ok=True))
             self.succeeded.emit()
         else:
             self.error.emit(
@@ -83,10 +92,6 @@ class Worker(QObject):
                 popen.wait(timeout=5)
             except Exception:
                 popen.kill()
-
-    def get_total_lines(self):
-        return {"Stems": 34, "Trees": 118, "Nodes": 125}.get(
-            self.command[-1], 100)
 
 
 class EnvSetupWorker(QObject):

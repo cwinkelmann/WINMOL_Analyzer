@@ -279,6 +279,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         ("env_choose_button", "clicked", "_choose_interpreter"),
         ("env_repair_button", "clicked", "_setup_repair_env"),
         ("env_delete_button", "clicked", "_setup_delete_env"),
+        ("autotune_clear_button", "clicked", "_setup_clear_autotune"),
         ("models_variants_checkBox", "stateChanged", "_refresh_model_tree"),
         ("models_refresh_button", "clicked", "_setup_rescan"),
         ("models_treeWidget", "currentItemChanged",
@@ -1289,7 +1290,13 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         print("Starting the process...")
         try:
             self.thread = QThread()
-            self.worker = Worker(command)
+            # Point the child's batch-size autotune cache at WINMOL's managed
+            # state, so it is created, found and deleted with the environment
+            # rather than in a HOME the QGIS/Docker user may not own.
+            self.worker = Worker(command, env_extra={
+                "WINMOL_AUTOTUNE_CACHE":
+                    installer.autotune_cache_location(self._plugin_dir()),
+            })
             self.worker.moveToThread(self.thread)
             self.worker.progress_signal.connect(self.update_progress)
             self.thread.started.connect(self.worker.run_process)
@@ -2255,6 +2262,28 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self._refuse_while_busy()
             return
         self._create_environment()
+
+    def _setup_clear_autotune(self):
+        """Forget the persisted prediction batch-size measurement.
+
+        The autotune runs ONCE per (hardware, model, execution provider,
+        tile geometry) and is then reused; the cache invalidates itself
+        when any of those change, so this is an escape hatch, not routine
+        maintenance. Deleting a small JSON is instant and needs no worker
+        thread — but it still refuses while a run is live, because the
+        child holds the same file.
+        """
+        if self._busy():
+            self._refuse_while_busy()
+            return
+        from .plugin_utils import autotune_cache
+        path = installer.autotune_cache_location(self._plugin_dir())
+        removed = autotune_cache.clear(path)
+        self._append_setup_detail(
+            f"Autotune cache cleared ({path}). The batch size is "
+            "re-measured once on the next run."
+            if removed else
+            f"No autotune cache to clear ({path}).")
 
     def _setup_repair_env(self):
         """Reinstall the dependencies.

@@ -222,6 +222,9 @@ def run_variant(v, ortho, out_dir, python_exe, process, force_cpu, edge_m,
         if force_cpu:
             env["WINMOL_ONNX_FORCE_CPU"] = "1"
         env.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+        # Off, so a cold vs warm autotune cache cannot contaminate a timing
+        # run (the first run would pay ~60 s of tuning, later ones nothing).
+        env.setdefault("WINMOL_BATCH_AUTOTUNE", "off")
         onnx_prefix = None
         if onnx_profile and str(model).lower().endswith(".onnx"):
             onnx_prefix = os.path.join(out_dir, f"{label}_onnxprof")

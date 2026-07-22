@@ -51,7 +51,11 @@ python winmol_batch.py <Spruce|Beech|Spruce_Deadwood|General> --input <dir> --ou
 
 **Domain model** (`classes/`): a `Stem` is an ordered list of `Node`s (each a point + diameter) exposing `length`/`volume`; `Part`/`Vector` are the intermediate geometry primitives assembled before stems are connected.
 
-**Config** (`classes/Config.py`) is a plain class of class-level attributes (not a dataclass) grouped by concern: backend selection, tiling/streaming, resource caps, prediction batching + autotune, segmentation (`img_width/height=512`, `num_classes=1`), vectorization thresholds, and diameter/volume method (`contour` vs `edt`). The planner writes resolved runtime values back onto the `Config` instance.
+**Config** (`classes/Config.py`) is a plain class of class-level attributes (not a dataclass) grouped by concern: backend selection, tiling/streaming, resource caps, prediction batching + autotune, segmentation (`img_width/height=512`, `num_classes=1`), vectorization thresholds, and diameter/volume method (`contour` vs `edt`). The planner writes resolved runtime values back onto the `Config` instance. `prediction_batch_autotune` is tri-state (`"auto"` | `False` | `True`): `"auto"` tunes **once** per (hardware, model, execution provider, tile geometry) and reuses the result persisted by `plugin_utils/autotune_cache.py`. Pin `WINMOL_BATCH_AUTOTUNE=off` for anything that must be timing- or byte-reproducible; the test suite does this in `tests/conftest.py`.
+
+Note `ImageProcessing.main()` is **dead code** — the `__main__` block at the bottom of `winmol_run.py` duplicates the same flow inline, and that is what actually runs. The sequence above is accurate as documentation; the call path is not.
+
+**The QGIS run progress bar** is driven by `plugin_utils/run_progress.py`, which parses the `done/total` counters the pipeline already prints (`Written tile`, `Multi-GPU prediction`, `Vector tiles`, `MERGE TILE READ`) onto benchmark-derived phase bands. Changing any of those print formats silently freezes the bar — `tests/test_run_progress.py` guards the exact prefixes.
 
 **Models** are U-Net HDF5 files hosted on Zenodo; URLs live in `config.json` (`Beech`, `Spruce`, `Spruce_Deadwood`, `General`). The plugin downloads them into `models/` on first run; batch expects them pre-downloaded in `standalone/model/`.
 

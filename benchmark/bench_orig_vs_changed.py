@@ -118,6 +118,11 @@ def run_once(cfg, ortho, outdir, index):
     env = dict(os.environ)
     env["TF_CPP_MIN_LOG_LEVEL"] = "3"
     env.pop("PYTHONHASHSEED", None)          # ORIGINAL behaviour by default
+    # The batch-size autotune defaults to "auto": it would tune on the first
+    # run (a one-off stall of ~60 s) and reuse a cached batch afterwards, so
+    # run 1 and run 2 of the same variant would not be comparable. Pin it off
+    # -- benchmarks measure the pipeline, not the tuner.
+    env["WINMOL_BATCH_AUTOTUNE"] = "off"
     env.update(cfg["env"])
 
     cmd = [cfg["python"], "-u", "winmol_run.py", cfg["model"], ortho,

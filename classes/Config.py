@@ -21,11 +21,18 @@ class Config(object):
     prediction_batch_gpu = 4
     prediction_batch_max_gpu = 16
     prediction_batch_multi_gpu = 12     # local per-worker batch
-    # Off by default: the autotune times ~6 batch sizes x 5 repeats before the
-    # first tile, and on Apple/CoreML each distinct batch size forces a model
-    # recompile -> a long SILENT stall for ~1% throughput. Enable via
-    # WINMOL_CONFIG_OVERRIDES_JSON on CUDA if you want it.
-    prediction_batch_autotune = False
+    # Tri-state, resolved by plugin_utils.autotune_cache.resolve_mode():
+    #   "auto"  -- use the persisted result if one matches this device+model,
+    #              otherwise tune ONCE and save it (the default).
+    #   False   -- never tune. Pin this for benchmarks and determinism runs.
+    #   True    -- tune on every run and refresh the cache (force a re-tune).
+    # Tuning times up to 13 candidate batch sizes x 5 repeats before the first
+    # tile, and on Apple/CoreML each distinct batch size forces a model
+    # recompile: measured 62 s of stall on the 9-tile crop fixture, for ~6 %
+    # throughput. Worth paying once per device+model, never worth paying every
+    # run -- hence the cache. $WINMOL_BATCH_AUTOTUNE (off|auto|force)
+    # overrides this without touching config.
+    prediction_batch_autotune = "auto"
     prediction_batch_autotune_patience = 4
     prediction_batch_autotune_repeats = 5
     prediction_batch_autotune_min_improve = 0.005
@@ -38,6 +45,9 @@ class Config(object):
     multi_gpu_cpu_workers = 48
 
     # runtime state populated by planner
+    # The detected HardwareInfo, so downstream code (e.g. the autotune cache
+    # key) can see the GPUs without re-probing nvidia-smi. Not a user knob.
+    hardware = None
     cpu_workers = None
     gpu_workers = None
     vector_mode = 'none'

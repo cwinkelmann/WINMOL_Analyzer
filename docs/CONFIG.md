@@ -212,11 +212,60 @@ below instead.
 | `tile_inner_px` | 4096 | Vector tile size. **Changes results** (measured) — see the sweep. Bigger = fewer seams, more RAM per worker; smaller = proportionally more halo recomputation. |
 | `tile_overlap_m` | 12.0 | Halo between vector tiles; also the merge de-duplication buffer. |
 | `gpu_memory_fraction` | 0.9 | Fraction of GPU memory a worker may use. |
-| `prediction_batch_autotune` | False | Off because it re-runs every prediction, costing minutes on CoreML/Metal for ~1 % throughput. |
+| `prediction_batch_autotune` | `"auto"` | Tri-state. `"auto"` tunes **once** per device+model and reuses a persisted result; `False` never tunes; `True` re-tunes every run. See below. |
 | `stem_binary_threshold` | 0.5 | Mask binarisation cut-off. **Changing this changes results** — the golden fixtures assume 0.5. |
 | `min_length` | 2.0 | Shortest stem kept (m). Also a results-changing knob. |
 | `measuring_point_spacing_m` | 0.5 | Diameter sampling interval along a stem. |
 | `diameter_method` | contour | `contour` or `edt`. |
+
+## The batch-size autotune runs once, then is remembered
+
+`prediction_batch_autotune` picks the micro-batch that gives the lowest
+seconds-per-tile by timing every candidate from `prediction_batch_gpu` up to
+`prediction_batch_max_gpu` (up to **13** candidates x
+`prediction_batch_autotune_repeats` runs each) before the first tile is
+written. On Apple/CoreML each distinct batch size forces a model recompile.
+Measured on an M2 with the 9-tile `tests/fixtures/crop_input.tif`: **11.0 s
+without it, 73.5 s with it** — ~62 s of stall to go from 0.169 to
+0.159 s/tile (5.9 %).
+
+Paying that on every run is a bad trade; paying it once is not. So the result
+is **persisted and reused**:
+
+| value | behaviour |
+|---|---|
+| `"auto"` (default) | Use the cached batch size if one matches this machine; otherwise tune once and save it. |
+| `False` | Never tune. **Pin this for benchmarks and determinism runs** — the micro-batch changes float accumulation order in the ONNX session. |
+| `True` | Tune on every run and overwrite the cache. The explicit "re-measure now" override. |
+
+`WINMOL_BATCH_AUTOTUNE=off|auto|force` overrides the config value without
+editing anything (the test suite and `benchmark/` pin it to `off`).
+
+The cache key covers **hardware, model file, execution provider and tile
+geometry**, so swapping the model, moving from CoreML to CPU, or changing
+`img_width`/`prediction_batch_max_gpu` re-tunes automatically. Its knobs
+(`_patience`, `_repeats`, `_min_improve`, `_stop_on_oom`, `_quiet`) still apply
+to the tuning run.
+
+**Where it lives, and how to clear it**
+
+* QGIS plugin: `<QGIS profile>/winmol/autotune.json`. The Setup tab has a
+  *Clear batch-size autotune cache* button, and *Delete environment* removes
+  it too.
+* CLI: `$WINMOL_AUTOTUNE_CACHE` if set, else `~/Library/Caches/winmol/`
+  (macOS), `%LOCALAPPDATA%\winmol\` (Windows), `$XDG_CACHE_HOME/winmol/` or
+  `~/.cache/winmol/` (Linux) — `autotune.json` in all cases.
+
+```bash
+rm ~/.cache/winmol/autotune.json      # forget the measurement
+```
+
+Deleting it is always safe: a missing, truncated or otherwise unusable file
+degrades to "no cached entry" and the next run simply re-measures. A cache that
+cannot be written is a logged no-op, never a failure.
+
+Note: the **multi-GPU** prediction path (`utils/PredictWorkers.py`) has no
+autotune at all and is unaffected — it uses `prediction_batch_multi_gpu`.
 
 ## The GPU count is NOT configurable
 

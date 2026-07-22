@@ -17,6 +17,7 @@ from rasterio.windows import Window
 from skimage.transform import resize
 
 from classes.Timer import Timer
+from plugin_utils import autotune_cache
 from utils import IO
 
 
@@ -412,12 +413,43 @@ def _autotune_batch_size(
     initial_batch,
     label='Prediction micro-batch',
 ):
-    autotune = bool(getattr(config, 'prediction_batch_autotune', True))
     initial = max(1, int(initial_batch))
-    if not autotune:
+    mode = autotune_cache.resolve_mode(config)
+    if mode == 'off':
         return initial
     if len(sample_tiles) < 2:
         return initial
+
+    # "auto": tune ONCE per (hardware, model, provider, tile geometry) and
+    # reuse the persisted answer forever after. "force" always re-tunes and
+    # refreshes the entry. Cache failures are never fatal -- a miss just means
+    # we tune. See plugin_utils/autotune_cache.py.
+    key = None
+    cache_file = None
+    try:
+        key = autotune_cache.cache_key(
+            model, config, getattr(config, 'hardware', None))
+        cache_file = autotune_cache.cache_path()
+    except Exception as exc:                                # pragma: no cover
+        print(f"{label} autotune: cache key unavailable ({exc}); tuning.",
+              flush=True)
+
+    max_batch = max(_prediction_batch_candidates(config, initial) or [initial])
+    if mode == 'auto' and key is not None:
+        cached = autotune_cache.load(key, path=cache_file)
+        if cached is not None and initial <= cached <= max_batch:
+            print(
+                f"{label} autotune: using cached batch {cached} "
+                f"(key {key[:8]}, {cache_file})",
+                flush=True,
+            )
+            return cached
+        if cached is not None:
+            print(
+                f"{label} autotune: ignoring out-of-range cached batch "
+                f"{cached} (valid {initial}-{max_batch}); re-tuning.",
+                flush=True,
+            )
 
     patience = max(
         1,
@@ -448,7 +480,17 @@ def _autotune_batch_size(
     results = []
     stop_reason = None
 
-    for cand in candidates:
+    # The tuning loop is the ~60 s stall that got this feature disabled. Say
+    # so up front and tick per candidate, so neither the log nor the progress
+    # bar looks like a hang (plugin_utils/run_progress.py parses these).
+    print(
+        f"{label} autotune: timing {len(candidates)} batch size(s) "
+        f"{candidates[0]}-{candidates[-1]} x {repeats} repeat(s); "
+        "this runs once and the result is cached.",
+        flush=True,
+    )
+
+    for index, cand in enumerate(candidates, start=1):
         used, per_tile, oomed = _time_batch_candidate(
             sample_tiles,
             sample_masks,
@@ -459,6 +501,12 @@ def _autotune_batch_size(
         )
 
         results.append((cand, used, per_tile, oomed))
+        print(
+            f"{label} autotune candidate {index}/{len(candidates)}: "
+            f"b{used} = {per_tile:.3f}s/tile"
+            f"{' OOM' if oomed else ''}",
+            flush=True,
+        )
 
         improved = (
             not np.isfinite(best_per_tile)
@@ -500,6 +548,26 @@ def _autotune_batch_size(
         if stop_reason is not None:
             msg = f"{msg} ({stop_reason})"
         print(msg, flush=True)
+
+    if key is not None:
+        meta = {
+            'per_tile_s': (None if not np.isfinite(best_per_tile)
+                           else round(float(best_per_tile), 6)),
+            'candidates': [int(c) for c in candidates],
+            'label': str(label),
+        }
+        if autotune_cache.store(key, best_batch, meta=meta, path=cache_file):
+            print(
+                f"{label} autotune: cached batch {best_batch} "
+                f"(key {key[:8]}, {cache_file})",
+                flush=True,
+            )
+        else:
+            print(
+                f"{label} autotune: could not write {cache_file}; "
+                "the result will be re-measured next run.",
+                flush=True,
+            )
 
     return best_batch
 

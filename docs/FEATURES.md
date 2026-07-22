@@ -53,18 +53,22 @@ candidates would quantization, prunning, onnx speedup Especially on cpu it shoul
 #### Do a speed and feature benchmark
 Are all the optimisations faster and by how much? How does accuracy change in the end.
 
-### Persist the batch-size autotune result
-The prediction batch-size autotune (`prediction_batch_autotune`) is currently
-OFF by default because it re-runs on every prediction: a silent multi-minute
-stall on CoreML/Metal (it recompiles the model for each candidate batch size)
-for only ~1% throughput. Better: run it ONCE, keyed by
-(hardware signature + model + execution provider), persist the chosen batch size
-(a small JSON cache in the QGIS profile / next to the model, or via QgsSettings),
-and reuse it on later runs — skipping the autotune entirely when a cached entry
-matches. Then the tuning cost is paid once and every subsequent run gets the
-optimal batch for free. Invalidate the cache when the model, provider, or
-hardware changes. (Note: measured per-device — e.g. on this M2/CoreML the
-optimum was ~batch 5; a large CUDA GPU will likely prefer a much bigger batch.)
+### Persist the batch-size autotune result — DONE
+Shipped in `plugin_utils/autotune_cache.py`; `prediction_batch_autotune` is now
+tri-state and defaults to `"auto"`: tune ONCE, keyed by (hardware + model file
++ execution provider + tile geometry), persist to a small JSON cache, and reuse
+it on every later run. `True` forces a re-tune, `False` disables it (pinned by
+the test suite and `benchmark/`), and `WINMOL_BATCH_AUTOTUNE=off|auto|force`
+overrides without editing config. A corrupt or unwritable cache degrades to a
+re-measurement, never a failure. See `docs/CONFIG.md` for the cache location
+and how to clear it.
+
+Measured on an M2/CoreML with the 9-tile crop fixture: tuning costs ~62 s and
+buys 0.169 → 0.159 s/tile (5.9 %), i.e. ~18 s per run on the 580-tile ortho in
+`docs/benchmark-full-ortho.md` — it pays for itself after ~4 runs and is free
+thereafter. The optimum is per-device (batch 4-5 on this M2; a large CUDA GPU
+will likely prefer a much bigger batch), which is exactly why it is measured
+rather than hardcoded.
 
 ### Split semantic segmentation from vectorization
 
