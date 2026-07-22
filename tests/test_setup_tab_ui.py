@@ -165,6 +165,10 @@ SETUP_WIDGETS = (
 DETECTION_ADDITIONS = (
     "setup_banner_widget", "setup_banner_label", "setup_banner_button",
     "model_variant_widget", "horizontalLayout_variant",
+    # The idle-GPU warning. It is a NAVIGATION banner like its sibling
+    # above — a sentence and a button that opens Setup — not a setup
+    # control, so it does not violate "setup leaves the detection tab".
+    "accel_banner_widget", "accel_banner_label", "accel_banner_button",
 )
 
 
@@ -194,7 +198,8 @@ def test_the_detection_page_carries_no_setup_control():
     the navigation banner and the variant placeholder stay."""
     page = [p for p in _tab_pages() if p.get("name") == "tab"][0]
     allowed = set(DETECTION_ADDITIONS) | {
-        "horizontalLayout_setup_banner", "horizontalSpacer_setup_banner"}
+        "horizontalLayout_setup_banner", "horizontalSpacer_setup_banner",
+        "horizontalLayout_accel_banner", "horizontalSpacer_accel_banner"}
     strays = sorted(n for n in _subtree_names(page)
                     if n.startswith(("env_", "models_", "setup_"))
                     and n not in allowed)
@@ -436,7 +441,17 @@ def test_the_old_env_button_is_gone():
 GUI_THREAD_FUNCTIONS = ("_refresh_setup_state", "_refresh_model_tree",
                         "_refresh_setup_actions", "_env_snapshot",
                         "_env_usage", "_apply_blocking_reason",
-                        "_scan_models", "__init__")
+                        "_scan_models", "__init__",
+                        # The proactive GPU offer. run_process is in here
+                        # because the pre-run question happens INSIDE it:
+                        # a probe called from there would freeze the GUI
+                        # at the exact moment the user pressed Run, which
+                        # is the worst possible moment for it. Every one
+                        # of these reads the cache EnvProbeWorker filled.
+                        "run_process", "_gpu_offer_pre_flight",
+                        "_apply_accel_nudge", "_gpu_prompt_dismissed",
+                        "_remember_gpu_prompt", "_accel_status",
+                        "_confirm_gpu_runtime")
 
 BANNED_CALLS = (
     "run", "Popen", "check_call", "check_output",      # subprocess

@@ -49,6 +49,18 @@ MODELS_PATH = "models"
 READY_MARKER = ".winmol_ready"
 QSETTINGS_PYTHON_KEY = "winmol/python_executable"
 
+#: Where the dialog remembers that the user answered "run on the CPU
+#: anyway" to the pre-run GPU offer. Same QgsSettings group and the same
+#: read/write discipline as QSETTINGS_PYTHON_KEY above: this module only
+#: names the key, the dialog is the only thing that touches QgsSettings,
+#: and the DECISION built on the stored value lives in
+#: setup_state.pre_run_decision so it can be tested without Qt.
+#:
+#: The stored value is setup_state.accelerator_token(...), not a bare
+#: bool, so that swapping the graphics card asks once more instead of
+#: staying silent forever about a GPU the user has never been told about.
+QSETTINGS_GPU_PROMPT_KEY = "winmol/gpu_offer_dismissed"
+
 #: The two inference runtimes, and the rule about them: they both provide
 #: the ``onnxruntime`` module, so exactly one may be installed. Every code
 #: path that installs one uninstalls the other first.

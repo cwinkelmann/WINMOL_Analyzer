@@ -389,6 +389,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         ("setup_go_detect_button", "clicked", "_go_to_detection"),
         ("setup_open_log_button", "clicked", "_go_to_log"),
         ("setup_banner_button", "clicked", "_go_to_setup"),
+        ("accel_banner_button", "clicked", "_go_to_setup"),
         ("log_widget", "currentChanged", "_on_tab_changed"),
     )
 
@@ -1431,6 +1432,15 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self._set_status(reason or setup_state.TXT_BLOCK_NO_ENV)
             self._refresh_setup_state()
             return
+
+        # The environment is usable — but is it using the right processor?
+        # Asked HERE, once, because this is the last moment before the
+        # user spends hours on something that takes minutes. Returns True
+        # (proceed) for every state but an idle NVIDIA GPU, and for that
+        # one too as soon as the user has answered it once.
+        if not self._gpu_offer_pre_flight():
+            return
+
         command = [
             self.python_exe,
             "-u",
@@ -1882,6 +1892,78 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             "later from the Setup tab.")
         return chosen
 
+    # --- the proactive pre-run offer ------------------------------------
+
+    def _gpu_prompt_dismissed(self):
+        """The token stored the last time the user said "run on the CPU".
+
+        Read through QgsSettings exactly like the interpreter path
+        (installer.QSETTINGS_PYTHON_KEY); a missing or unreadable key
+        simply means "never answered", so the worst a broken settings
+        store can do is ask once more.
+        """
+        try:
+            return QgsSettings().value(
+                installer.QSETTINGS_GPU_PROMPT_KEY, "") or ""
+        except Exception:                          # pragma: no cover - GUI
+            return ""
+
+    def _remember_gpu_prompt(self, token):
+        """Persist "do not ask me again on this machine"."""
+        if not token:
+            return
+        try:
+            QgsSettings().setValue(
+                installer.QSETTINGS_GPU_PROMPT_KEY, token)
+        except Exception as exc:                   # pragma: no cover - GUI
+            self.update_output_log(
+                f"Could not remember the GPU runtime choice: {exc}")
+
+    def _gpu_offer_pre_flight(self):
+        """Interrupt Run once when the GPU is idle. True to go ahead.
+
+        The whole point of this method is WHEN it happens: the Setup tab's
+        button was the only surviving entry point once an environment
+        existed, so an upgrade-from-CPU user was never told. Here the
+        question arrives at the only moment it is actionable — after the
+        inputs validate, before a run that would take hours starts.
+
+        Everything expensive has already been measured by EnvProbeWorker;
+        this reads ``self._accel_status()`` (the CACHE) and hands it to a
+        pure decision function. When the probe has not landed yet the
+        decision is "no question", so pressing Run is never made to wait
+        on nvidia-smi or a child interpreter.
+        """
+        decision = setup_state.pre_run_decision(
+            self._accel_status(), self._gpu_prompt_dismissed())
+        if not decision.asks:
+            return True
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Warning)
+        box.setWindowTitle(self.tr(decision.title))
+        box.setText(self.tr(decision.text))
+        install = box.addButton(self.tr(decision.install_label),
+                                QtWidgets.QMessageBox.AcceptRole)
+        # RejectRole, so Esc and the window's close button both mean
+        # "run on the CPU" — the choice that costs the user nothing.
+        run_anyway = box.addButton(self.tr(decision.run_label),
+                                   QtWidgets.QMessageBox.RejectRole)
+        box.setDefaultButton(run_anyway)
+        box.exec_()
+        if box.clickedButton() is install:
+            # The 2.4 GB was named in the text above and clicked through,
+            # which IS the explicit confirmation; asking the same question
+            # a second time would be theatre. The run does not start —
+            # the environment it would use is about to be rebuilt.
+            self._go_to_setup()
+            self._setup_install_gpu_runtime(confirmed=True)
+            return False
+        self._remember_gpu_prompt(decision.token)
+        self.update_output_log(
+            f"Running on the CPU with {decision.gpu_label} idle, as chosen. "
+            "The Setup tab can install the GPU runtime later.")
+        return True
+
     def _create_environment(self, gpu=False):
         """Build the compute environment (download Python 3.11 if needed, make
         the venv, pip-install deps) on a background thread so QGIS stays
@@ -2281,6 +2363,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             except Exception:                      # pragma: no cover - GUI
                 pass
         self._set_label("setup_banner_label", reason or "")
+        self._apply_accel_nudge(reason)
 
         ready_button = getattr(self, "setup_go_detect_button", None)
         if reason is None:
@@ -2300,6 +2383,36 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
                         "press Run.")
             except Exception:                      # pragma: no cover - GUI
                 pass
+
+    def _apply_accel_nudge(self, reason):
+        """Show the idle-GPU warning where the user actually is.
+
+        The Setup tab's accelerator line was the ONLY place this was ever
+        said, and a user whose environment already existed had no reason
+        to open that tab: the reported case ran a full detection at ~5 s
+        per tile with an RTX 4080 SUPER idle beside it.
+
+        Quiet by construction — ``setup_state.should_nudge`` is False for
+        every state except ``gpu_idle``, so a machine with no GPU, an
+        Apple GPU, or a GPU already in use shows nothing at all. It stays
+        visible after the pre-run question has been dismissed: one gray
+        line with a button is the way BACK to the offer, not a nag.
+
+        Suppressed while ``reason`` is set — a broken environment is the
+        more urgent sentence, and two orange banners stacked above the
+        input fields read as noise.
+        """
+        accel = self._accel_status()
+        show = reason is None and setup_state.should_nudge(accel)
+        widget = getattr(self, "accel_banner_widget", None)
+        if widget is not None:
+            try:
+                widget.setVisible(show)
+            except Exception:                      # pragma: no cover - GUI
+                pass
+        self._set_label(
+            "accel_banner_label",
+            setup_state.accel_nudge_text(accel) if show else "")
 
     def _is_setup_current(self):
         page = getattr(self, "tab_setup", None)
@@ -2483,13 +2596,19 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         # answer could only be "no".
         self._create_environment(gpu=self._confirm_gpu_runtime())
 
-    def _setup_install_gpu_runtime(self):
+    def _setup_install_gpu_runtime(self, _checked=False, confirmed=False):
         """Swap the CPU-only inference runtime for the CUDA one.
 
         Explicit by construction. 2.4 GB is not something to start on a
         user's behalf, so the confirmation names the GPU, the download
         size and the measured speed-up, and "No" is a real answer that
         leaves a perfectly working CPU environment in place.
+
+        ``confirmed=True`` says the caller ALREADY put those same facts on
+        screen and got a click — the pre-run offer does. It skips the
+        second modal and nothing else; the choice is still explicit, it
+        was just made one dialog earlier. ``_checked`` absorbs the bool
+        that ``clicked`` delivers when the Setup-tab button is the caller.
 
         The marker is invalidated first for the same reason
         _setup_repair_env does it: setup_environment short-circuits on a
@@ -2502,7 +2621,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         if not status.can_install:
             self._append_setup_detail(status.text)
             return
-        if not self._confirm_gpu_runtime():
+        if not confirmed and not self._confirm_gpu_runtime():
             return
         installer.invalidate_marker(installer.venv_location(
             self._plugin_dir()))
