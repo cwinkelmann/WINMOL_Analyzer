@@ -255,6 +255,26 @@ def test_a_cpu_only_machine_is_recommended_the_int8_build():
     assert flagged[0].entry_id == reg.default_entry(device="cpu").id
 
 
+def test_an_apple_silicon_machine_is_recommended_the_fp32_build():
+    """The GUI preselection follows the registry's CoreML rule: the
+    flagged row -- which is also 'Download recommended's target and the
+    variant combo's item 0 -- is the fp32 reference, never the fp16
+    build that measures 14.6x slower on that provider.
+
+    Runs on any machine: the device is passed, never probed.
+    """
+    reg = mr.load_registry(SHIPPED_CONFIG)
+    rows = model_status.scan(reg, os.path.join(REPO, "no-such-models"),
+                             device="coreml")
+    flagged = [r for r in rows if r.recommended]
+    assert len(flagged) == 1
+    assert flagged[0].precision == "fp32"
+    assert flagged[0].entry_id == "Spruce_Deadwood"
+    # the same file default_entry() names, and NOT the CUDA answer
+    assert flagged[0].entry_id == reg.default_entry(device="coreml").id
+    assert flagged[0].entry_id != reg.default_entry(device="gpu").id
+
+
 def test_the_lossless_gate_is_still_reachable_from_scan():
     """variant='auto' is not gone — an explicit selection still gets the
     conservative answer (fp32 for the domain-calibrated classic int8)."""

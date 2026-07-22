@@ -5,7 +5,8 @@
     "'file' is the mandatory on-disk filename used by BOTH the QGIS plugin (<plugin>/models/) and the batch CLI (--model-dir); it always equals the URL basename (query-stripped) so files fetched manually (gh release download / browser) are recognized.",
     "'sha256' (zoo assets) or 'md5' (Zenodo hdf5) enables integrity verification. EVERY downloadable entry is pinned: tests/test_model_registry.py::test_every_entry_has_a_digest fails the build if an unpinned entry is added.",
     "'preload' lists entry ids installer.download_models may fetch at env-setup time; it ships EMPTY: all downloads are on-demand at selection time.",
-    "'recommended' is the ranked default list (best first). recommended[0] MUST equal gui_default. The EFFECTIVE default is device-aware: Registry.default_entry(device) keeps recommended[0]'s FAMILY (the domain choice) and swaps in that family's cpu (int8) or gpu (fp16) variant. Any explicit user/CLI selection overrides it.",
+    "'recommended' is the ranked default list (best first). recommended[0] MUST equal gui_default. The EFFECTIVE default is device-aware: Registry.default_entry(device) keeps recommended[0]'s FAMILY (the domain choice) and swaps in that family's cpu (int8), gpu (fp16) or coreml variant. Any explicit user/CLI selection overrides it.",
+    "A family names one entry per DEVICE CLASS: 'cpu' (int8), 'gpu' (fp16, CUDA) and 'coreml' (Apple Silicon). All three are optional; an absent key means the family default (fp32) is kept for that device — and for 'coreml' the loader falls back to that default deliberately, so forgetting the key cannot hand a Mac the int8 or fp16 build. 'coreml' points at the fp32 reference ON PURPOSE and must not be pointed at an fp16 build: measured on an M2 (onnxruntime 1.27, Spruce_Deadwood, batch 2) fp16 on CoreML costs 2735 ms/image against 187 ms/image for fp32 — 14.6x — and is slower than the same fp16 model on the CPU provider (2268 ms). CoreML reports 69 of 74 nodes supported for the fp16 graph, so this is not a silent provider fallback, it is fp16 being pathological there. End to end on a 182-tile orthomosaic: 429.8 s (fp16) vs 61.2 s (fp32).",
     "'lossless' on a variant means numerically equivalent to its family's fp32 reference; auto variant selection only substitutes a device variant when it is lossless, otherwise it stays on the family default (results-stable).",
     "'hidden': true keeps an entry out of the GUI dropdown (hdf5 originals need TensorFlow; the plugin venv is ONNX-only). They remain addressable by id from the CLI and scripts/convert_models_to_onnx.py.",
     "'Custom' is a reserved id (GUI escape hatch); the loader rejects a registry that defines it.",
@@ -24,47 +25,55 @@
       "label": "Classic WINMOL — General (all species)",
       "default": "General",
       "cpu": "General_int8",
-      "gpu": "General_fp16"
+      "gpu": "General_fp16",
+      "coreml": "General"
     },
     "classic_beech": {
       "label": "Classic WINMOL — Beech",
       "default": "Beech",
       "cpu": "Beech_int8",
-      "gpu": "Beech_fp16"
+      "gpu": "Beech_fp16",
+      "coreml": "Beech"
     },
     "classic_spruce": {
       "label": "Classic WINMOL — Spruce",
       "default": "Spruce",
       "cpu": "Spruce_int8",
-      "gpu": "Spruce_fp16"
+      "gpu": "Spruce_fp16",
+      "coreml": "Spruce"
     },
     "classic_spruce_deadwood": {
       "label": "Classic WINMOL — Spruce + deadwood (default)",
       "default": "Spruce_Deadwood",
       "cpu": "Spruce_Deadwood_int8",
-      "gpu": "Spruce_Deadwood_fp16"
+      "gpu": "Spruce_Deadwood_fp16",
+      "coreml": "Spruce_Deadwood"
     },
     "unet_pt": {
       "label": "UNet PyTorch retrain (SpecDS beech) — second choice",
       "default": "UNet_PT",
       "cpu": "UNet_PT_int8",
-      "gpu": "UNet_PT_fp16"
+      "gpu": "UNet_PT_fp16",
+      "coreml": "UNet_PT"
     },
     "unet_rkeras": {
       "label": "UNet R/Keras 512 retrain (beech)",
       "default": "UNet_R_Beech",
       "cpu": "UNet_R_Beech_int8",
-      "gpu": "UNet_R_Beech_fp16"
+      "gpu": "UNet_R_Beech_fp16",
+      "coreml": "UNet_R_Beech"
     },
     "deeplab": {
       "label": "DeepLabV3+ (beech)",
       "default": "DeepLab_Beech",
-      "gpu": "DeepLab_Beech_fp16"
+      "gpu": "DeepLab_Beech_fp16",
+      "coreml": "DeepLab_Beech"
     },
     "hrnet": {
       "label": "HRNet (beech) — best F1",
       "default": "HRNet_Beech",
-      "gpu": "HRNet_Beech_fp16"
+      "gpu": "HRNet_Beech_fp16",
+      "coreml": "HRNet_Beech"
     }
   },
   "models": {
@@ -80,7 +89,7 @@
       "size_mb": 124.6,
       "f1": null,
       "lossless": true,
-      "description": "ONNX conversion of the original Keras GenDS model (Zenodo 10.5281/zenodo.15907576), numerically identical. Served from the sha256-pinned models-v1 release (was the unchecksummed models-onnx-v1/General.onnx)."
+      "description": "ONNX conversion of the original Keras GenDS model (Zenodo 10.5281/zenodo.15907576), numerically identical. Served from the sha256-pinned models-v1 release (was the unchecksummed models-onnx-v1/General.onnx). Also the automatic default on Apple Silicon (CoreML), where it is the fastest of the three precisions (~172 ms/image against ~594 int8 and ~2735 fp16; M2, onnxruntime 1.27)."
     },
     "General_int8": {
       "label": "General — CPU-optimised int8",
@@ -94,7 +103,7 @@
       "size_mb": 31.4,
       "f1": null,
       "lossless": false,
-      "description": "Post-training static int8, domain-calibrated. Faster on CPU; small accuracy drift possible."
+      "description": "Post-training static int8, domain-calibrated. Faster on CPU; small accuracy drift possible. APPLE SILICON: fp32 is the faster choice — int8 measures ~594 ms/image on CoreML against ~172 ms for fp32 (M2, onnxruntime 1.27, Spruce_Deadwood, batch 2), so the CoreML device default is the fp32 reference, not this build."
     },
     "General_fp16": {
       "label": "General — GPU-optimised fp16",
@@ -108,7 +117,7 @@
       "size_mb": 62.3,
       "f1": null,
       "lossless": true,
-      "description": "Post-training fp16, lossless; Tensor-Core friendly."
+      "description": "Post-training fp16, lossless; Tensor-Core friendly. APPLE SILICON: do NOT pick this build. fp16 is pathological on the CoreML execution provider — 2735 ms/image against 187 ms for fp32 (M2, onnxruntime 1.27, Spruce_Deadwood, batch 2), i.e. 14.6x slower, and slower than the same file on the CPU provider. fp16 is for CUDA; on a Mac the device default stays fp32."
     },
     "Beech": {
       "label": "Beech — classic UNet, fp32",
@@ -122,7 +131,7 @@
       "size_mb": 124.6,
       "f1": null,
       "lossless": true,
-      "description": "ONNX conversion of the original Keras SpecDS_Beech model (Zenodo 10.5281/zenodo.15907576), numerically identical. Served from the sha256-pinned models-v1 release (was the unchecksummed models-onnx-v1/Beech.onnx)."
+      "description": "ONNX conversion of the original Keras SpecDS_Beech model (Zenodo 10.5281/zenodo.15907576), numerically identical. Served from the sha256-pinned models-v1 release (was the unchecksummed models-onnx-v1/Beech.onnx). Also the automatic default on Apple Silicon (CoreML), where it is the fastest of the three precisions (~172 ms/image against ~594 int8 and ~2735 fp16; M2, onnxruntime 1.27)."
     },
     "Beech_int8": {
       "label": "Beech — CPU-optimised int8",
@@ -136,7 +145,7 @@
       "size_mb": 31.4,
       "f1": null,
       "lossless": false,
-      "description": "Post-training static int8, domain-calibrated."
+      "description": "Post-training static int8, domain-calibrated. APPLE SILICON: fp32 is the faster choice — int8 measures ~594 ms/image on CoreML against ~172 ms for fp32 (M2, onnxruntime 1.27, Spruce_Deadwood, batch 2), so the CoreML device default is the fp32 reference, not this build."
     },
     "Beech_fp16": {
       "label": "Beech — GPU-optimised fp16",
@@ -150,7 +159,7 @@
       "size_mb": 62.3,
       "f1": null,
       "lossless": true,
-      "description": "Post-training fp16, lossless."
+      "description": "Post-training fp16, lossless. APPLE SILICON: do NOT pick this build. fp16 is pathological on the CoreML execution provider — 2735 ms/image against 187 ms for fp32 (M2, onnxruntime 1.27, Spruce_Deadwood, batch 2), i.e. 14.6x slower, and slower than the same file on the CPU provider. fp16 is for CUDA; on a Mac the device default stays fp32."
     },
     "Spruce": {
       "label": "Spruce — classic UNet, fp32",
@@ -164,7 +173,7 @@
       "size_mb": 124.6,
       "f1": null,
       "lossless": true,
-      "description": "ONNX conversion of the original Keras SpecDS_Spruce model (Zenodo 10.5281/zenodo.15907576), numerically identical. Served from the sha256-pinned models-v1 release (was the unchecksummed models-onnx-v1/Spruce.onnx)."
+      "description": "ONNX conversion of the original Keras SpecDS_Spruce model (Zenodo 10.5281/zenodo.15907576), numerically identical. Served from the sha256-pinned models-v1 release (was the unchecksummed models-onnx-v1/Spruce.onnx). Also the automatic default on Apple Silicon (CoreML), where it is the fastest of the three precisions (~172 ms/image against ~594 int8 and ~2735 fp16; M2, onnxruntime 1.27)."
     },
     "Spruce_int8": {
       "label": "Spruce — CPU-optimised int8",
@@ -178,7 +187,7 @@
       "size_mb": 31.4,
       "f1": null,
       "lossless": false,
-      "description": "Post-training static int8, domain-calibrated."
+      "description": "Post-training static int8, domain-calibrated. APPLE SILICON: fp32 is the faster choice — int8 measures ~594 ms/image on CoreML against ~172 ms for fp32 (M2, onnxruntime 1.27, Spruce_Deadwood, batch 2), so the CoreML device default is the fp32 reference, not this build."
     },
     "Spruce_fp16": {
       "label": "Spruce — GPU-optimised fp16",
@@ -192,7 +201,7 @@
       "size_mb": 62.3,
       "f1": null,
       "lossless": true,
-      "description": "Post-training fp16, lossless."
+      "description": "Post-training fp16, lossless. APPLE SILICON: do NOT pick this build. fp16 is pathological on the CoreML execution provider — 2735 ms/image against 187 ms for fp32 (M2, onnxruntime 1.27, Spruce_Deadwood, batch 2), i.e. 14.6x slower, and slower than the same file on the CPU provider. fp16 is for CUDA; on a Mac the device default stays fp32."
     },
     "Spruce_Deadwood": {
       "label": "Spruce + standing deadwood (SpecDS) — recommended, 1st",
@@ -206,7 +215,7 @@
       "size_mb": 124.6,
       "f1": null,
       "lossless": true,
-      "description": "ONNX conversion of the original Keras SpecDS_Spruce_Deadwood model (Zenodo 10.5281/zenodo.15907576), numerically identical. Served from the sha256-pinned models-v1 release (was the unchecksummed models-onnx-v1/Spruce_Deadwood.onnx)."
+      "description": "ONNX conversion of the original Keras SpecDS_Spruce_Deadwood model (Zenodo 10.5281/zenodo.15907576), numerically identical. Served from the sha256-pinned models-v1 release (was the unchecksummed models-onnx-v1/Spruce_Deadwood.onnx). Also the automatic default on Apple Silicon (CoreML), where it is the fastest of the three precisions (~172 ms/image against ~594 int8 and ~2735 fp16; M2, onnxruntime 1.27)."
     },
     "Spruce_Deadwood_int8": {
       "label": "Spruce + deadwood (SpecDS) — CPU int8 [DEFAULT]",
@@ -220,7 +229,7 @@
       "size_mb": 31.4,
       "f1": null,
       "lossless": false,
-      "description": "Shipped default on a CPU-only machine (recommended[0]): 31 MB to download against 124.6 MB for the fp32 reference, and much faster on CPU. Post-training static int8 of the SpecDS Spruce+Deadwood Keras model, domain-calibrated. NOTE: unlike the fp16 variant, this int8 build is NOT certified lossless in the models-v1 manifest — it is the default by explicit product decision (small size, fast CPU), not by a measured-equivalence claim; pick 'Reference (fp32)' in the variant selector if you need results identical to the published reference. On a GPU host the effective default becomes the lossless Spruce_Deadwood_fp16."
+      "description": "Shipped default on a CPU-only machine (recommended[0]): 31 MB to download against 124.6 MB for the fp32 reference, and much faster on CPU. Post-training static int8 of the SpecDS Spruce+Deadwood Keras model, domain-calibrated. NOTE: unlike the fp16 variant, this int8 build is NOT certified lossless in the models-v1 manifest — it is the default by explicit product decision (small size, fast CPU), not by a measured-equivalence claim; pick 'Reference (fp32)' in the variant selector if you need results identical to the published reference. On a GPU host the effective default becomes the lossless Spruce_Deadwood_fp16. APPLE SILICON: fp32 is the faster choice — int8 measures ~594 ms/image on CoreML against ~172 ms for fp32 (M2, onnxruntime 1.27, Spruce_Deadwood, batch 2), so the CoreML device default is the fp32 reference, not this build."
     },
     "Spruce_Deadwood_fp16": {
       "label": "Spruce + deadwood — GPU-optimised fp16",
@@ -234,7 +243,7 @@
       "size_mb": 62.3,
       "f1": null,
       "lossless": true,
-      "description": "Post-training fp16, lossless."
+      "description": "Post-training fp16, lossless. APPLE SILICON: do NOT pick this build. fp16 is pathological on the CoreML execution provider — 2735 ms/image against 187 ms for fp32 (M2, onnxruntime 1.27, Spruce_Deadwood, batch 2), i.e. 14.6x slower, and slower than the same file on the CPU provider. fp16 is for CUDA; on a Mac the device default stays fp32."
     },
     "UNet_PT": {
       "label": "UNet PyTorch (SpecDS beech) — fp32 reference, F1 0.760",
@@ -248,7 +257,7 @@
       "size_mb": 124.1,
       "f1": 0.76,
       "lossless": true,
-      "description": "Reference WINMOL UNet, PyTorch two-stage lrfix retrain on the SpecDS beech data, TestDS F1 0.760. Full-width fp32 reference — NOT a w05 build; the w05 (width-0.5) builds are the int8/fp16 variants of this family."
+      "description": "Reference WINMOL UNet, PyTorch two-stage lrfix retrain on the SpecDS beech data, TestDS F1 0.760. Full-width fp32 reference — NOT a w05 build; the w05 (width-0.5) builds are the int8/fp16 variants of this family. Also the automatic default on Apple Silicon (CoreML), where it is the fastest of the three precisions (~172 ms/image against ~594 int8 and ~2735 fp16; M2, onnxruntime 1.27)."
     },
     "UNet_PT_int8": {
       "label": "UNet PyTorch w05 — CPU int8 (10x, lossless) [2nd choice]",
@@ -262,7 +271,7 @@
       "size_mb": 7.9,
       "f1": 0.76,
       "lossless": true,
-      "description": "Documented runner-up (recommended[1]). 10x faster on CPU (AVX-VNNI), TestDS F1 0.760, certified lossless vs its fp32 reference. DISAMBIGUATION (corrected 2026-07-21): this is the 'w05' (width-0.5) build of the PyTorch UNet retrain, asset model_UNet_SpecDS_Beech_512_pytorch_w05_int8.onnx. It IS trained on SpecDS beech data — an earlier note here wrongly claimed 'SpecDS' named only the classic Keras models; the models-v1 rename settled the provenance. What still must not be conflated is the ARCHITECTURE/lineage: 'w05' exists only in this PyTorch family (qualifier _pytorch), never in the classic converted-Keras SpecDS entries (Beech/Spruce/Spruce_Deadwood/General), which have no w05 variant."
+      "description": "Documented runner-up (recommended[1]). 10x faster on CPU (AVX-VNNI), TestDS F1 0.760, certified lossless vs its fp32 reference. DISAMBIGUATION (corrected 2026-07-21): this is the 'w05' (width-0.5) build of the PyTorch UNet retrain, asset model_UNet_SpecDS_Beech_512_pytorch_w05_int8.onnx. It IS trained on SpecDS beech data — an earlier note here wrongly claimed 'SpecDS' named only the classic Keras models; the models-v1 rename settled the provenance. What still must not be conflated is the ARCHITECTURE/lineage: 'w05' exists only in this PyTorch family (qualifier _pytorch), never in the classic converted-Keras SpecDS entries (Beech/Spruce/Spruce_Deadwood/General), which have no w05 variant. APPLE SILICON: fp32 is the faster choice — int8 measures ~594 ms/image on CoreML against ~172 ms for fp32 (M2, onnxruntime 1.27, Spruce_Deadwood, batch 2), so the CoreML device default is the fp32 reference, not this build."
     },
     "UNet_PT_fp16": {
       "label": "UNet PyTorch w05 — GPU-optimised fp16 (lossless)",
@@ -276,7 +285,7 @@
       "size_mb": 15.5,
       "f1": 0.76,
       "lossless": true,
-      "description": "Tensor-Core fp16, TestDS F1 0.760 (lossless)."
+      "description": "Tensor-Core fp16, TestDS F1 0.760 (lossless). APPLE SILICON: do NOT pick this build. fp16 is pathological on the CoreML execution provider — 2735 ms/image against 187 ms for fp32 (M2, onnxruntime 1.27, Spruce_Deadwood, batch 2), i.e. 14.6x slower, and slower than the same file on the CPU provider. fp16 is for CUDA; on a Mac the device default stays fp32."
     },
     "UNet_R_Beech": {
       "label": "UNet R/Keras 512 retrain (beech) — fp32, F1 0.738",
@@ -290,7 +299,7 @@
       "size_mb": 124.6,
       "f1": 0.738,
       "lossless": true,
-      "description": "R reimplementation, two-stage LR-fixed, TestDS F1 0.738 (512 px)."
+      "description": "R reimplementation, two-stage LR-fixed, TestDS F1 0.738 (512 px). Also the automatic default on Apple Silicon (CoreML), where it is the fastest of the three precisions (~172 ms/image against ~594 int8 and ~2735 fp16; M2, onnxruntime 1.27)."
     },
     "UNet_R_Beech_fp16": {
       "label": "UNet R/Keras beech — GPU-optimised fp16",
@@ -304,7 +313,7 @@
       "size_mb": 62.3,
       "f1": 0.738,
       "lossless": true,
-      "description": "Post-training fp16, lossless."
+      "description": "Post-training fp16, lossless. APPLE SILICON: do NOT pick this build. fp16 is pathological on the CoreML execution provider — 2735 ms/image against 187 ms for fp32 (M2, onnxruntime 1.27, Spruce_Deadwood, batch 2), i.e. 14.6x slower, and slower than the same file on the CPU provider. fp16 is for CUDA; on a Mac the device default stays fp32."
     },
     "UNet_R_Beech_int8": {
       "label": "UNet R/Keras beech — CPU-optimised int8",
@@ -318,7 +327,7 @@
       "size_mb": 31.4,
       "f1": 0.74,
       "lossless": false,
-      "description": "Post-training static int8, TestDS F1 0.740 (models-v1 manifest)."
+      "description": "Post-training static int8, TestDS F1 0.740 (models-v1 manifest). APPLE SILICON: fp32 is the faster choice — int8 measures ~594 ms/image on CoreML against ~172 ms for fp32 (M2, onnxruntime 1.27, Spruce_Deadwood, batch 2), so the CoreML device default is the fp32 reference, not this build."
     },
     "DeepLab_Beech": {
       "label": "DeepLabV3+ (beech) — fp32, F1 0.742",
@@ -332,7 +341,7 @@
       "size_mb": 89.7,
       "f1": 0.742,
       "lossless": true,
-      "description": "Two-stage LR-fixed, TestDS F1 0.742."
+      "description": "Two-stage LR-fixed, TestDS F1 0.742. Also the automatic default on Apple Silicon (CoreML), where it is the fastest of the three precisions (~172 ms/image against ~594 int8 and ~2735 fp16; M2, onnxruntime 1.27)."
     },
     "DeepLab_Beech_fp16": {
       "label": "DeepLabV3+ beech — GPU-optimised fp16",
@@ -346,7 +355,7 @@
       "size_mb": 44.9,
       "f1": 0.742,
       "lossless": true,
-      "description": "Post-training fp16, lossless."
+      "description": "Post-training fp16, lossless. APPLE SILICON: do NOT pick this build. fp16 is pathological on the CoreML execution provider — 2735 ms/image against 187 ms for fp32 (M2, onnxruntime 1.27, Spruce_Deadwood, batch 2), i.e. 14.6x slower, and slower than the same file on the CPU provider. fp16 is for CUDA; on a Mac the device default stays fp32."
     },
     "HRNet_Beech": {
       "label": "HRNet (beech) — fp32, best F1 0.764",
@@ -360,7 +369,7 @@
       "size_mb": 64.4,
       "f1": 0.764,
       "lossless": true,
-      "description": "Two-stage LR-fixed, TestDS F1 0.764 — highest F1 in the zoo."
+      "description": "Two-stage LR-fixed, TestDS F1 0.764 — highest F1 in the zoo. Also the automatic default on Apple Silicon (CoreML), where it is the fastest of the three precisions (~172 ms/image against ~594 int8 and ~2735 fp16; M2, onnxruntime 1.27)."
     },
     "HRNet_Beech_fp16": {
       "label": "HRNet beech — GPU-optimised fp16",
@@ -374,7 +383,7 @@
       "size_mb": 32.5,
       "f1": 0.764,
       "lossless": true,
-      "description": "Post-training fp16, lossless."
+      "description": "Post-training fp16, lossless. APPLE SILICON: do NOT pick this build. fp16 is pathological on the CoreML execution provider — 2735 ms/image against 187 ms for fp32 (M2, onnxruntime 1.27, Spruce_Deadwood, batch 2), i.e. 14.6x slower, and slower than the same file on the CPU provider. fp16 is for CUDA; on a Mac the device default stays fp32."
     },
     "General_hdf5": {
       "label": "General — original Keras HDF5 (needs TensorFlow)",

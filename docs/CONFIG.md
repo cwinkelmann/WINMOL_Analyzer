@@ -98,7 +98,10 @@ the shipped int8 default — so a CPU-only machine was told to download the
 > only the `_pytorch` family does.
 
 **Families and variants.** A family groups the precision variants of one
-trained model: `default` (fp32 reference), `cpu` (int8), `gpu` (fp16).
+trained model and names one per device class: `default` (fp32 reference),
+`cpu` (int8), `gpu` (fp16, CUDA), `coreml` (Apple Silicon — the fp32
+reference, see below). Each device key is optional; an absent one means the
+family default is kept for that device.
 Resolution rules (`Registry.resolve`):
 
 - An **explicit model id is never rewritten** — `General` always means the
@@ -111,9 +114,27 @@ Resolution rules (`Registry.resolve`):
   that gate — the machine's declared default, identical to
   `default_entry()`'s rule. `--variant fp32|int8|fp16` forces a variant or
   errors if the family lacks it.
-- Device for `auto` = `WINMOL_DEVICE` env (`gpu`/`cpu`) if set, else an
-  `nvidia-smi` probe. Apple-Silicon/CoreML machines report `cpu`; use
-  `WINMOL_DEVICE`/`WINMOL_ONNX_PROVIDERS` to steer if needed.
+- Device for `auto` = `WINMOL_DEVICE` env (`gpu`/`coreml`/`cpu`) if set,
+  else Darwin/arm64 → `coreml` and otherwise an `nvidia-smi` probe
+  (`gpu`/`cpu`). No onnxruntime import — the QGIS process must not need one.
+
+**Why CoreML is its own device class (fp32, not fp16).** fp16 is the right
+GPU precision on CUDA and a *pathological* one on Apple's execution
+provider. Measured on an M2 (onnxruntime 1.27, Spruce_Deadwood, batch 2):
+
+| precision | CoreML | CPU provider |
+|---|---|---|
+| fp32 | **0.172 s/image** | 2.237 |
+| int8 | 0.594 | 0.547 |
+| fp16 | 2.268 | 2.282 |
+
+fp16 on CoreML is 13x the fp32 cost and no faster than running the same file
+on the CPU, and CoreML reports 69 of 74 nodes supported for it — so this is
+not a silent fallback to CPU, it is fp16 itself. End to end on a 182-tile
+orthomosaic the same job took 429.8 s (fp16) against 61.2 s (fp32). int8
+gains nothing from CoreML either (0.594 vs 0.547 on CPU). Hence
+`coreml` → the fp32 reference. The CUDA (`gpu` → fp16) and CPU-only
+(`cpu` → int8) rules are unchanged.
 
 **Sources.** All 22 ONNX entries (the classic four included, since the
 repoint above) come from the `models-v1` release of

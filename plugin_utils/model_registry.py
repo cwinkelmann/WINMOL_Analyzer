@@ -9,7 +9,11 @@ the QGIS plugin). Two shapes are accepted:
   (always the URL basename), an optional checksum (``sha256`` for the
   model-zoo assets, ``md5`` for the Zenodo HDF5 originals), and metadata
   (family, backend, precision, F1, size). Families group precision
-  variants (fp32 reference / int8 CPU / fp16 GPU) of one trained model.
+  variants of one trained model and name the one to use per device
+  class: ``cpu`` (int8), ``gpu`` (fp16, CUDA) and ``coreml`` (fp32 —
+  fp16 is 14.6x slower on Apple's execution provider, measured; see
+  ``Registry._device_variant``). An absent key means "keep the fp32
+  reference", so ``coreml`` is optional and old registries still load.
 * **legacy v1** — a flat ``{"Name": "https://...url"}`` map, normalized
   into equivalent entries (installer-compatible ``<Name><ext>`` file
   naming, no checksums).
@@ -38,6 +42,7 @@ installer.py) — unit-testable and usable from the batch CLI.
 import hashlib
 import json
 import os
+import platform
 import subprocess
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -94,6 +99,11 @@ class Family:
     default: str                  # entry id (fp32 reference)
     cpu: Optional[str] = None     # entry id of the int8/CPU variant
     gpu: Optional[str] = None     # entry id of the fp16/GPU variant
+    #: Entry id for Apple Silicon (CoreML). A separate device class
+    #: because fp16 -- right on CUDA -- is pathological on CoreML; see
+    #: :meth:`Registry._device_variant`. Defaults to the family's fp32
+    #: reference when config.json declares none.
+    coreml: Optional[str] = None
 
 
 class Registry:
@@ -126,15 +136,45 @@ class Registry:
         return self.entries[canonical]
 
     def _device_variant(self, fam, device) -> Optional[ModelEntry]:
-        """The family's variant for ``device`` (cpu->int8, gpu->fp16), or
-        None when the family declares none.
+        """The family's variant for ``device``, or None when the family
+        declares none (callers then keep the family's fp32 default).
+
+        The rule, one device class per line:
+
+        * ``cpu``    -> int8   (small download, AVX-VNNI fast)
+        * ``gpu``    -> fp16   (CUDA tensor cores)
+        * ``coreml`` -> fp32   (Apple Silicon; the family default when
+          the family names no coreml entry)
+
+        CoreML is deliberately NOT folded into "gpu". It is a GPU by
+        every other measure -- HardwareInfo reports accelerator 'coreml'
+        with gpu_count 1 -- but fp16 is pathological on that execution
+        provider: measured on an M2 (onnxruntime 1.27, Spruce_Deadwood,
+        batch 2) fp16/CoreML costs 2735 ms per image against 187 ms for
+        fp32/CoreML, a 14.6x penalty, and is even slower than the same
+        fp16 model on the CPU provider (2268 ms). It is not a silent
+        fallback either: CoreML reports 69 of 74 nodes supported and
+        still runs that slowly. End to end on a 182-tile orthomosaic the
+        same run took 429.8 s on fp16 against 61.2 s on fp32.
 
         The ONE place the device->variant rule lives: both
         ``resolve(variant="default")`` and :meth:`default_entry` go
         through it, so the two APIs cannot answer "what runs on this
         machine" differently again.
         """
-        cand_id = fam.cpu if device == "cpu" else fam.gpu
+        if device == "cpu":
+            cand_id = fam.cpu
+        elif device == "coreml":
+            # ``or fam.default``: on CoreML the fp32 reference is the
+            # measured-best of the three precisions (fp32 0.172 s/image,
+            # int8 0.594, fp16 2.268), so a family that declares no
+            # coreml entry must land on fp32 -- NOT on the registry's
+            # declared int8 default, which is a CPU-size/speed decision.
+            # That makes the config.json key documentation and an
+            # override point rather than the thing holding the rule up.
+            cand_id = fam.coreml or fam.default
+        else:
+            cand_id = fam.gpu
         return self.entries.get(cand_id) if cand_id else None
 
     def resolve(self, name, device="auto", variant="auto") -> ModelEntry:
@@ -144,9 +184,10 @@ class Registry:
           ``variant``/``device`` (so "General" always means the fp32
           GenDS model, exactly as before the registry existed).
         * A family id picks the family default; with ``variant="auto"``
-          the device variant (cpu->int8, gpu->fp16) is substituted ONLY
-          when that variant is certified lossless, keeping results
-          stable. ``variant="default"`` takes the device variant
+          the device variant (cpu->int8, gpu->fp16, coreml->fp32) is
+          substituted ONLY when that variant is certified lossless,
+          keeping results stable. ``variant="default"`` takes the
+          device variant
           WITHOUT that gate — it is the machine's declared default, the
           same rule :meth:`default_entry` applies, and it is what the
           GUI opens on. A forced variant ("fp32"/"int8"/"fp16") selects
@@ -205,8 +246,10 @@ class Registry:
         also ``gui_default``. That declaration fixes the *domain* (which
         trained model), and this method fixes the *precision* for the
         machine at hand: the declared default's family supplies the
-        int8 variant on CPU and the fp16 variant on GPU, falling back to
-        the declared entry itself when the family has no such variant.
+        int8 variant on CPU, the fp16 variant on a CUDA GPU and the fp32
+        reference on Apple Silicon/CoreML (see
+        :meth:`_device_variant`), falling back to the declared entry
+        itself when the family has no such variant.
 
         This deliberately does NOT go through :meth:`resolve`'s
         lossless-only ``auto`` gate — it is ``resolve(family,
@@ -381,8 +424,8 @@ def _parse_v2(raw, config_path):
         default = spec.get("default")
         fam = Family(id=fid, label=str(spec.get("label", fid)),
                      default=default, cpu=spec.get("cpu"),
-                     gpu=spec.get("gpu"))
-        for ref in (fam.default, fam.cpu, fam.gpu):
+                     gpu=spec.get("gpu"), coreml=spec.get("coreml"))
+        for ref in (fam.default, fam.cpu, fam.gpu, fam.coreml):
             if ref is not None and ref not in entries:
                 raise ValueError(
                     f"family {fid!r} references unknown model {ref!r}")
@@ -414,17 +457,34 @@ def local_path(entry, model_dir) -> str:
 
 
 def detect_device() -> str:
-    """"gpu" or "cpu". WINMOL_DEVICE env overrides; else an nvidia-smi
-    probe (same pattern as winmol_batch.detect_gpu_count). No
-    onnxruntime import — the QGIS process must not need it."""
+    """"gpu" (CUDA), "coreml" (Apple Silicon) or "cpu".
+
+    WINMOL_DEVICE env overrides; else Apple Silicon is recognised from
+    the platform and everything else falls back to an nvidia-smi probe
+    (same pattern as winmol_batch.detect_gpu_count). No onnxruntime
+    import — the QGIS process must not need it — so CoreML is inferred
+    from Darwin/arm64, the same gate
+    ``onnx_runtime.active_accelerator`` applies before it will call a
+    session CoreML. Apple Silicon never carries an NVIDIA GPU, so the
+    two probes cannot disagree.
+    """
     forced = os.environ.get("WINMOL_DEVICE", "").strip().lower()
     if forced in ("gpu", "cuda"):
         return "gpu"
+    if forced in ("coreml", "metal", "mps"):
+        return "coreml"
     if forced == "cpu":
         return "cpu"
+    if _is_apple_silicon():
+        return "coreml"
     if "probe" not in _DEVICE_PROBE_CACHE:
         _DEVICE_PROBE_CACHE["probe"] = _probe_nvidia()
     return _DEVICE_PROBE_CACHE["probe"]
+
+
+def _is_apple_silicon() -> bool:
+    return (platform.system() == "Darwin"
+            and platform.machine() == "arm64")
 
 
 def _probe_nvidia() -> str:

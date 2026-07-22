@@ -364,7 +364,8 @@ def main(argv: List[str]) -> int:
             "Precision variant when MODEL is a family id (e.g. unet_pt): "
             "'auto' substitutes the device variant only when it is "
             "certified lossless; 'default' takes the device variant "
-            "(int8 on CPU, fp16 on GPU) regardless — what the GUI opens "
+            "(int8 on CPU, fp16 on a CUDA GPU, fp32 on Apple "
+            "Silicon/CoreML) regardless — what the GUI opens "
             "on; fp32/int8/fp16 force one. Explicit model ids (e.g. "
             "Spruce_Deadwood, UNet_PT_int8) are never rewritten."
         ),

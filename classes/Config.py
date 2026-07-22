@@ -85,11 +85,19 @@ class Config(object):
     # user reported b4..b9 rising 0.340 -> 1.135 s/tile without stopping).
     # 0 disables the guard.
     prediction_batch_autotune_runaway_factor = 1.5
-    # CoreML (Apple Silicon) prices batching very differently from CUDA: it
-    # runs 69 of this U-Net's 74 nodes, but per-image cost RISES monotonically
-    # with batch size. Measured on Spruce.onnx (M2, onnxruntime 1.27):
-    #   b1 0.228  b2 0.285  b6 0.435  b8 0.498  s/image
-    # i.e. the memory-derived default of 4-8 is ~2x slower per tile than b1.
+    # CoreML (Apple Silicon) prices batching differently from CUDA, which
+    # scales with batch size. Re-measured 2026-07-22 on the file the plugin
+    # now actually loads there -- the fp32 Spruce_Deadwood build, since
+    # CoreML's device default was changed from fp16 to fp32 (fp16 is 14.6x
+    # slower on that provider; see plugin_utils/model_registry) -- on an M2,
+    # onnxruntime 1.27:
+    #   b1 0.184  b2 0.172  b4 0.183  s/image
+    # Per-image cost is FLAT to ~7% here, with b2 marginally best; the
+    # earlier table in this comment (b1 0.228 ... b8 0.498, rising
+    # monotonically) was taken on a different model and no longer describes
+    # the shipped path. The cap stays 2 because 2 is the measured optimum
+    # and it keeps the memory-derived default (4-8) out of the flat-to-worse
+    # regime, not because batching is inherently harmful here.
     # Batch size does not affect output (verified: max abs diff 0.0 b1/b4/b8),
     # so this is a pure throughput cap. Set None to disable.
     prediction_batch_max_coreml = 2
