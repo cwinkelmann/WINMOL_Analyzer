@@ -308,3 +308,96 @@ def test_hardware_info_constructs_without_the_new_fields():
     hw = HardwareInfo(cpu_count=4, total_ram_gb=8.0, gpu_count=0)
     assert hw.accelerator == "cpu"
     assert hw.accelerator_label == "CPU"
+
+
+# --------------------------------------------------------------------------
+# The banner
+# --------------------------------------------------------------------------
+
+def _image_processor(model_path="model.onnx"):
+    import winmol_run
+    return winmol_run.ImageProcessing(
+        model_path, "in.tif", "stem.tif", "out", "Stems")
+
+
+def test_banner_has_no_tensorflow_or_cuda_noise(monkeypatch, capsys):
+    """The TF-free plugin venv is the normal case, not an error."""
+    import winmol_run
+
+    fake_platform(monkeypatch, "Darwin", "arm64")
+    fake_providers(monkeypatch, COREML_PROVIDERS)
+    monkeypatch.setattr(winmol_run, "_import_tensorflow", lambda: None)
+    monkeypatch.setattr(winmol_run, "_nvidia_driver_version", lambda: None)
+
+    _image_processor().report_runtime_env()
+    out = capsys.readouterr().out
+
+    assert "Tensorflow error" not in out
+    assert "Check CUDA environment" not in out
+    assert "cuDNN" not in out
+    assert "No NVIDIA GPU available" not in out
+    assert "onnxruntime" in out
+    assert "Apple Silicon GPU (Metal/CoreML)" in out
+
+
+def test_banner_mentions_tensorflow_only_for_a_legacy_keras_model(
+        monkeypatch, capsys):
+    import winmol_run
+
+    class FakeTF:
+        __version__ = "2.16.2"
+
+    fake_platform(monkeypatch, "Linux")
+    fake_providers(monkeypatch, CPU_ONLY_PROVIDERS)
+    monkeypatch.setattr(winmol_run, "_import_tensorflow", lambda: FakeTF())
+    monkeypatch.setattr(winmol_run, "_nvidia_driver_version", lambda: None)
+
+    _image_processor("model.onnx").report_runtime_env()
+    assert "TensorFlow" not in capsys.readouterr().out
+
+    _image_processor("legacy.hdf5").report_runtime_env()
+    out = capsys.readouterr().out
+    assert "TensorFlow 2.16.2" in out
+
+
+def test_banner_reports_the_nvidia_driver_only_when_present(
+        monkeypatch, capsys):
+    import winmol_run
+
+    fake_platform(monkeypatch, "Linux")
+    fake_providers(monkeypatch, CUDA_PROVIDERS)
+    monkeypatch.setattr(winmol_run, "_import_tensorflow", lambda: None)
+    monkeypatch.setattr(winmol_run, "_nvidia_driver_version", lambda: "550.54")
+
+    _image_processor().report_runtime_env()
+    out = capsys.readouterr().out
+
+    assert "550.54" in out
+    assert "NVIDIA GPU (CUDA)" in out
+
+
+def test_hardware_line_speaks_of_cpu_cores_and_an_accelerator(
+        monkeypatch, capsys):
+    fake_platform(monkeypatch, "Darwin", "arm64")
+    no_nvidia_smi(monkeypatch)
+    fake_providers(monkeypatch, COREML_PROVIDERS)
+
+    _image_processor().detect_hardware()
+    out = capsys.readouterr().out
+
+    assert "CPU cores=" in out
+    assert "GPUs=0" not in out
+    assert "accelerator=Apple Silicon GPU (Metal/CoreML)" in out
+
+
+def test_hardware_line_says_cpu_when_there_is_no_accelerator(
+        monkeypatch, capsys):
+    fake_platform(monkeypatch, "Linux")
+    no_nvidia_smi(monkeypatch)
+    fake_providers(monkeypatch, CPU_ONLY_PROVIDERS)
+
+    _image_processor().detect_hardware()
+    out = capsys.readouterr().out
+
+    assert "GPUs=0" not in out
+    assert "accelerator=CPU (no GPU acceleration available)" in out
