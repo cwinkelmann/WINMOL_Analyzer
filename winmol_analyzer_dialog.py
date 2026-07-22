@@ -377,6 +377,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         ("models_verify_button", "clicked", "_setup_verify_selected"),
         ("models_delete_button", "clicked", "_setup_delete_selected"),
         ("models_open_folder_button", "clicked", "_open_models_dir"),
+        ("env_open_folder_button", "clicked", "_open_env_dir"),
         ("setup_go_detect_button", "clicked", "_go_to_detection"),
         ("setup_open_log_button", "clicked", "_go_to_log"),
         ("setup_banner_button", "clicked", "_go_to_setup"),
@@ -2163,10 +2164,16 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         if not getattr(self, "_setup_live", False):
             return
         info = self._env_snapshot(force=force_env)
+        usage = self._env_usage()
         self._set_label("env_state_label", setup_state.env_state_text(info))
         self._set_label("env_path_label", info.exe or "")
         self._set_label("env_detail_label",
-                        setup_state.env_detail_text(info, self._env_usage()))
+                        setup_state.env_detail_text(info, usage))
+        # Where the environment lives, and that uninstalling leaves it
+        # behind. QGIS has no uninstall hook — see _open_env_dir.
+        self._set_label(
+            "env_location_label",
+            setup_state.env_location_text(self._plugin_dir(), usage))
         self._model_rows = self._scan_models()
         self._refresh_model_tree()      # ...which applies the interlock
         self._apply_blocking_reason(info)
@@ -2519,6 +2526,14 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         layout = QtWidgets.QVBoxLayout(box)
         layout.addWidget(QtWidgets.QLabel(
             "Choose what to remove. Your own files are never touched.", box))
+        # The user's report: uninstalling the plugin leaves <profile>/winmol
+        # behind. It does, unavoidably — QGIS has no uninstall hook (see
+        # _open_env_dir) — so say so where the removal actually happens.
+        note = QtWidgets.QLabel(
+            setup_state.env_location_text(self._plugin_dir()), box)
+        note.setWordWrap(True)
+        note.setStyleSheet("color: gray;")
+        layout.addWidget(note)
         venv_cb = QtWidgets.QCheckBox("Virtual environment", box)
         venv_cb.setChecked(True)
         runtime_cb = QtWidgets.QCheckBox(
@@ -2713,6 +2728,29 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             QDesktopServices.openUrl(QUrl.fromLocalFile(self.models_dir))
         except Exception as exc:                   # pragma: no cover - GUI
             self.update_output_log(f"Could not open {self.models_dir}: {exc}")
+
+    def _open_env_dir(self):
+        """Open the managed root — the folder QGIS leaves behind.
+
+        Uninstalling the plugin runs pyplugin_installer's
+        ``uninstallPlugin``: ``unloadPlugin(key)`` then ``removeDir(
+        <profile>/python/plugins/WINMOL_Analyzer)``, and nothing else.
+        ``unload()`` is the SAME callback QGIS fires on disable, on
+        plugin reload and at application shutdown, so it cannot be used
+        to detect an uninstall — deleting from there would erase a
+        multi-GB venv every time QGIS closes. There is no uninstall hook
+        in the QGIS plugin API, so the leftover is surfaced here instead
+        of removed behind the user's back.
+        """
+        root = installer.managed_root(self._plugin_dir())
+        try:
+            if not os.path.isdir(root):
+                self.update_output_log(
+                    f"There is no WINMOL environment folder yet ({root}).")
+                return
+            QDesktopServices.openUrl(QUrl.fromLocalFile(root))
+        except Exception as exc:                   # pragma: no cover - GUI
+            self.update_output_log(f"Could not open {root}: {exc}")
 
     def load_layers_to_session(self):
         """Load outputs after processing finishes.

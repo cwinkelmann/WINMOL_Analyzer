@@ -183,7 +183,30 @@ class WINMOLAnalyzer:
         self.first_start = True
 
     def unload(self):
-        """Removes the plugin menu item and icon from QGIS GUI."""
+        """Removes the plugin menu item and icon from QGIS GUI.
+
+        It deliberately does NOT delete WINMOL's managed environment
+        under ``<QGIS profile>/winmol``, even though uninstalling the
+        plugin leaves it behind.
+
+        QGIS offers no uninstall hook. Read from the installed QGIS,
+        ``pyplugin_installer/installer.py::uninstallPlugin`` is exactly
+        ``unloadPlugin(key)`` followed by ``removeDir(HOME_PLUGIN_PATH +
+        "/" + plugin["id"])`` — and ``unloadPlugin`` calls THIS method,
+        the same one QGIS calls when the plugin is merely disabled,
+        reloaded, or when the application quits. Nothing distinguishes
+        the four cases here, so deleting from this method would erase a
+        multi-gigabyte venv every time QGIS closes.
+
+        The managed root is a deliberate SIBLING of the plugin folder
+        (``plugin_utils.installer.managed_root``) so that QGIS's
+        recursive plugin-folder delete never has to walk venv symlinks —
+        which means it is also out of ``removeDir``'s reach. Removing it
+        is therefore an explicit user action: the Setup tab names the
+        folder, offers "Open folder", and "Delete environment…" removes
+        it after an itemised confirmation. docs/SETUP.md documents the
+        manual route.
+        """
         # Stop any running background threads BEFORE QGIS drops the dialog
         # reference: destroying a still-running QThread (e.g. unloading/reloading
         # the plugin mid-run) triggers Qt's qFatal() and aborts all of QGIS.

@@ -430,6 +430,30 @@ def test_env_state_text_unsupported_and_missing_deps():
         "Ready — Python 3.11.15")
 
 
+def test_env_location_text_names_the_folder_and_the_uninstall_caveat(
+        tmp_path):
+    """The user's report: '<profile>/winmol stays untouched after
+    deinstalling'. QGIS has no uninstall hook, so the only honest
+    remedy is to say where it is and how to get rid of it."""
+    root = inst.managed_root(str(tmp_path))
+    text = ss.env_location_text(str(tmp_path))
+    assert root in text
+    assert "does NOT remove it" in text
+    assert "Delete environment" in text
+    # the size is appended only once the probe worker has measured it
+    assert "GB" not in text
+    sized = ss.env_location_text(
+        str(tmp_path), {"venv": 2_040_109_466, "runtime": 66_060_288})
+    assert "(2.0 GB)" in sized
+
+
+def test_env_location_text_is_read_only(tmp_path):
+    """It must not create the folder it describes."""
+    before = sorted(os.listdir(tmp_path))
+    ss.env_location_text(str(tmp_path), {"venv": 1})
+    assert sorted(os.listdir(tmp_path)) == before
+
+
 def test_env_detail_text_with_usage():
     info = _info()
     text = ss.env_detail_text(info, {"venv": 2_040_109_466,

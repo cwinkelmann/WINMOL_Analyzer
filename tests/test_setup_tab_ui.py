@@ -157,6 +157,7 @@ SETUP_WIDGETS = (
     "models_treeWidget", "models_download_button",
     "models_download_default_button", "models_verify_button",
     "models_delete_button", "models_open_folder_button",
+    "env_location_label", "env_open_folder_button",
     "setup_intro_label", "setup_ready_label", "setup_go_detect_button",
     "setup_status_label", "setup_progress_bar", "setup_detail_log",
     "setup_open_log_button",
@@ -356,7 +357,7 @@ NEW_SLOTS = (
     "_refresh_model_tree", "_refresh_setup_actions", "_on_tab_changed",
     "_open_models_dir", "_refresh_setup_state", "_enter_first_run",
     "_on_env_removed", "_on_models_changed", "_start_env_job",
-    "_start_dl_job", "_show_tab",
+    "_start_dl_job", "_show_tab", "_open_env_dir",
 )
 
 
@@ -975,3 +976,57 @@ def test_the_variant_labels_carry_the_download_size():
     assert "size_mb" in src and "MB" in src
     refresher = ast.unparse(_function_node("_refresh_variant_controls"))
     assert "_variant_item_text" in refresher and "setItemText" in refresher
+
+
+# --- AST: the environment QGIS leaves behind --------------------------------
+
+def test_unload_never_deletes_the_environment():
+    """QGIS has no uninstall hook: pyplugin_installer's uninstallPlugin is
+    unloadPlugin() + removeDir(<plugin dir>), and unloadPlugin calls the
+    plugin's unload() — the SAME callback fired on disable, on reload and
+    at application shutdown. Deleting from there would wipe a multi-GB
+    venv every time QGIS closes."""
+    plugin_file = os.path.join(REPO, "winmol_analyzer.py")
+    module = ast.parse(open(plugin_file, encoding="utf-8").read())
+    unload = None
+    for node in ast.walk(module):
+        if isinstance(node, ast.FunctionDef) and node.name == "unload":
+            unload = node
+    assert unload is not None
+    destructive = {"rmtree", "remove", "unlink", "rmdir",
+                   "remove_environment", "removeDir"}
+    offenders = [call.lineno for call in ast.walk(unload)
+                 if isinstance(call, ast.Call)
+                 and getattr(call.func, "attr", None) in destructive]
+    assert not offenders, (
+        f"unload() deletes something at {offenders}; it cannot tell an "
+        "uninstall from a disable/reload/quit")
+    # ...and the reason is written down where the next reader will look.
+    doc = ast.get_docstring(unload) or ""
+    assert "uninstall" in doc.lower()
+
+
+def test_the_setup_tab_names_the_folder_uninstall_leaves_behind():
+    """The user's report: '<profile>/winmol stays untouched after
+    deinstalling'. It must at least be visible and openable."""
+    assert "_open_env_dir" in _function_names()
+    node = _function_node("_open_env_dir")
+    src = ast.unparse(node)
+    assert "managed_root" in src and "openUrl" in src
+    # and nothing destructive hides behind an "open folder" button
+    assert "rmtree" not in src and "remove_environment" not in src
+
+    refresh = ast.unparse(_function_node("_refresh_setup_state"))
+    assert "env_location_text" in refresh
+    scope = ast.unparse(_function_node("_ask_deletion_scope"))
+    assert "env_location_text" in scope, (
+        "the deletion dialog must say what uninstalling does not remove")
+
+
+def test_deleting_the_environment_still_needs_an_explicit_confirmation():
+    """Making the leftover removable must not make it removable by
+    accident: the scope dialog and the itemised confirmation both stay."""
+    delete = ast.unparse(_function_node("_setup_delete_env"))
+    assert "_ask_deletion_scope" in delete
+    confirm = ast.unparse(_function_node("_confirm_deletion"))
+    assert "Cancel" in confirm and "cannot be undone" in confirm
