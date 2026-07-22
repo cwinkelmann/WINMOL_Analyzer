@@ -20,22 +20,62 @@ class Config(object):
     prediction_batch_cpu = 1
     prediction_batch_gpu = 4
     prediction_batch_max_gpu = 16
+    # Separate ceiling for a cpu_stream plan. It used to share
+    # prediction_batch_max_gpu, so a 4-core CPU box swept b1..b16 -- 16
+    # candidates before the first tile was written.
+    prediction_batch_max_cpu = 8
     prediction_batch_multi_gpu = 12     # local per-worker batch
+    # Manual pin, in tiles. None (or 0) = let the planner size the batch and
+    # let the autotune refine it. Any value >= 1 is used verbatim by
+    # build_execution_plan and skips the autotune completely -- the escape
+    # hatch for "just use this and start working". Exposed in the QGIS plugin
+    # as Detection -> Prediction batch size, and settable from the CLI with
+    # WINMOL_CONFIG_OVERRIDES_JSON='{"prediction_batch_override": 4}'.
+    # NOTE: prediction_batch_size below is planner-owned and overwritten on
+    # every run, so it can never serve as the pin.
+    prediction_batch_override = None
     # Tri-state, resolved by plugin_utils.autotune_cache.resolve_mode():
     #   "auto"  -- use the persisted result if one matches this device+model,
     #              otherwise tune ONCE and save it (the default).
     #   False   -- never tune. Pin this for benchmarks and determinism runs.
     #   True    -- tune on every run and refresh the cache (force a re-tune).
-    # Tuning times up to 13 candidate batch sizes x 5 repeats before the first
-    # tile, and on Apple/CoreML each distinct batch size forces a model
-    # recompile: measured 62 s of stall on the 9-tile crop fixture, for ~6 %
-    # throughput. Worth paying once per device+model, never worth paying every
-    # run -- hence the cache. $WINMOL_BATCH_AUTOTUNE (off|auto|force)
-    # overrides this without touching config.
+    # Tuning costs real time before the first tile is written, and on
+    # Apple/CoreML each distinct batch size forces a model recompile. Worth
+    # paying once per device+model, never worth paying every run -- hence the
+    # cache. $WINMOL_BATCH_AUTOTUNE (off|auto|force) overrides this without
+    # touching config.
     prediction_batch_autotune = "auto"
-    prediction_batch_autotune_patience = 4
-    prediction_batch_autotune_repeats = 5
-    prediction_batch_autotune_min_improve = 0.005
+    # --- how the sweep is bounded (safety first) ---
+    # The sweep is capped by FREE memory before anything is timed: never ask
+    # for more than this share of what is actually free right now. A user's
+    # Linux box was taken down by the old unbounded sweep marching towards
+    # b16 while six producer threads held prefetched tiles -- host RAM
+    # exhaustion raises no exception, it just swaps until the OOM killer
+    # fires. 0.6 leaves headroom for exactly those neighbours.
+    prediction_batch_autotune_memory_fraction = 0.6
+    # Device bytes per tile ~= img_h * img_w * (channels + classes) * 4 bytes
+    # * this factor. Measured with the Spruce ONNX model on the CPU EP:
+    # ~113 MB of working set per tile at b8 against a 4.19 MB raw tensor,
+    # i.e. ~28x. 32 is that, rounded up.
+    prediction_batch_autotune_activation_factor = 32
+    # Hard cap on how many candidates may be timed, whatever the memory
+    # ceiling allows.
+    prediction_batch_autotune_max_candidates = 6
+    # --- when the sweep stops ---
+    prediction_batch_autotune_patience = 2
+    prediction_batch_autotune_repeats = 3
+    # A candidate counts as an improvement only if it is faster by BOTH a
+    # relative margin and an absolute one. The absolute bar is what stops the
+    # sweep chasing 3 ms differences: 0.337 vs 0.340 s/tile is noise, not a
+    # reason to time another batch size.
+    prediction_batch_autotune_min_improve = 0.005      # fraction
+    prediction_batch_autotune_min_improve_s = 0.2      # seconds per tile
+    # Abort immediately (regardless of patience) once a candidate is this
+    # much slower than the best seen. Past the memory cliff the times explode
+    # -- b7=0.471 then b9=1.135 against a best of 0.340 -- and marching on is
+    # exactly what preceded the crash. 1.25 sits above run-to-run jitter
+    # (~3 %) and well below the first real cliff (1.4x).
+    prediction_batch_autotune_degrade_factor = 1.25
     prediction_batch_autotune_stop_on_oom = True
     prediction_batch_autotune_quiet = True
     # Abandon the sweep as soon as a candidate is this much slower than the

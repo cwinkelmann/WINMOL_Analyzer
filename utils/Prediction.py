@@ -16,6 +16,7 @@ from rasterio.enums import Resampling
 from rasterio.windows import Window
 from skimage.transform import resize
 
+from classes.HardwareInfo import UNIFIED_MEMORY_GPU_SHARE, HardwareInfo
 from classes.Timer import Timer
 from plugin_utils import autotune_cache
 from utils import IO
@@ -206,13 +207,165 @@ def _format_eta(seconds: float) -> str:
     return f"{m:02d}m {s:02d}s"
 
 
-def _prediction_batch_candidates(config, initial_batch: int) -> list[int]:
+#: How far above the starting batch the sweep may go when free memory could
+#: not be determined at all. Deliberately tiny: an unbounded sweep on an
+#: unknown machine is what took a user's Linux box down.
+AUTOTUNE_BLIND_HEADROOM = 2
+
+_GB = float(1024 ** 3)
+
+
+def _batch_override(config):
+    """The user's manual pin as a positive int, or None.
+
+    ``Config.prediction_batch_size`` cannot serve this purpose: the planner
+    overwrites it on every run (ExecutionPlan, all three scenarios).
+    """
+    raw = getattr(config, 'prediction_batch_override', None)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 1 else None
+
+
+def _available_ram_bytes():
+    """Free host RAM in bytes, or None when psutil is unavailable.
+
+    psutil is in requirements/plugin.txt and requirements/gpu.txt but NOT in
+    requirements/base.txt, so this must degrade rather than raise.
+    """
+    try:
+        import psutil
+        return float(psutil.virtual_memory().available)
+    except Exception:
+        return None
+
+
+def _free_memory_bytes(config):
+    """``(bytes, source)`` describing the memory the sweep may spend from.
+
+    Returns ``(None, reason)`` when it cannot be determined; the caller then
+    falls back to :data:`AUTOTUNE_BLIND_HEADROOM`.
+    """
+    hardware = getattr(config, 'hardware', None)
+    accelerator = str(getattr(hardware, 'accelerator', '') or '').lower()
+
+    if accelerator == 'cuda':
+        try:
+            free = HardwareInfo.free_gpu_memory_gb()
+        except Exception:                                   # pragma: no cover
+            free = []
+        usable = [f for f in free if f and f > 0]
+        if usable:
+            # The smallest visible device bounds the run: the same batch size
+            # is used on all of them.
+            gpu_free = min(usable) * _GB
+            host = _available_ram_bytes()
+            if host is not None and 0 < host < gpu_free:
+                # Bound by BOTH. A run planned for CUDA whose session
+                # silently fell back to the CPU provider allocates on the
+                # host, and that is exactly the box that froze: plenty of
+                # VRAM free, no VRAM in use, and the arena eating RAM.
+                return host, 'psutil available RAM (below free VRAM)'
+            return gpu_free, 'nvidia-smi memory.free'
+        return None, 'nvidia-smi did not report free GPU memory'
+
+    available = _available_ram_bytes()
+    if available is None or available <= 0:
+        return None, 'psutil unavailable'
+    if accelerator == 'coreml':
+        # Unified memory: the CPU, the OS and the raster reader draw on the
+        # same pool, so claim only the share HardwareInfo already reports as
+        # the "GPU" budget.
+        return (available * UNIFIED_MEMORY_GPU_SHARE,
+                'unified memory (psutil available)')
+    return available, 'psutil available RAM'
+
+
+def _estimated_bytes_per_tile(config) -> float:
+    """Device memory one tile costs, activations included."""
+    height = int(getattr(config, 'img_height', 512) or 512)
+    width = int(getattr(config, 'img_width', 512) or 512)
+    channels = int(getattr(config, 'n_channels', 3) or 3)
+    classes = int(getattr(config, 'num_classes', 1) or 1)
+    raw = float(height * width * (channels + classes) * 4)
+    factor = float(getattr(
+        config, 'prediction_batch_autotune_activation_factor', 32) or 32)
+    return max(1.0, raw * max(1.0, factor))
+
+
+def _memory_batch_ceiling(config, initial_batch: int) -> dict:
+    """The largest batch the sweep may TRY, decided before anything is timed.
+
+    This is the safety cap the whole feature hangs on: a GPU OOM is caught and
+    halved (utils/onnx_runtime raises OnnxOutOfMemoryError), but host RAM
+    exhaustion raises nothing at all -- the box swaps and dies. Only a
+    pre-emptive ceiling helps.
+    """
     initial = max(1, int(initial_batch))
-    max_batch_attr = getattr(config, 'prediction_batch_max_gpu', initial)
-    max_batch = max(
-        initial,
-        int(max_batch_attr if max_batch_attr is not None else initial),
+    free, source = _free_memory_bytes(config)
+    per_tile = _estimated_bytes_per_tile(config)
+
+    if not free or free <= 0:
+        return {
+            'ceiling': initial + AUTOTUNE_BLIND_HEADROOM,
+            'free_bytes': None,
+            'source': source,
+            'fraction': None,
+            'bytes_per_tile': per_tile,
+            'blind': True,
+        }
+
+    fraction = float(getattr(
+        config, 'prediction_batch_autotune_memory_fraction', 0.6) or 0.6)
+    fraction = min(0.95, max(0.05, fraction))
+    ceiling = int((free * fraction) // per_tile)
+    return {
+        'ceiling': max(initial, ceiling),
+        'free_bytes': free,
+        'source': source,
+        'fraction': fraction,
+        'bytes_per_tile': per_tile,
+        'blind': False,
+    }
+
+
+def _describe_memory_ceiling(budget: dict, label: str) -> str:
+    """One honest line about where the ceiling came from."""
+    if budget.get('blind'):
+        return (f"{label} autotune: free memory unknown "
+                f"({budget['source']}); capping at "
+                f"b{budget['ceiling']}")
+    return (
+        f"{label} autotune: memory ceiling b{budget['ceiling']} "
+        f"({budget['free_bytes'] / _GB:.1f} GB free per "
+        f"{budget['source']}, "
+        f"{budget['fraction'] * 100:.0f}% budget, "
+        f"~{budget['bytes_per_tile'] / (1024 ** 2):.0f} MB/tile)"
     )
+
+
+def _batch_ceiling_attr(config) -> str:
+    """Which configured ceiling applies -- the CPU one or the GPU one."""
+    hardware = getattr(config, 'hardware', None)
+    accelerator = str(getattr(hardware, 'accelerator', '') or '').lower()
+    if hardware is not None and accelerator not in ('cuda', 'coreml'):
+        return 'prediction_batch_max_cpu'
+    return 'prediction_batch_max_gpu'
+
+
+def _configured_batch_max(config, initial_batch: int) -> int:
+    """The configured ceiling for this device, ignoring free memory."""
+    initial = max(1, int(initial_batch))
+    value = getattr(config, _batch_ceiling_attr(config), None)
+    if value is None:
+        value = getattr(config, 'prediction_batch_max_gpu', initial)
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        value = initial
+    value = max(initial, value)
     # On CoreML larger batches are strictly slower per image, so sweeping up to
     # prediction_batch_max_gpu only burns time measuring known losers (see
     # Config.prediction_batch_max_coreml).
@@ -220,8 +373,34 @@ def _prediction_batch_candidates(config, initial_batch: int) -> list[int]:
     if getattr(hardware, 'accelerator', None) == 'coreml':
         cap = getattr(config, 'prediction_batch_max_coreml', 2)
         if cap is not None:
-            max_batch = max(initial, min(max_batch, int(cap)))
-    return list(range(initial, max_batch + 1))
+            value = max(initial, min(value, int(cap)))
+    return value
+
+
+def _prediction_batch_candidates(
+    config, initial_batch: int, ceiling: int = None,
+) -> list[int]:
+    """Batch sizes the autotune may time, smallest first.
+
+    ``ceiling`` is the memory-derived cap; omit it and only the configured
+    ceilings apply (the pre-memory-awareness behaviour, kept for callers that
+    only want the configured range).
+    """
+    initial = max(1, int(initial_batch))
+    max_batch = _configured_batch_max(config, initial)
+    if ceiling is not None:
+        max_batch = max(initial, min(max_batch, int(ceiling)))
+    candidates = list(range(initial, max_batch + 1))
+
+    max_candidates = getattr(
+        config, 'prediction_batch_autotune_max_candidates', None)
+    try:
+        max_candidates = int(max_candidates)
+    except (TypeError, ValueError):
+        max_candidates = 0
+    if max_candidates >= 1:
+        candidates = candidates[:max_candidates]
+    return candidates
 
 
 class TileBatchProducer(threading.Thread):
@@ -413,39 +592,135 @@ def _time_batch_candidate(
     return warm_used, per_tile, oomed
 
 
-def _autotune_stop_reason(
-    cand,
-    used,
-    per_tile,
-    best_batch,
-    best_per_tile,
-    stale_steps,
-    patience,
-    runaway_factor,
-):
-    """Why the sweep should stop after this candidate, or None to continue.
+def _autotune_rules(config) -> dict:
+    """The stop rules, resolved from config.
 
-    Only ever stops on candidates LARGER than the current best, so the knee is
-    always explored before giving up.
-
-    The runaway rule exists because `patience` alone is not enough: when the
-    curve degrades monotonically (CoreML, and CPU past its optimum) each extra
-    candidate is both slower per tile AND larger, so the sweep gets
-    progressively more expensive exactly when it has least to gain. A user
-    watched b4..b9 climb 0.340 -> 1.135 s/tile without it stopping.
+    The getattr fallbacks MUST match classes/Config.py: real runs read
+    Config, stub-config tests read the fallbacks, and if the two disagree the
+    tests measure a rule production never uses.
     """
-    if cand <= best_batch:
-        return None
-    if (runaway_factor > 0.0
-            and np.isfinite(best_per_tile)
-            and per_tile > best_per_tile * runaway_factor):
-        return (
-            f"stopped: b{used} is {per_tile / best_per_tile:.1f}x slower "
-            f"than the best (b{best_batch}); larger batches only get worse"
+    degrade_factor = float(getattr(
+        config, 'prediction_batch_autotune_degrade_factor', 1.25) or 0.0)
+    if degrade_factor <= 1.0:
+        degrade_factor = float('inf')       # explicitly disabled
+    return {
+        'patience': max(1, int(getattr(
+            config, 'prediction_batch_autotune_patience', 2))),
+        'min_improve': max(0.0, float(getattr(
+            config, 'prediction_batch_autotune_min_improve', 0.005))),
+        'min_improve_s': max(0.0, float(getattr(
+            config, 'prediction_batch_autotune_min_improve_s', 0.2))),
+        'degrade_factor': degrade_factor,
+        'stop_on_oom': bool(getattr(
+            config, 'prediction_batch_autotune_stop_on_oom', True)),
+        'repeats': max(1, int(getattr(
+            config, 'prediction_batch_autotune_repeats', 3))),
+        # The runaway rule is the degradation guard's softer sibling: it only
+        # ever fires on a candidate LARGER than the current best, so the knee
+        # is always explored first. 0 disables it.
+        'runaway_factor': max(0.0, float(getattr(
+            config, 'prediction_batch_autotune_runaway_factor', 1.5) or 0.0)),
+    }
+
+
+def _sweep_batch_candidates(
+    sample_tiles, sample_masks, model, config, candidates, rules, label,
+):
+    """Time candidates in order and stop as soon as it stops being useful.
+
+    Returns ``(best_batch, best_per_tile, results, stop_reason)``;
+    ``stop_reason`` is None when the list was simply exhausted.
+    """
+    best_batch = candidates[0]
+    best_per_tile = float('inf')
+    stale_steps = 0
+    results = []
+    stop_reason = None
+    oom_ceiling = None
+
+    for index, cand in enumerate(candidates, start=1):
+        if oom_ceiling is not None and cand > oom_ceiling:
+            stop_reason = (
+                f"working ceiling lowered to b{oom_ceiling} after an "
+                "out-of-memory fallback"
+            )
+            break
+
+        used, per_tile, oomed = _time_batch_candidate(
+            sample_tiles, sample_masks, model, config, cand,
+            repeats=rules['repeats'],
         )
-    if stale_steps >= patience:
-        return f"stopped after {stale_steps} non-improving step(s)"
-    return None
+
+        results.append((cand, used, per_tile, oomed))
+        print(
+            f"{label} autotune candidate {index}/{len(candidates)}: "
+            f"b{used} = {per_tile:.3f}s/tile"
+            f"{' OOM' if oomed else ''}",
+            flush=True,
+        )
+
+        # An improvement has to clear BOTH bars. The absolute one is what
+        # ends the sweep: 0.337 against 0.340 s/tile is jitter, and treating
+        # it as progress is what kept the old loop walking to b10.
+        improved = (
+            not np.isfinite(best_per_tile)
+            or (per_tile < best_per_tile * (1.0 - rules['min_improve'])
+                and per_tile <= best_per_tile - rules['min_improve_s'])
+        )
+        degraded = (
+            np.isfinite(best_per_tile)
+            and per_tile > best_per_tile * rules['degrade_factor']
+        )
+
+        if improved:
+            best_per_tile = per_tile
+            best_batch = used
+            stale_steps = 0
+        else:
+            stale_steps += 1
+
+        if oomed:
+            # Never try anything larger after an out-of-memory fallback,
+            # whatever stop_on_oom says: the next candidate is by definition
+            # further past the cliff.
+            oom_ceiling = used
+            if rules['stop_on_oom']:
+                stop_reason = f"stopped after OOM fallback at candidate {cand}"
+                break
+
+        # Degradation beats patience: past the memory cliff the times
+        # explode, and growing the batch from there is what precedes a
+        # machine-wide freeze.
+        if degraded:
+            stop_reason = (
+                f"aborted at b{cand}: {per_tile / best_per_tile:.1f}x the "
+                f"best ({best_per_tile:.3f}s/tile at b{best_batch}) "
+                "-- degradation guard"
+            )
+            break
+
+        if stale_steps >= rules['patience'] and cand > best_batch:
+            stop_reason = (
+                f"stopped after {stale_steps} non-improving step(s) "
+                f"(< {rules['min_improve_s']:.2f}s/tile gain)"
+            )
+            break
+
+        # Softer than the degradation guard and only above the best so far:
+        # once a LARGER batch is measurably slower, every larger one is both
+        # slower and more expensive to measure. A user watched b4..b9 climb
+        # 0.340 -> 1.135 s/tile with nothing stopping it.
+        runaway = rules['runaway_factor']
+        if (runaway > 0.0 and cand > best_batch
+                and np.isfinite(best_per_tile)
+                and per_tile > best_per_tile * runaway):
+            stop_reason = (
+                f"stopped: b{used} is {per_tile / best_per_tile:.1f}x slower "
+                f"than the best (b{best_batch}); larger batches only get worse"
+            )
+            break
+
+    return best_batch, best_per_tile, results, stop_reason
 
 
 def _autotune_batch_size(
@@ -457,6 +732,17 @@ def _autotune_batch_size(
     label='Prediction micro-batch',
 ):
     initial = max(1, int(initial_batch))
+
+    # A manual pin beats everything: no probing, no timing, no cache.
+    override = _batch_override(config)
+    if override is not None:
+        print(
+            f"{label} autotune: skipped, batch pinned to b{override} "
+            "by the user",
+            flush=True,
+        )
+        return override
+
     mode = autotune_cache.resolve_mode(config)
     if mode == 'off':
         return initial
@@ -477,7 +763,14 @@ def _autotune_batch_size(
         print(f"{label} autotune: cache key unavailable ({exc}); tuning.",
               flush=True)
 
-    max_batch = max(_prediction_batch_candidates(config, initial) or [initial])
+    # Bound the sweep by FREE memory BEFORE timing anything. Everything
+    # below -- the candidate list, the cache range check -- is derived from
+    # this ceiling.
+    budget = _memory_batch_ceiling(config, initial)
+    ceiling = int(budget['ceiling'])
+
+    max_batch = max(
+        _prediction_batch_candidates(config, initial, ceiling) or [initial])
     if mode == 'auto' and key is not None:
         cached = autotune_cache.load(key, path=cache_file)
         if cached is not None and initial <= cached <= max_batch:
@@ -494,90 +787,48 @@ def _autotune_batch_size(
                 flush=True,
             )
 
-    patience = max(
-        1,
-        int(getattr(config, 'prediction_batch_autotune_patience', 2)),
-    )
-    min_improve = max(
-        0.0,
-        float(getattr(config, 'prediction_batch_autotune_min_improve', 0.02)),
-    )
-    stop_on_oom = bool(getattr(
-        config, 'prediction_batch_autotune_stop_on_oom', True,
-    ))
-    repeats = max(
-        1,
-        int(getattr(config, 'prediction_batch_autotune_repeats', 2)),
-    )
-    runaway_factor = max(0.0, float(getattr(
-        config, 'prediction_batch_autotune_runaway_factor', 1.5,
-    )))
+    rules = _autotune_rules(config)
 
     candidates = [
-        c for c in _prediction_batch_candidates(config, initial)
+        c for c in _prediction_batch_candidates(config, initial, ceiling)
         if c <= len(sample_tiles)
     ]
     if len(candidates) <= 1:
+        print(
+            f"{_describe_memory_ceiling(budget, label)}; "
+            f"nothing to tune, using b{initial}.",
+            flush=True,
+        )
         return initial
 
-    best_batch = candidates[0]
-    best_per_tile = float('inf')
-    stale_steps = 0
-    results = []
-    stop_reason = None
-
-    # The tuning loop is the ~60 s stall that got this feature disabled. Say
-    # so up front and tick per candidate, so neither the log nor the progress
-    # bar looks like a hang (plugin_utils/run_progress.py parses these).
+    # The tuning loop is the stall that got this feature disabled, and the
+    # unbounded version of it took a user's machine down. Say up front how
+    # far it may go and why, then tick per candidate so neither the log nor
+    # the progress bar looks like a hang (plugin_utils/run_progress.py parses
+    # the candidate lines -- do not change that prefix).
+    allowed_max = min(
+        ceiling, _configured_batch_max(config, initial), len(sample_tiles))
+    print(_describe_memory_ceiling(budget, label), flush=True)
     print(
         f"{label} autotune: timing {len(candidates)} batch size(s) "
-        f"{candidates[0]}-{candidates[-1]} x {repeats} repeat(s); "
-        "this runs once and the result is cached.",
+        f"b{candidates[0]}-b{candidates[-1]} x {rules['repeats']} "
+        f"repeat(s) (of b{initial}-b{allowed_max} allowed); "
+        f"stop rules: gain < {rules['min_improve_s']:.2f}s/tile "
+        f"x{rules['patience']}, abort at {rules['degrade_factor']:.2f}x the "
+        "best. This runs once and the result is cached.",
         flush=True,
     )
 
-    for index, cand in enumerate(candidates, start=1):
-        used, per_tile, oomed = _time_batch_candidate(
-            sample_tiles,
-            sample_masks,
-            model,
-            config,
-            cand,
-            repeats=repeats,
-        )
+    best_batch, best_per_tile, results, stop_reason = _sweep_batch_candidates(
+        sample_tiles, sample_masks, model, config, candidates, rules, label)
 
-        results.append((cand, used, per_tile, oomed))
-        print(
-            f"{label} autotune candidate {index}/{len(candidates)}: "
-            f"b{used} = {per_tile:.3f}s/tile"
-            f"{' OOM' if oomed else ''}",
-            flush=True,
-        )
-
-        improved = (
-            not np.isfinite(best_per_tile)
-            or per_tile < best_per_tile * (1.0 - min_improve)
-        )
-
-        if improved:
-            best_per_tile = per_tile
-            best_batch = used
-            stale_steps = 0
-        else:
-            stale_steps += 1
-
-        if oomed and stop_on_oom:
-            stop_reason = (
-                f"stopped after OOM fallback at candidate {cand}"
-            )
-            break
-
-        stop_reason = _autotune_stop_reason(
-            cand, used, per_tile, best_batch, best_per_tile,
-            stale_steps, patience, runaway_factor,
-        )
-        if stop_reason is not None:
-            break
+    # The sweep ran out of candidates rather than stopping on its own: say
+    # which cap ended it.
+    if stop_reason is None:
+        if candidates[-1] < allowed_max:
+            stop_reason = f"candidate cap of {len(candidates)} reached"
+        elif ceiling < _configured_batch_max(config, initial):
+            stop_reason = f"memory ceiling b{ceiling} reached"
 
     if results:
         summary_parts = []

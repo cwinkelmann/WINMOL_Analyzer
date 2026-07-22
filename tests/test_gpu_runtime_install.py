@@ -86,14 +86,34 @@ def test_a_wedged_nvidia_smi_times_out_instead_of_hanging():
 
 def test_nvidia_smi_is_never_run_without_a_timeout():
     """A driver stuck in an ioctl blocks the call for as long as the kernel
-    module takes to give up. Both call sites must bound it."""
+    module takes to give up. EVERY call site must bound it.
+
+    Checked by source inspection of the functions that actually spawn the
+    process, not of their callers: the memory probes (total for the planner,
+    free for the autotune ceiling) both delegate to one helper, and it is
+    that helper which has to carry the timeout.
+    """
     import inspect
     import classes.HardwareInfo as hw
-    for func in (gp._run_nvidia_smi,
-                 hw.HardwareInfo._detect_gpu_names_nvidia_smi,
-                 hw.HardwareInfo._detect_gpu_memory_gb_nvidia_smi):
-        assert "timeout" in inspect.getsource(func), \
+    spawners = (gp._run_nvidia_smi,
+                hw.HardwareInfo._detect_gpu_names_nvidia_smi,
+                hw.HardwareInfo._query_gpu_memory_gb)
+    for func in spawners:
+        src = inspect.getsource(func)
+        assert "nvidia-smi" in src, \
+            f"{func.__name__} no longer runs nvidia-smi -- update this guard"
+        assert "timeout" in src, \
             f"{func.__name__} runs nvidia-smi without a timeout"
+
+    # The two public memory probes must reach nvidia-smi only through the
+    # bounded helper above.
+    for func in (hw.HardwareInfo._detect_gpu_memory_gb_nvidia_smi,
+                 hw.HardwareInfo.free_gpu_memory_gb):
+        src = inspect.getsource(func)
+        assert "_query_gpu_memory_gb" in src, \
+            f"{func.__name__} must delegate to the bounded helper"
+        assert "subprocess" not in src, \
+            f"{func.__name__} spawns its own unbounded process"
 
 
 @pytest.mark.parametrize("system,machine", [

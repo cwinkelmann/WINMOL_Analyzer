@@ -19,6 +19,15 @@ b8 on Spruce.onnx), so the tail of the sweep is pure waste.
 Batch size does not change prediction output (verified: max abs diff 0.0
 between b1, b4 and b8 on Spruce.onnx), so stopping early is a pure
 time-vs-time trade with no effect on results.
+
+SCOPE. These tests isolate the RUNAWAY knob, so they deliberately disable
+the two rules that would otherwise stop this curve first: the absolute
+``min_improve_s`` bar and the ``degrade_factor`` abort. With the SHIPPED
+defaults the same curve stops at b6 having selected b4 -- that is the
+stricter behaviour the user asked for and it is covered by
+tests/test_autotune_stopping.py. What is under test here is that the
+runaway guard alone still bounds a sweep once the absolute bar is relaxed
+(e.g. on a slow CPU box where 0.2 s/tile gains are real).
 """
 import pytest
 
@@ -37,6 +46,10 @@ class Cfg:
     prediction_batch_autotune_patience = 4
     prediction_batch_autotune_repeats = 1
     prediction_batch_autotune_min_improve = 0.005
+    # Relaxed so the runaway guard, not the absolute bar, is what stops the
+    # sweep -- see the module docstring.
+    prediction_batch_autotune_min_improve_s = 0.0
+    prediction_batch_autotune_degrade_factor = 1.0      # disabled
     prediction_batch_autotune_stop_on_oom = True
     prediction_batch_autotune_runaway_factor = 1.5
     hardware = None
@@ -60,7 +73,7 @@ def curve(monkeypatch):
     monkeypatch.setattr(Pred, "_time_batch_candidate", _fake)
     monkeypatch.setattr(
         Pred, "_prediction_batch_candidates",
-        lambda config, initial: sorted(USER_CURVE))
+        lambda config, initial, ceiling=None: sorted(USER_CURVE))
     return measured
 
 

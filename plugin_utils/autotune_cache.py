@@ -46,8 +46,12 @@ import sys
 import tempfile
 import time
 
-#: Bumped when the stored payload shape changes; older files are ignored.
-SCHEMA_VERSION = 1
+#: Bumped when the stored payload shape changes -- or when the *meaning* of a
+#: stored batch size changes; older files are ignored either way. v2: the
+#: sweep is bounded by free memory and stops on an absolute 0.2 s/tile bar, so
+#: entries measured under the old unbounded rule name a batch this build would
+#: never have chosen.
+SCHEMA_VERSION = 2
 
 #: Overrides the cache location for both the plugin and the batch CLI.
 ENV_CACHE_PATH = "WINMOL_AUTOTUNE_CACHE"

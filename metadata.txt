@@ -7,7 +7,7 @@ name=WINMOL Analyzer
 
 qgisMinimumVersion=3.22
 description=Plugin to detect stems from UAV
-version=0.6.0
+version=0.6.1
 # The plugin uses qgis.PyQt shims throughout, so it is Qt6-ready. supportsQt6
 # declares this to QGIS 4; validate on a QGIS 4 build before a Qt6-only release.
 supportsQt6=True

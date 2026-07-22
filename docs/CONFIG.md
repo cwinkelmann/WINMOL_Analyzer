@@ -218,6 +218,8 @@ below instead.
 | `multi_gpu_cpu_workers` | 48 | Same for >1 GPU. With the default ceiling of 32 this **never takes effect**. |
 | `max_vector_tile_workers` | 4 | Ceiling on tiles vectorised in parallel. The vector phase is ~73 % of a run, so this caps the slowest stage. |
 | `prediction_batch_gpu` / `_multi_gpu` / `_max_gpu` | 4 / 12 / 16 | Tiles per inference batch. |
+| `prediction_batch_max_cpu` | 8 | Ceiling for a `cpu_stream` plan. It used to share `_max_gpu`, so a 4-core CPU box swept b1..b16. |
+| `prediction_batch_override` | `None` | **Manual pin, in tiles.** Any value >= 1 is used verbatim and skips the autotune. `None`/0 = auto. See below. |
 | `prediction_producer_workers_*` | 1 / 6 / 6 | Threads reading + preparing tiles to feed the GPU. |
 | `tile_inner_px` | 4096 | Vector tile size. **Changes results** (measured) — see the sweep. Bigger = fewer seams, more RAM per worker; smaller = proportionally more halo recomputation. |
 | `tile_overlap_m` | 12.0 | Halo between vector tiles; also the merge de-duplication buffer. |
@@ -228,19 +230,85 @@ below instead.
 | `measuring_point_spacing_m` | 0.5 | Diameter sampling interval along a stem. |
 | `diameter_method` | contour | `contour` or `edt`. |
 
-## The batch-size autotune runs once, then is remembered
+## Pinning the batch size by hand
 
-`prediction_batch_autotune` picks the micro-batch that gives the lowest
-seconds-per-tile by timing every candidate from `prediction_batch_gpu` up to
-`prediction_batch_max_gpu` (up to **13** candidates x
-`prediction_batch_autotune_repeats` runs each) before the first tile is
-written. On Apple/CoreML each distinct batch size forces a model recompile.
-Measured on an M2 with the 9-tile `tests/fixtures/crop_input.tif`: **11.0 s
-without it, 73.5 s with it** — ~62 s of stall to go from 0.169 to
-0.159 s/tile (5.9 %).
+The fastest tuning is the tuning you do not run. Set the batch size and the
+autotune is skipped entirely — no probing, no timing, no cache:
 
-Paying that on every run is a bad trade; paying it once is not. So the result
-is **persisted and reused**:
+* **QGIS plugin:** *Detection* tab -> **Prediction batch size**. `Auto` (the
+  0 position) keeps the automatic behaviour. The value applies to the run you
+  start next; it is not persisted between QGIS sessions.
+* **CLI / batch:**
+  `WINMOL_CONFIG_OVERRIDES_JSON='{"prediction_batch_override": 4}'`.
+
+The pin is honoured by the planner in **all three** scenarios, so it beats
+every VRAM-tier default. Note it is `prediction_batch_override`, not
+`prediction_batch_size` — the latter is planner-owned and overwritten on
+every run.
+
+## The batch-size autotune: bounded by memory, then measured
+
+`prediction_batch_autotune` picks the micro-batch with the lowest
+seconds-per-tile. Before it times *anything* it computes a **memory ceiling**,
+and it stops as soon as the measurements stop being interesting.
+
+**1. The memory ceiling (computed first, always).**
+
+```
+ceiling = memory_fraction * FREE memory / bytes_per_tile
+bytes_per_tile = img_h * img_w * (n_channels + num_classes) * 4 * activation_factor
+```
+
+* *FREE*, not total: `nvidia-smi --query-gpu=memory.free` on CUDA (the
+  smallest visible device bounds the run), `psutil.virtual_memory().available`
+  on CPU, and that times `UNIFIED_MEMORY_GPU_SHARE` on Apple Silicon, where
+  the CPU and the GPU share one pool. A CUDA run is bounded by **both** VRAM
+  and host RAM: a session that silently falls back to the CPU provider
+  allocates on the host, which is exactly the box that froze — plenty of VRAM
+  free, none of it in use.
+* `prediction_batch_autotune_memory_fraction` = **0.6** — never ask for more
+  than 60 % of what is free *right now*, leaving headroom for the producer
+  threads, the raster writer and the OS.
+* `prediction_batch_autotune_activation_factor` = **32** — measured working
+  set per tile (~113 MB at b8 with the Spruce model on the CPU EP) against a
+  4.19 MB raw tensor, i.e. ~28x, rounded up.
+* If free memory cannot be determined (no psutil, no `nvidia-smi`), the sweep
+  may only go **2** steps above the planner's batch. Never the old unbounded
+  range.
+
+This is a safety cap, not an optimisation. A GPU out-of-memory is caught and
+the batch halved (`utils/onnx_runtime.py` normalises it into
+`OnnxOutOfMemoryError`), but **host RAM exhaustion raises nothing at all** —
+the machine swaps until the OOM killer fires. One user's Linux box froze
+completely while the old sweep marched towards b16. Only refusing to try the
+batch in the first place prevents that.
+
+**2. The stop rules.** At most
+`prediction_batch_autotune_max_candidates` (**6**) candidates are timed, and:
+
+* a candidate counts as an improvement only if it is faster by **both**
+  `prediction_batch_autotune_min_improve` (0.5 %, relative) **and**
+  `prediction_batch_autotune_min_improve_s` (**0.2 s/tile, absolute**);
+* `prediction_batch_autotune_patience` (**2**) non-improving candidates in a
+  row end the sweep;
+* `prediction_batch_autotune_degrade_factor` (**1.25**) aborts it immediately,
+  whatever patience says, once a candidate is that much slower than the best —
+  past the memory cliff the times explode and growing the batch from there is
+  what precedes a freeze;
+* an out-of-memory fallback lowers the working ceiling, so nothing larger is
+  ever retried.
+
+Every one of those outcomes is printed as an explicit stop reason.
+
+Against a user's measured RTX-4080 sweep (b4 = 0.340, b5 = 0.337, b6 = 0.330,
+b7 = 0.471, b8 = 0.561, b9 = 1.135 s/tile) the old rule timed **seven**
+candidates and selected b6; the current one times **three** and selects b4.
+That trades ~3 % throughput for a sweep that is bounded, quick and cannot
+walk off the cliff — deliberately, on the user's instruction that "only an
+improvement of 0.2 seconds counts".
+
+Paying even that on every run is a bad trade; paying it once is not. So the
+result is **persisted and reused**:
 
 | value | behaviour |
 |---|---|
@@ -253,9 +321,13 @@ editing anything (the test suite and `benchmark/` pin it to `off`).
 
 The cache key covers **hardware, model file, execution provider and tile
 geometry**, so swapping the model, moving from CoreML to CPU, or changing
-`img_width`/`prediction_batch_max_gpu` re-tunes automatically. Its knobs
-(`_patience`, `_repeats`, `_min_improve`, `_stop_on_oom`, `_quiet`) still apply
-to the tuning run.
+`img_width`/`prediction_batch_max_gpu` re-tunes automatically. A cached batch
+is additionally re-validated against the memory ceiling **of the current run**
+— the box that had 24 GB free last week may have 2 GB free today — and is
+discarded (with a log line) when it no longer fits.
+
+Entries written by WINMOL <= 0.6.1 are ignored: the schema version was bumped
+because the stored number was chosen under the old, unbounded rule.
 
 **Where it lives, and how to clear it**
 
@@ -357,6 +429,12 @@ comparisons against earlier runs: `stem_binary_threshold`, `min_length`,
 `max_distance`, `tolerance_angle`, `measuring_point_spacing_m`,
 `diameter_method`, `max_tree_height`, `tile_overlap_m`, **`tile_inner_px`**,
 `img_width`/`img_height`.
+
+`prediction_batch_*` is in the performance-only group with one caveat: the
+micro-batch changes float accumulation order inside the ONNX session, so a
+*different selected batch* can move borderline pixels. That is why
+determinism and benchmark runs pin `WINMOL_BATCH_AUTOTUNE=off` — and why
+`prediction_batch_override` is the honest way to force one specific batch.
 
 `tile_inner_px` is in this group on measured evidence, not on principle: the
 sweep above produced 459 and 456 stems against a baseline of 458 purely by
