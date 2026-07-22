@@ -25,6 +25,7 @@ from classes.ExecutionPlan import build_execution_plan
 from classes.HardwareInfo import HardwareInfo
 from classes.Timer import Timer
 from utils import IO
+from utils import Log
 from utils import Skeletonization as Skel
 from utils import Vectorization as Vec
 from utils import Quantification as Quant
@@ -87,6 +88,9 @@ class ImageProcessing:
         self.process_type = process_type
         self.config = Config()
         self.apply_env_config_overrides()
+        # Resolve verbosity once the overrides are in, and export it so the
+        # spawned vector-tile workers inherit the same level.
+        Log.configure_from_config(self.config)
 
     def apply_env_config_overrides(self):
         raw = os.environ.get("WINMOL_CONFIG_OVERRIDES_JSON", "").strip()

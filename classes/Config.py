@@ -53,6 +53,12 @@ class Config(object):
     compress_output = True
 
     # logging / diagnostics
+    # log_level drives utils/Log.py: 'quiet' (warnings/errors only),
+    # 'normal' (phases, progress, summaries, results) or 'debug' (adds the
+    # per-tile MERGE/VECTOR diagnostics). Overridable per run through
+    # WINMOL_LOG_LEVEL / WINMOL_VERBOSE=1, which also survive the spawned
+    # vector-tile pool. vector_debug=True still implies 'debug'.
+    log_level = "normal"                 # quiet | normal | debug
     prediction_tile_log = True
     vector_debug = False
     vector_summary_log = True

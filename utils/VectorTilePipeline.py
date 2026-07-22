@@ -15,6 +15,7 @@ from utils.IO import (
     write_all_layers_to_gpkg,
     write_stems_to_gpkg,
 )
+from utils import Log
 import utils.Quantification as Quant
 import utils.Skeletonization as Skel
 import utils.Vectorization as Vec
@@ -278,6 +279,7 @@ def process_prediction_array_to_gpkg(
             pass
     config.cpu_workers = 1
     config.vector_tile_workers = 1
+    Log.configure_from_config(config)
 
     pred = np.asarray(pred_arr)
     if pred.size == 0 or not np.any(pred >= 1):
@@ -302,6 +304,9 @@ def process_prediction_tile(
     process_type: str,
     output_prefix: str,
 ):
+    # Pool workers are spawned on macOS: re-derive the level from the env
+    # (exported by Log.configure_from_config) and the tile's config copy.
+    Log.configure_from_config(config)
     pred, profile = load_stem_map(pred_tile_path)
     pred_arr = np.asarray(pred)
     if pred_arr.size == 0 or not np.any(pred_arr >= 1):
