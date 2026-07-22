@@ -1,9 +1,16 @@
 from __future__ import annotations
 
 import os
+import platform
 import subprocess
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
+
+# Share of unified memory reported as the "GPU" budget on Apple Silicon. The
+# CPU, the OS and the raster reader all live in the same pool, so handing the
+# planner the full figure over-sizes the prediction batch (ExecutionPlan tiers
+# on >= 20 GB / >= 12 GB of dedicated VRAM).
+UNIFIED_MEMORY_GPU_SHARE = 0.5
 
 
 @dataclass
@@ -13,6 +20,10 @@ class HardwareInfo:
     gpu_count: int
     gpu_names: List[str] = field(default_factory=list)
     gpu_memory_gb: List[float] = field(default_factory=list)
+    # What actually runs the inference: 'cuda' | 'coreml' | 'cpu', plus the
+    # name to show the user. Defaulted so existing constructors keep working.
+    accelerator: str = "cpu"
+    accelerator_label: str = "CPU"
 
     @classmethod
     def detect(cls) -> "HardwareInfo":
@@ -25,13 +36,36 @@ class HardwareInfo:
             gpu_names, gpu_memory_gb
         )
 
-        # Fallback: on Apple Silicon there is no nvidia-smi, but TensorFlow
-        # can still run on the integrated GPU via the tensorflow-metal plugin.
-        # Only probe Metal when no NVIDIA GPU was found and the user has not
-        # explicitly forced CPU-only via CUDA_VISIBLE_DEVICES.
-        if not gpu_names and not cls._cpu_forced_via_env():
-            metal_names, metal_mem = cls._detect_metal_gpu(total_ram_gb)
-            gpu_names, gpu_memory_gb = metal_names, metal_mem
+        # Ask the runtime that actually performs inference (onnxruntime) which
+        # device it will use, rather than inferring one from installed
+        # packages. Returns None when onnxruntime cannot be imported at all.
+        # CUDA_VISIBLE_DEVICES="" / "-1" is a whole-process CPU pin, so it
+        # short-circuits the probe; _apply_cuda_visible_devices above has
+        # already emptied the NVIDIA list for it.
+        kind = (None if cls._cuda_hidden_via_env()
+                else cls._detect_accelerator_kind())
+
+        if gpu_names:
+            # nvidia-smi stays the authority for NVIDIA count and per-GPU
+            # memory; onnxruntime only confirms it can use them. A CPU-only
+            # onnxruntime build (or a forced CPU run) means those GPUs are
+            # unreachable, so do not let the planner size a GPU run for them.
+            # kind is None only when onnxruntime could not be asked at all --
+            # trust nvidia-smi then rather than downgrading a working box.
+            # WINMOL_DISABLE_METAL is deliberately NOT consulted here: it is a
+            # Metal-only escape hatch and must never discard NVIDIA GPUs.
+            if kind in (None, "cuda"):
+                accelerator = "cuda"
+            else:
+                gpu_names, gpu_memory_gb = [], []
+                accelerator = "cpu"
+        elif kind == "coreml" and not cls._metal_disabled_via_env():
+            # Apple Silicon: no nvidia-smi, but onnxruntime runs the model on
+            # the integrated GPU/ANE through CoreML.
+            gpu_names, gpu_memory_gb = cls._metal_gpu(total_ram_gb)
+            accelerator = "coreml" if gpu_names else "cpu"
+        else:
+            accelerator = "cpu"
 
         gpu_count = len(gpu_names)
 
@@ -47,7 +81,37 @@ class HardwareInfo:
             gpu_count=gpu_count,
             gpu_names=gpu_names,
             gpu_memory_gb=gpu_memory_gb,
+            accelerator=accelerator,
+            accelerator_label=cls._label(accelerator),
         )
+
+    @staticmethod
+    def _label(accelerator: str) -> str:
+        try:
+            from utils.onnx_runtime import ACCELERATOR_LABELS
+            return ACCELERATOR_LABELS.get(accelerator, "CPU")
+        except Exception:
+            return {
+                "cuda": "NVIDIA GPU (CUDA)",
+                "coreml": "Apple Silicon GPU (Metal/CoreML)",
+            }.get(accelerator, "CPU")
+
+    @staticmethod
+    def _detect_accelerator_kind() -> Optional[str]:
+        """'cuda' | 'coreml' | 'cpu' per onnxruntime, or None if unavailable.
+
+        None means "could not ask" — callers must then fall back to the
+        nvidia-smi verdict rather than downgrading a working CUDA box. The
+        import is guarded because HardwareInfo is imported at module scope by
+        winmol_run, and a missing onnxruntime must surface at model load with
+        a clear message, not as an import-time crash.
+        """
+        try:
+            from utils import onnx_runtime
+            kind, _ = onnx_runtime.accelerator()
+            return kind
+        except Exception:
+            return None
 
     @staticmethod
     def _detect_total_ram_gb() -> float:
@@ -101,31 +165,39 @@ class HardwareInfo:
             return []
 
     @staticmethod
-    def _cpu_forced_via_env() -> bool:
+    def _cuda_hidden_via_env() -> bool:
+        """True when CUDA_VISIBLE_DEVICES hides every device ("" or "-1").
+
+        The device *filtering* lives in _apply_cuda_visible_devices; this only
+        answers whether the user asked for a CPU-only process.
+        """
         raw = os.environ.get("CUDA_VISIBLE_DEVICES", None)
-        if raw is not None and raw.strip() in ("", "-1"):
-            return True
+        return raw is not None and raw.strip() in ("", "-1")
+
+    @staticmethod
+    def _metal_disabled_via_env() -> bool:
+        """WINMOL_DISABLE_METAL — the Apple-Silicon-only escape hatch.
+
+        Scoped to the CoreML branch on purpose. It once shared a helper with
+        the CUDA_VISIBLE_DEVICES check, which made setting it on an NVIDIA box
+        silently discard every GPU and drop the run to cpu_stream.
+        """
         disable = str(os.environ.get("WINMOL_DISABLE_METAL", "")).strip()
         return disable.lower() in ("1", "true", "yes")
 
-    @staticmethod
-    def _detect_metal_gpu(
+    @classmethod
+    def _metal_gpu(
+        cls,
         total_ram_gb: float,
     ) -> tuple[List[str], List[float]]:
-        import platform
+        """The Apple Silicon entry, once onnxruntime has confirmed CoreML."""
         if platform.system() != "Darwin" or platform.machine() != "arm64":
             return [], []
-        # Confirm the tensorflow-metal plugin is installed, so TensorFlow will
-        # actually place ops on the GPU. Cheap metadata lookup; no TF import.
-        try:
-            import importlib.metadata as md
-            md.version("tensorflow-metal")
-        except Exception:
-            return [], []
-        # Apple Silicon uses unified memory; report it as the GPU budget so the
-        # planner's memory tiers behave sensibly.
-        mem = round(total_ram_gb, 2) if total_ram_gb else 0.0
-        return ["Apple Silicon GPU (Metal)"], [mem]
+        # Unified memory: report a share of system RAM, not all of it (see
+        # UNIFIED_MEMORY_GPU_SHARE).
+        mem = (round(total_ram_gb * UNIFIED_MEMORY_GPU_SHARE, 2)
+               if total_ram_gb else 0.0)
+        return [cls._label("coreml")], [mem]
 
     @staticmethod
     def _apply_cuda_visible_devices(

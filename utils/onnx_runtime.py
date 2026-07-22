@@ -10,6 +10,7 @@ external contract is always NHWC: ``predict_on_batch([N,512,512,3]) ->
 [N,512,512,1]``.
 """
 import os
+import platform
 
 import numpy as np
 import onnxruntime as ort
@@ -18,6 +19,14 @@ IMG_SIZE = 512
 IN_CHANNELS = 3
 OUT_CHANNELS = 1
 
+# Human-readable name of the device inference actually runs on. Keyed by the
+# accelerator "kind" the rest of the codebase reasons about.
+ACCELERATOR_LABELS = {
+    "cuda": "NVIDIA GPU (CUDA)",
+    "coreml": "Apple Silicon GPU (Metal/CoreML)",
+    "cpu": "CPU",
+}
+
 
 class OnnxOutOfMemoryError(RuntimeError):
     """Raised on ONNX-runtime OOM; caught by the analyzer's batch-backoff."""
@@ -25,6 +34,11 @@ class OnnxOutOfMemoryError(RuntimeError):
 
 def _truthy(val):
     return str(val).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _available_providers():
+    """Execution providers this onnxruntime build offers (seam for tests)."""
+    return list(ort.get_available_providers())
 
 
 def _default_providers():
@@ -39,12 +53,62 @@ def _default_providers():
         return [p.strip() for p in override.split(",") if p.strip()]
     if _truthy(os.environ.get("WINMOL_ONNX_FORCE_CPU", "")):
         return ["CPUExecutionProvider"]
-    avail = set(ort.get_available_providers())
+    avail = set(_available_providers())
     if "CUDAExecutionProvider" in avail:
         return ["CUDAExecutionProvider", "CPUExecutionProvider"]
     if "CoreMLExecutionProvider" in avail:
         return ["CoreMLExecutionProvider", "CPUExecutionProvider"]
     return ["CPUExecutionProvider"]
+
+
+def selected_providers():
+    """The providers the analyzer will hand to onnxruntime.
+
+    Public name for :func:`_default_providers` so hardware reporting asks the
+    inference runtime what it will do instead of re-deriving the precedence.
+    """
+    return _default_providers()
+
+
+def _provider_override_env():
+    """Name of the env var pinning the provider list, or None."""
+    if os.environ.get("WINMOL_ONNX_PROVIDERS"):
+        return "WINMOL_ONNX_PROVIDERS"
+    if _truthy(os.environ.get("WINMOL_ONNX_FORCE_CPU", "")):
+        return "WINMOL_ONNX_FORCE_CPU"
+    return None
+
+
+def accelerator():
+    """``(kind, label)`` of the device inference will actually use.
+
+    Derived from :func:`selected_providers`, so every env override is honoured
+    automatically. Note ``ort.get_device()`` is deliberately NOT used: it
+    reports "CPU" on macOS even when CoreML is available and selected.
+    """
+    providers = selected_providers()
+    if "CUDAExecutionProvider" in providers:
+        return "cuda", ACCELERATOR_LABELS["cuda"]
+    # onnxruntime lists CoreMLExecutionProvider on Intel macOS builds too;
+    # only Apple Silicon has the GPU/ANE this label promises.
+    if ("CoreMLExecutionProvider" in providers
+            and platform.system() == "Darwin"
+            and platform.machine() == "arm64"):
+        return "coreml", ACCELERATOR_LABELS["coreml"]
+    return "cpu", ACCELERATOR_LABELS["cpu"]
+
+
+def runtime_report():
+    """Everything the startup banner needs about the inference runtime."""
+    kind, label = accelerator()
+    return {
+        "onnxruntime_version": getattr(ort, "__version__", "unknown"),
+        "available_providers": _available_providers(),
+        "selected_providers": selected_providers(),
+        "accelerator": kind,
+        "accelerator_label": label,
+        "override": _provider_override_env(),
+    }
 
 
 def _layout(shape, channels):

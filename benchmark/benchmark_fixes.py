@@ -55,12 +55,35 @@ def _git(*args):
                           text=True)
 
 
+# winmol_run.report_runtime_env() prints, indented under "Environment:":
+#   Available providers: CUDAExecutionProvider, CPUExecutionProvider
+#   Selected providers: CPUExecutionProvider (forced by WINMOL_ONNX_FORCE_CPU)
+#   Device: CPU
+# Only the "Selected"/"Device" lines say what ran -- "Available" lists every
+# provider the build ships, so matching a bare provider name anywhere in the
+# log reports CoreML for a CPU-pinned run.
+SELECTED_PROVIDERS_RE = re.compile(r"^\s*Selected providers:\s*(.+)$", re.M)
+DEVICE_RE = re.compile(r"^\s*Device:\s*(.+)$", re.M)
+
+
 def _detect_backend(stdout: str) -> str:
     """Which inference engine + device actually ran (from the log)."""
-    if "CoreMLExecutionProvider" in stdout:
-        return "onnxruntime / CoreML"
-    if "CUDAExecutionProvider" in stdout:
-        return "onnxruntime / CUDA"
+    selected = SELECTED_PROVIDERS_RE.search(stdout)
+    if selected:
+        chosen = selected.group(1).split("(")[0]
+        if "CUDAExecutionProvider" in chosen:
+            return "onnxruntime / CUDA"
+        if "CoreMLExecutionProvider" in chosen:
+            return "onnxruntime / CoreML"
+        return "onnxruntime / CPU"
+    device = DEVICE_RE.search(stdout)
+    if device:
+        label = device.group(1).strip()
+        if "CUDA" in label:
+            return "onnxruntime / CUDA"
+        if "CoreML" in label or "Metal" in label:
+            return "onnxruntime / CoreML"
+        return "onnxruntime / CPU"
     if "OnnxSegmenter" in stdout:
         m = re.search(r"providers?\W+\[?([A-Za-z, ]*Provider)", stdout)
         return f"onnxruntime ({m.group(1)})" if m else "onnxruntime / CPU"
@@ -84,7 +107,10 @@ def _parse_run(stdout: str) -> dict:
     stems = re.search(r"Total stems written:\s+(\d+)", stdout)
     tiles = re.search(r"Written tile \d+/(\d+)", stdout)
     layout = re.search(r"src (\d+)x(\d+) -> out (\d+)x(\d+)", stdout)
-    tf_ver = re.search(r"Tensorflow version:\s*([\d.]+)", stdout)
+    # New banner: "Legacy Keras model path: TensorFlow 2.16.2".
+    # Old banner: "Tensorflow version: 2.16.2".
+    tf_ver = re.search(
+        r"(?:Tensorflow version:|TensorFlow)\s*([\d.]+)", stdout)
     return {
         "backend": _detect_backend(stdout),
         "avg_read_s": read, "avg_prep_s": prep,
