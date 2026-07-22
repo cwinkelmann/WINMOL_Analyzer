@@ -146,14 +146,11 @@ def test_process_type_for(stem, trees, nodes, expected):
     assert process_type_for(stem, trees, nodes) == expected
 
 
-def test_default_selection_maps_to_nodes():
-    """All three products checked -> one run with process_type 'Nodes'."""
-    assert process_type_for(True, True, True) == "Nodes"
-
-
 @pytest.mark.parametrize(
     "trees,nodes,expected",
     [
+        # The exact list, so a layer added twice (which used to put
+        # 'stems' into the QGIS project twice) fails here.
         (True, True, ["stems", "vectors", "nodes"]),
         (False, True, ["stems", "vectors", "nodes"]),
         (True, False, ["stems"]),
@@ -162,9 +159,3 @@ def test_default_selection_maps_to_nodes():
 )
 def test_gpkg_layers_for(trees, nodes, expected):
     assert gpkg_layers_for(trees, nodes) == expected
-
-
-def test_gpkg_layers_for_has_no_duplicates():
-    layers = gpkg_layers_for(True, True)
-    assert len(set(layers)) == len(layers), (
-        f"duplicate layers would be added to the QGIS project: {layers}")

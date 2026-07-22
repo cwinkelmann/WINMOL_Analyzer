@@ -26,12 +26,11 @@ So the decisions tested here are about REACH:
     we must not sell a download for) is never nagged, and an unfinished
     probe never delays a run.
 
-All headless: no QGIS, no Qt, no GPU, no network. The Qt side is pinned
-by the AST assertions at the bottom, which is the only way to prove "this
-never runs on the GUI thread" without a live dialog.
+All headless: no QGIS, no Qt, no GPU, no network. The Qt side's one
+irreducible static rule -- that none of this measures anything on the GUI
+thread -- lives in tests/test_dialog_lint.py.
 """
 
-import ast
 import os
 import sys
 
@@ -44,8 +43,6 @@ if REPO not in sys.path:
 from plugin_utils import installer as inst        # noqa: E402
 from plugin_utils import setup_state as ss        # noqa: E402
 
-DIALOG_FILE = os.path.join(REPO, "winmol_analyzer_dialog.py")
-UI_FILE = os.path.join(REPO, "winmol_analyzer_dialog_base.ui")
 
 GPU = "NVIDIA GeForce RTX 4080 SUPER"
 
@@ -237,97 +234,3 @@ def test_accelerator_from_machine_still_produces_the_reported_state(
     assert accel.state == ss.ACCEL_GPU_IDLE and accel.can_install
     assert ss.pre_run_decision(accel).asks
     assert ss.should_nudge(accel)
-
-
-# --- the Qt side, statically -----------------------------------------------
-
-def _module():
-    return ast.parse(open(DIALOG_FILE, encoding="utf-8").read())
-
-
-def _function_node(name):
-    for node in ast.walk(_module()):
-        if isinstance(node, ast.FunctionDef) and node.name == name:
-            return node
-    pytest.fail(f"{name} not found in winmol_analyzer_dialog.py")
-
-
-def _calls(node):
-    return {getattr(call.func, "attr", None) or getattr(call.func, "id", None)
-            for call in ast.walk(node) if isinstance(call, ast.Call)}
-
-
-def test_run_process_consults_the_pre_flight():
-    assert "_gpu_offer_pre_flight" in _calls(_function_node("run_process"))
-
-
-def test_the_pre_flight_reads_the_cache_and_decides_in_setup_state():
-    """The separation that makes every assertion above meaningful: the
-    dialog renders, setup_state decides, and the expensive measurement is
-    EnvProbeWorker's alone."""
-    calls = _calls(_function_node("_gpu_offer_pre_flight"))
-    assert "pre_run_decision" in calls, "the decision leaked into the dialog"
-    assert "_accel_status" in calls, "it must read the cached verdict"
-    assert "_gpu_prompt_dismissed" in calls
-
-
-def test_the_pre_flight_persists_the_dismissal_through_qgssettings():
-    assert "setValue" in _calls(_function_node("_remember_gpu_prompt"))
-    source = open(DIALOG_FILE, encoding="utf-8").read()
-    assert "QSETTINGS_GPU_PROMPT_KEY" in source
-
-
-def test_declining_the_offer_starts_the_run_rather_than_the_install():
-    """"Run anyway" proceeds IMMEDIATELY. The only branch that stops the
-    run is the one that starts a 2.4 GB install the run would race."""
-    node = _function_node("_gpu_offer_pre_flight")
-    returns = [r for r in ast.walk(node) if isinstance(r, ast.Return)]
-    values = [r.value.value for r in returns
-              if isinstance(r.value, ast.Constant)]
-    assert True in values and False in values
-
-
-def test_the_install_is_never_started_without_a_click():
-    """2.4 GB stays an explicit, confirmed choice: the pre-flight reaches
-    the installer only from inside a branch on the clicked button."""
-    node = _function_node("_gpu_offer_pre_flight")
-    guarded = any(
-        "_setup_install_gpu_runtime" in _calls(branch)
-        for branch in ast.walk(node) if isinstance(branch, ast.If))
-    assert guarded, (
-        "the GPU install is reachable without the user clicking Install")
-
-
-def test_the_detection_tab_banner_is_wired_and_starts_hidden():
-    import xml.etree.ElementTree as ET
-    root = ET.parse(UI_FILE).getroot()
-    named = {}
-    for element in root.iter():
-        if element.tag in ("widget", "layout", "spacer") and \
-                element.get("name"):
-            named.setdefault(element.get("name"), []).append(element)
-    for name in ("accel_banner_widget", "accel_banner_label",
-                 "accel_banner_button"):
-        assert len(named.get(name, [])) == 1, f"{name} is not in the .ui once"
-    visible = named["accel_banner_widget"][0].find(
-        "property[@name='visible']/bool")
-    assert visible is not None and visible.text == "false", (
-        "the banner must start hidden; a machine with no GPU never sees it")
-    # ...and it lives on the DETECTION page, which is the entire point.
-    page = [w for w in root.iter("widget")
-            if w.get("name") == "tab"][0]
-    assert "accel_banner_widget" in {
-        n.get("name") for n in page.iter() if n.get("name")}
-
-
-def test_the_banner_button_leads_back_to_setup():
-    source = open(DIALOG_FILE, encoding="utf-8").read()
-    assert '("accel_banner_button", "clicked", "_go_to_setup")' in source
-
-
-def test_the_nudge_renderer_only_renders():
-    """_apply_accel_nudge sets a label and a visibility, and asks
-    setup_state everything else."""
-    calls = _calls(_function_node("_apply_accel_nudge"))
-    assert {"should_nudge", "accel_nudge_text"} <= calls
-    assert "accelerator_from_machine" not in calls

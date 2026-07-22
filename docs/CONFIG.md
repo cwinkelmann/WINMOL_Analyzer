@@ -171,7 +171,7 @@ enabled, what the environment line says, why Run is blocked, what a
 deletion would remove — is a pure function in `plugin_utils/setup_state.py`
 plus `plugin_utils/model_status.py`, both Qt-free and unit-tested
 (`tests/test_setup_state.py`, `tests/test_model_status.py`,
-`tests/test_setup_tab_ui.py`). The long operations run on the two existing
+`tests/test_dialog_lint.py`). The long operations run on the two existing
 worker/QThread pairs (`_env_*` for build/repair/delete, `_dl_*` for
 download/verify/delete-model).
 

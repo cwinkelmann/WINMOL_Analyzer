@@ -633,3 +633,45 @@ def test_reinstalling_dependencies_keeps_a_gpu_environment_on_the_gpu():
     assert any(kw.arg == "gpu"
                for call in ast.walk(node) if isinstance(call, ast.Call)
                for kw in call.keywords), "the repair drops the gpu flag"
+
+
+# --- the CLI/log hint for the same state -----------------------------------
+#
+# ACCEL_GPU_IDLE above is the Setup tab's rendering of "a GPU is present
+# and this runtime cannot reach it". installer.cuda_capability_hint is the
+# other consumer of that fact -- the line the CLI and the install log
+# print -- so it is checked against the same four inputs and, above all,
+# for staying silent on the three where nothing is wrong.
+
+@pytest.fixture
+def _hint_box(monkeypatch):
+    """Fake (nvidia-smi present?, providers offered) for the hint."""
+    def configure(gpu_present, providers):
+        monkeypatch.setattr(
+            inst, "_nvidia_gpu_present", lambda: gpu_present)
+        monkeypatch.setattr(
+            inst, "_onnx_providers", lambda exe: list(providers))
+    return configure
+
+
+def test_the_hint_names_the_package_and_the_doc(_hint_box):
+    """requirements/cpu.txt installs the CPU-only wheel, so a
+    plugin-installed NVIDIA box can never reach CUDA. The install is
+    deliberately NOT changed -- the user is told, with the remedy."""
+    _hint_box(True, ["CPUExecutionProvider"])
+    hint = inst.cuda_capability_hint("/venv/bin/python")
+    assert "onnxruntime-gpu" in hint
+    assert "docs/GPU.md" in hint
+
+
+@pytest.mark.parametrize("gpu_present,providers,exe,why", [
+    (True, PROVIDERS_GPU_BUILD, "/venv/bin/python", "CUDA is available"),
+    (False, ["CPUExecutionProvider"], "/venv/bin/python",
+     "a Mac must never be told to install onnxruntime-gpu"),
+    (True, [], "/venv/bin/python",
+     "a failed probe is not evidence of anything"),
+    (True, ["CPUExecutionProvider"], None, "there is no interpreter to ask"),
+])
+def test_the_hint_stays_quiet(_hint_box, gpu_present, providers, exe, why):
+    _hint_box(gpu_present, providers)
+    assert inst.cuda_capability_hint(exe) == "", why
