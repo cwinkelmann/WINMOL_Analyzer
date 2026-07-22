@@ -71,6 +71,14 @@ explicit selection (a GUI entry, `winmol_batch <MODEL>`, `--variant`)
 overrides it. The GUI lists the recommended families first and preselects
 the matching variant, so what is displayed is what runs.
 
+`resolve(family, variant="default")` is the same rule, reachable for any
+family (both go through `Registry._device_variant`, so they cannot
+disagree). It is what the GUI's precision selector opens on and what
+`model_status.scan()` flags as "recommended here". Until 2026-07-22 both of
+those went through `variant="auto"` instead, whose lossless gate refuses
+the shipped int8 default — so a CPU-only machine was told to download the
+124.6 MB fp32 reference. `variant="auto"` itself is unchanged.
+
 > **Caveat, stated honestly:** the classic `_int8` builds (including the
 > default) are described in the zoo manifest as "post-training static int8,
 > domain-calibrated" — they are **not** certified lossless there, and carry
@@ -99,8 +107,10 @@ Resolution rules (`Registry.resolve`):
   default; with variant `auto` the device variant is substituted **only when
   it is certified `lossless`** (the classic int8s are domain-calibrated, not
   certified — auto never picks them; the PyTorch UNet int8/fp16 are lossless
-  and are picked). `--variant fp32|int8|fp16` forces a variant or errors if
-  the family lacks it.
+  and are picked). `--variant default` takes the device variant *without*
+  that gate — the machine's declared default, identical to
+  `default_entry()`'s rule. `--variant fp32|int8|fp16` forces a variant or
+  errors if the family lacks it.
 - Device for `auto` = `WINMOL_DEVICE` env (`gpu`/`cpu`) if set, else an
   `nvidia-smi` probe. Apple-Silicon/CoreML machines report `cpu`; use
   `WINMOL_DEVICE`/`WINMOL_ONNX_PROVIDERS` to steer if needed.

@@ -886,3 +886,92 @@ def test_only_the_constructor_resizes_the_dialog():
                 offenders.append((func.name, call.lineno))
     assert not offenders, (
         f"the dialog resizes itself outside construction: {offenders}")
+
+
+# --- AST: the precision selector -------------------------------------------
+
+def _variant_items():
+    """The (label, value) pairs of the module-level VARIANT_ITEMS."""
+    for node in ast.walk(_module()):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(t, ast.Name) and t.id == "VARIANT_ITEMS"
+                   for t in node.targets):
+            continue
+        return [tuple(c.value for c in elt.elts)
+                for elt in node.value.elts]
+    pytest.fail("VARIANT_ITEMS not found in winmol_analyzer_dialog.py")
+
+
+def test_the_variant_selector_opens_on_the_machines_default():
+    """Item 0 is what an untouched dialog runs with. It must be
+    'default' — the registry's own device answer (int8 on a CPU-only
+    box) — not 'auto', whose lossless-only gate refuses the shipped int8
+    default and lands a CPU-only machine on the 124 MB fp32 model."""
+    items = _variant_items()
+    assert items[0][1] == "default"
+    values = [value for _label, value in items]
+    assert values == ["default", "auto", "fp32", "int8", "fp16"]
+    # every escape hatch stays one click away
+    assert "fp32" in values and "int8" in values
+
+
+def test_the_variant_preset_lives_where_the_combo_exists():
+    """The construction-order defect, pinned.
+
+    populate_model_combo_box() runs BEFORE _add_custom_controls()
+    creates variant_comboBox, so a preset written into the former is
+    dead code on every single launch — which is exactly how a CPU-only
+    machine kept opening on 'auto'. The preset therefore belongs to
+    _add_custom_controls (or anything it calls), and nowhere else.
+    """
+    src = open(DIALOG_FILE, encoding="utf-8").read()
+    module = ast.parse(src)
+
+    init = _function_node("__init__")
+    order = [call.func.attr for call in ast.walk(init)
+             if isinstance(call, ast.Call)
+             and getattr(call.func, "attr", None) in
+             ("populate_model_combo_box", "_add_custom_controls")]
+    assert order == ["populate_model_combo_box", "_add_custom_controls"], (
+        "construction order changed; the preset assumption below must be "
+        "re-derived")
+
+    callers = set()
+    for func in ast.walk(module):
+        if not isinstance(func, ast.FunctionDef):
+            continue
+        for call in ast.walk(func):
+            if isinstance(call, ast.Call) and getattr(
+                    call.func, "attr", None) == "_default_variant_value":
+                callers.add(func.name)
+    assert "populate_model_combo_box" not in callers, (
+        "the variant preset is back in populate_model_combo_box, where "
+        "variant_comboBox does not exist yet — it silently does nothing")
+    assert callers, "nothing presets the variant selector any more"
+
+    adder = _function_node("_add_custom_controls")
+    called = {c.func.attr for c in ast.walk(adder)
+              if isinstance(c, ast.Call) and hasattr(c.func, "attr")}
+    assert "_preset_default_variant" in called
+
+
+def test_the_variant_tooltip_does_not_oversell_int8():
+    """int8 for the Keras-derived families is domain-calibrated, not
+    certified lossless. The UI has to say so at the point of choice."""
+    src = open(DIALOG_FILE, encoding="utf-8").read()
+    start = src.index("VARIANT_TOOLTIP")
+    tip = src[start:src.index("\n)\n", start)].lower()
+    assert "not certified lossless" in tip
+    assert "domain-calibrated" in tip
+    assert "reference (fp32)" in tip
+
+
+def test_the_variant_labels_carry_the_download_size():
+    """31 MB against 124 MB is the reason to prefer int8 on a CPU box;
+    it must be visible before the download, not after."""
+    node = _function_node("_variant_item_text")
+    src = ast.unparse(node)
+    assert "size_mb" in src and "MB" in src
+    refresher = ast.unparse(_function_node("_refresh_variant_controls"))
+    assert "_variant_item_text" in refresher and "setItemText" in refresher

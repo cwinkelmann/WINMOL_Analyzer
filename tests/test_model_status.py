@@ -232,12 +232,40 @@ def test_scan_against_the_shipped_registry():
     assert hidden and all(h.endswith("_hdf5") for h in hidden)
     grouped = model_status.group_by_family(rows)
     assert len(grouped) == len(reg.families)
-    # exactly what a run would load, resolver and all — including
-    # resolve()'s lossless gate, which keeps 'auto' on the fp32
-    # reference for a family whose int8 variant is not certified
+    # exactly what a run would load, resolver and all: scan()'s default
+    # variant is the registry's own device default
     family = reg.families[reg.entries[reg.gui_default].family]
-    expected = reg.resolve(family.id, device="cpu", variant="auto").id
+    expected = reg.resolve(family.id, device="cpu", variant="default").id
     assert [r.entry_id for r in rows if r.recommended] == [expected]
+
+
+def test_a_cpu_only_machine_is_recommended_the_int8_build():
+    """The user's report, pinned: on a CPU-only box the Setup tab used
+    to flag — and the 'Download recommended' button used to fetch — the
+    124.6 MB fp32 model, because scan() defaulted to variant='auto' and
+    auto's lossless gate refuses the shipped int8 default."""
+    reg = mr.load_registry(SHIPPED_CONFIG)
+    rows = model_status.scan(reg, os.path.join(REPO, "no-such-models"),
+                             device="cpu")
+    flagged = [r for r in rows if r.recommended]
+    assert [r.entry_id for r in flagged] == [reg.gui_default]
+    assert flagged[0].precision == "int8"
+    assert flagged[0].size_expected_mb == 31.4
+    # and it is the same file default_entry() names
+    assert flagged[0].entry_id == reg.default_entry(device="cpu").id
+
+
+def test_the_lossless_gate_is_still_reachable_from_scan():
+    """variant='auto' is not gone — an explicit selection still gets the
+    conservative answer (fp32 for the domain-calibrated classic int8)."""
+    reg = mr.load_registry(SHIPPED_CONFIG)
+    family = reg.families[reg.entries[reg.gui_default].family]
+    rows = model_status.scan(reg, os.path.join(REPO, "no-such-models"),
+                             device="cpu", family_id=family.id,
+                             variant="auto")
+    flagged = [r for r in rows if r.recommended]
+    assert [r.entry_id for r in flagged] == ["Spruce_Deadwood"]
+    assert flagged[0].precision == "fp32"
 
 
 def test_the_declared_default_is_flagged_when_its_variant_is_selected():

@@ -360,6 +360,44 @@ def test_resolve_family_auto_substitutes_only_lossless():
     assert reg.resolve("hrnet", device="gpu").id == "HRNet_Beech_fp16"
 
 
+def test_resolve_default_variant_is_the_device_default():
+    """``variant="default"`` is the machine's declared default — the
+    device variant WITHOUT auto's lossless gate.
+
+    This is the regression guard for the bug a CPU-only Windows machine
+    hit: ``auto`` refuses the domain-calibrated Spruce_Deadwood_int8
+    (lossless: false) and falls back to the 124.6 MB fp32 reference,
+    while ``default_entry()`` says int8. The registry must not answer
+    "what runs on this machine" two different ways.
+    """
+    reg = mr.load_registry(SHIPPED_CONFIG)
+    fam = reg.entries[reg.gui_default].family
+
+    cpu = reg.resolve(fam, device="cpu", variant="default")
+    assert cpu.id == "Spruce_Deadwood_int8"
+    assert cpu.size_mb == 31.4
+    assert cpu.id == reg.default_entry(device="cpu").id
+
+    gpu = reg.resolve(fam, device="gpu", variant="default")
+    assert gpu.id == "Spruce_Deadwood_fp16"
+    assert gpu.id == reg.default_entry(device="gpu").id
+
+    # auto keeps its gate: unchanged, and demonstrably different on CPU
+    assert reg.resolve(fam, device="cpu", variant="auto").id == \
+        "Spruce_Deadwood"
+
+
+def test_default_variant_agrees_with_default_entry_for_every_family():
+    """The two APIs share ``_device_variant``; assert the equality that
+    made them diverge is now impossible to reintroduce family-wise."""
+    reg = mr.load_registry(SHIPPED_CONFIG)
+    for fam in reg.families.values():
+        for device in ("cpu", "gpu"):
+            entry = reg.resolve(fam.id, device=device, variant="default")
+            want = fam.cpu if device == "cpu" else fam.gpu
+            assert entry.id == (want or fam.default)
+
+
 def test_resolve_forced_variant():
     reg = mr.load_registry(SHIPPED_CONFIG)
     assert (reg.resolve("classic_spruce", device="gpu", variant="fp32").id

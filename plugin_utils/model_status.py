@@ -24,7 +24,7 @@ def _family_label(registry, entry):
     return entry.family or entry.id, entry.family or entry.label
 
 
-def _recommended_id(registry, family_id, device, variant="auto"):
+def _recommended_id(registry, family_id, device, variant="default"):
     """The entry the registry would actually load for ``family_id`` on
     this device, or None when it cannot be resolved."""
     if not family_id:
@@ -37,7 +37,7 @@ def _recommended_id(registry, family_id, device, variant="auto"):
 
 
 def scan(registry, models_dir, device="auto", family_id=None,
-         variant="auto") -> list:
+         variant="default") -> list:
     """One :class:`ModelRow` per selectable registry entry.
 
     ``family_id`` and ``variant`` are the family and precision currently
@@ -48,6 +48,14 @@ def scan(registry, models_dir, device="auto", family_id=None,
     will actually be loaded — not a second opinion about it.
     ``family_id`` defaults to the registry's own ``gui_default`` family
     so a caller with no selection yet still gets a sensible highlight.
+
+    ``variant`` defaults to ``"default"`` — the registry's own declared
+    device default (int8 on a CPU-only box, fp16 on an NVIDIA GPU), the
+    same answer :meth:`Registry.default_entry` gives. It used to default
+    to ``"auto"``, whose lossless-only gate refuses the shipped int8
+    default and falls back to the 124 MB fp32 reference: a CPU-only
+    machine was shown "recommended here" against, and offered to
+    download, the largest and slowest file in the family.
 
     Reserved ids (the GUI's "Custom" escape hatch) are excluded. Hidden
     entries (the TensorFlow-only Zenodo originals) are INCLUDED but
