@@ -195,6 +195,54 @@ def _has_compute_deps(executable) -> bool:
         return False
 
 
+def _nvidia_gpu_present() -> bool:
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, timeout=30, text=True)
+        return out.returncode == 0 and bool(out.stdout.strip())
+    except Exception:
+        return False
+
+
+def _onnx_providers(executable) -> list:
+    """Execution providers the given interpreter's onnxruntime offers."""
+    try:
+        out = subprocess.run(
+            [executable, "-I", "-c",
+             "import onnxruntime as ort; "
+             "print(','.join(ort.get_available_providers()))"],
+            capture_output=True, timeout=60, text=True, env=child_env())
+        if out.returncode != 0:
+            return []
+        return [p for p in out.stdout.strip().split(",") if p]
+    except Exception:
+        return []
+
+
+def cuda_capability_hint(executable) -> str:
+    """Warn when an NVIDIA GPU is present but unusable by this environment.
+
+    The default environment installs the CPU-only 'onnxruntime' wheel
+    (requirements/plugin.txt -> base.txt), so CUDA is simply not available --
+    no amount of driver or CUDA toolkit fixes that, because 'onnxruntime-gpu'
+    is a different package. Returns "" when there is nothing to say.
+
+    Deliberately only a HINT: the default install is left alone rather than
+    silently pulling a large CUDA dependency into every plugin environment.
+    """
+    if not executable or not _nvidia_gpu_present():
+        return ""
+    providers = _onnx_providers(executable)
+    if not providers or "CUDAExecutionProvider" in providers:
+        return ""
+    return (
+        "An NVIDIA GPU was detected, but this environment's onnxruntime is "
+        "the CPU-only build, so inference will run on the CPU. To use the "
+        "GPU, install onnxruntime-gpu into the WINMOL environment — see "
+        "docs/GPU.md.")
+
+
 def configured_python_executable():
     """The user-provided interpreter from QgsSettings, or None."""
     try:
@@ -900,8 +948,12 @@ def resolve_environment(plugin_dir, prompt=True, build=True) -> dict:
         return result
 
     if is_ready(venv_path):
-        result.update(status="ready", python=get_venv_python_path(venv_path),
-                      message="WINMOL environment ready.")
+        python = get_venv_python_path(venv_path)
+        message = "WINMOL environment ready."
+        hint = cuda_capability_hint(python)
+        if hint:
+            message = f"{message} {hint}"
+        result.update(status="ready", python=python, message=message)
         return result
 
     if not build:
