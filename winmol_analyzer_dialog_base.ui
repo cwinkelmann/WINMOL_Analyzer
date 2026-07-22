@@ -864,6 +864,39 @@
                    </property>
                   </widget>
                  </item>
+                 <item row="2" column="0">
+                  <widget class="QLabel" name="batchsize_label">
+                   <property name="text">
+                    <string>Prediction batch size:</string>
+                   </property>
+                  </widget>
+                 </item>
+                 <item row="2" column="1">
+                  <widget class="QSpinBox" name="batchsize_spinBox">
+                   <property name="toolTip">
+                    <string>Tiles per inference batch. Auto lets WINMOL size the batch for this machine and measure the best value once. Set a number to pin it and skip the measurement entirely.</string>
+                   </property>
+                   <property name="styleSheet">
+                    <string notr="true">background-color: rgb(255, 255, 255)</string>
+                   </property>
+                   <property name="specialValueText">
+                    <string>Auto</string>
+                   </property>
+                   <property name="minimum">
+                    <number>0</number>
+                   </property>
+                   <property name="maximum">
+                    <number>64</number>
+                   </property>
+                  </widget>
+                 </item>
+                 <item row="2" column="2">
+                  <widget class="QLabel" name="batchsize_unit_label">
+                   <property name="text">
+                    <string>tiles</string>
+                   </property>
+                  </widget>
+                 </item>
                 </layout>
                </item>
               </layout>

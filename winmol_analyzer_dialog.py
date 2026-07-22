@@ -42,7 +42,8 @@ from qgis.core import (
 from qgis.PyQt import QtWidgets, uic
 
 from .classes.Config import Config
-from .plugin_utils import installer, model_status, setup_state
+from .plugin_utils import (config_overrides, installer, model_status,
+                           setup_state)
 from .plugin_utils.output_selection import gpkg_layers_for, process_type_for
 from .tasks_threads import Worker
 
@@ -749,6 +750,10 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
 
     def set_default_config_parameters(self):
         # set default values
+        # 0 == "Auto" (the spin box' specialValueText): let the planner size
+        # the batch and let the one-time autotune refine it.
+        self.batchsize_spinBox.setValue(
+            int(getattr(self.config, "prediction_batch_override", 0) or 0))
         self.minlength_doubleSpinBox.setValue(self.config.min_length)
         self.maxdistance_doubleSpinBox.setValue(self.config.max_distance)
         self.tolerance_doubleSpinBox.setValue(self.config.tolerance_angle)
@@ -761,6 +766,27 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.config.max_distance = self.maxdistance_doubleSpinBox.value()
         self.config.tolerance_angle = self.tolerance_doubleSpinBox.value()
         self.config.max_tree_height = self.maxtree_doubleSpinBox.value()
+
+    def _batch_override_env(self):
+        """Child environment pinning the prediction batch size, or ``{}``.
+
+        0 is "Auto" and injects nothing. Read here, on the GUI thread and
+        before the worker starts — no widget is ever touched from the worker.
+        Any WINMOL_CONFIG_OVERRIDES_JSON the user set themselves is merged,
+        not replaced.
+        """
+        try:
+            value = int(self.batchsize_spinBox.value())
+        except Exception:
+            return {}
+        env = config_overrides.batch_override_env(
+            value, os.environ.get(config_overrides.ENV_VAR))
+        if env:
+            self.update_output_log(
+                f"Prediction batch size pinned to {value} tiles "
+                "(batch-size autotune skipped)."
+            )
+        return env
 
     def set_crs(self, layer):
         # get crs from uav image
@@ -1345,10 +1371,14 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             # Point the child's batch-size autotune cache at WINMOL's managed
             # state, so it is created, found and deleted with the environment
             # rather than in a HOME the QGIS/Docker user may not own.
-            self.worker = Worker(command, env_extra={
+            env_extra = {
                 "WINMOL_AUTOTUNE_CACHE":
                     installer.autotune_cache_location(self._plugin_dir()),
-            })
+            }
+            # The run command is five positional arguments; the environment is
+            # the only channel that carries a config value to the child.
+            env_extra.update(self._batch_override_env())
+            self.worker = Worker(command, env_extra=env_extra)
             self.worker.moveToThread(self.thread)
             self.worker.progress_signal.connect(self.update_progress)
             self.thread.started.connect(self.worker.run_process)

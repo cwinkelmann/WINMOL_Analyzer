@@ -8,6 +8,7 @@ live QGIS, as the suite requires.
 """
 
 import ast
+import json
 import os
 import sys
 
@@ -15,7 +16,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from plugin_utils import autotune_cache, installer  # noqa: E402
+from plugin_utils import autotune_cache, config_overrides, installer  # noqa: E402,E501
 from plugin_utils.childenv import STRIPPED, child_env  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -119,3 +120,62 @@ def test_clearing_twice_is_not_an_error(tmp_path, path_only):
     autotune_cache.store("k", 4, path=path)
     assert autotune_cache.clear(path) is True
     assert autotune_cache.clear(path) is False
+
+
+# --- the manual batch-size pin (Detection tab) ------------------------------
+#
+# "It should be possible to set the batch size manually in the GUI." The
+# Detection tab's other config widgets are dead ends -- self.config is never
+# serialised to the child -- so the pin travels the one channel that works:
+# Worker(env_extra=...) -> child_env() -> WINMOL_CONFIG_OVERRIDES_JSON.
+
+def test_the_batch_spin_box_exists_once_in_the_ui():
+    ui = _source("winmol_analyzer_dialog_base.ui")
+    assert ui.count('name="batchsize_spinBox"') == 1
+    assert 'name="batchsize_label"' in ui
+    # 0 must read as "Auto", not as a batch of zero tiles.
+    assert "<string>Auto</string>" in ui
+
+
+def test_the_dialog_sends_the_pin_through_the_worker_environment():
+    source = _source("winmol_analyzer_dialog.py")
+    tree = ast.parse(source)
+    slot = next((n for n in ast.walk(tree)
+                 if isinstance(n, ast.FunctionDef)
+                 and n.name == "_batch_override_env"), None)
+    assert slot is not None, "the dialog cannot pin the batch size"
+    assert "batchsize_spinBox" in ast.dump(slot)
+    assert "env_extra.update(self._batch_override_env())" in source
+
+
+def test_a_pin_becomes_a_config_override_for_the_child():
+    env = config_overrides.batch_override_env(6)
+    payload = json.loads(env[config_overrides.ENV_VAR])
+    assert payload == {"prediction_batch_override": 6}
+    assert config_overrides.ENV_VAR not in STRIPPED
+    assert child_env(env)[config_overrides.ENV_VAR] == \
+        env[config_overrides.ENV_VAR]
+
+
+@pytest.mark.parametrize("value", [0, None, "", "auto", -1])
+def test_auto_injects_nothing(value):
+    assert config_overrides.batch_override_env(value) == {}
+
+
+def test_an_existing_override_is_merged_not_clobbered():
+    existing = json.dumps({"tile_inner_px": 2048})
+    env = config_overrides.batch_override_env(4, existing)
+    payload = json.loads(env[config_overrides.ENV_VAR])
+    assert payload == {"tile_inner_px": 2048, "prediction_batch_override": 4}
+
+
+def test_an_unparsable_existing_override_is_dropped():
+    env = config_overrides.batch_override_env(4, "{ truncated")
+    assert json.loads(env[config_overrides.ENV_VAR]) == {
+        "prediction_batch_override": 4}
+
+
+def test_the_pinned_key_is_a_real_config_attribute():
+    from classes.Config import Config
+    assert hasattr(Config(), "prediction_batch_override"), (
+        "winmol_run skips unknown keys, so a typo would be silently ignored")
