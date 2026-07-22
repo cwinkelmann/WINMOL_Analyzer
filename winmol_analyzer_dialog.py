@@ -79,7 +79,8 @@ SETUP_INPUTS = (
 #: The precision selector's items, (label, variant value), in order.
 #: Item 0 is load-bearing: a combo built from this list opens on it, so
 #: it has to be the answer the registry itself gives for this machine
-#: ("default" -> int8 on a CPU-only box, fp16 on an NVIDIA GPU). It used
+#: ("default" -> int8 on a CPU-only box, fp16 on an NVIDIA GPU, fp32 on
+#: Apple Silicon/CoreML where fp16 is 14.6x slower). It used
 #: to be "auto", whose lossless-only gate refuses the shipped int8
 #: default and lands on the 124 MB fp32 reference instead.
 VARIANT_ITEMS = (
@@ -609,7 +610,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
     def _default_variant_value(self):
         """The variant to preselect so the GUI opens on exactly the
         entry the registry calls the effective default for this machine
-        (int8 on CPU, fp16 on GPU).
+        (int8 on CPU, fp16 on a CUDA GPU, fp32 on Apple Silicon).
 
         That is ``"default"`` for any schema-v2 registry — the registry
         answers the device question itself, and asking for it by name
@@ -1595,7 +1596,8 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         """
         # Model variant selector + info line (registry schema v2 only).
         # Item 0 is the registry's declared default FOR THIS MACHINE
-        # (int8 on a CPU-only box, fp16 on an NVIDIA GPU); 'Auto —
+        # (int8 on a CPU-only box, fp16 on an NVIDIA GPU, fp32 on Apple
+        # Silicon/CoreML); 'Auto —
         # lossless only' is the conservative one step below it, and the
         # fp32 reference is always one click away. See VARIANT_TOOLTIP
         # for what int8 does and does not promise.

@@ -238,13 +238,23 @@ class ImageProcessing:
         providers we know the truth; if it differs, say so and downgrade the
         recorded hardware so nothing downstream keeps sizing a GPU run for a
         CPU session.
+
+        When it MATCHES, say that too. The banner's "(expected; not yet
+        verified against a session)" is honest but leaves the log hedging
+        forever; one confirmation line here settles it using the observation
+        this hook already has, without a second provider check anywhere.
         """
         active_kind = getattr(model, 'accelerator', None)
         if not active_kind:
             return
         hardware = getattr(self.config, 'hardware', None)
         expected = getattr(hardware, 'accelerator', None) if hardware else None
-        if expected is None or active_kind == expected:
+        if expected is None:
+            return
+        if active_kind == expected:
+            label = getattr(model, 'accelerator_label', active_kind)
+            print(f"Device confirmed: inference is running on {label} "
+                  "(verified against the loaded session).")
             return
         label = getattr(model, 'accelerator_label', active_kind)
         expected_label = getattr(hardware, 'accelerator_label', expected)

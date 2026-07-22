@@ -267,10 +267,108 @@ def test_default_entry_is_device_aware(monkeypatch):
     assert e.precision == "fp16"
     assert e.family == "classic_spruce_deadwood"
 
+    monkeypatch.setattr(mr, "detect_device", lambda: "coreml")
+    e = reg.default_entry()
+    assert e.id == "Spruce_Deadwood"
+    assert e.precision == "fp32"
+    assert e.family == "classic_spruce_deadwood"
+
     # explicit device argument wins over detection
     monkeypatch.setattr(mr, "detect_device", _boom)
     assert reg.default_entry(device="cpu").id == "Spruce_Deadwood_int8"
     assert reg.default_entry(device="gpu").id == "Spruce_Deadwood_fp16"
+    assert reg.default_entry(device="coreml").id == "Spruce_Deadwood"
+
+
+# --- CoreML is its own device class -----------------------------------------
+#
+# Measured on an M2 (onnxruntime 1.27, Spruce_Deadwood, batch 2):
+#   fp32 CoreML 0.172 s/image | int8 CoreML 0.594 | fp16 CoreML 2.268
+#   fp32 CPU    2.237         | int8 CPU    0.547 | fp16 CPU    2.282
+# fp16 -- the right GPU precision on CUDA -- is 13x the fp32 cost on
+# CoreML and no faster than the CPU provider, with 69 of 74 nodes
+# reported supported (so: not a fallback, fp16 itself). End to end on a
+# 182-tile orthomosaic: 429.8 s fp16 vs 61.2 s fp32.
+
+def test_coreml_prefers_fp32_and_cuda_still_prefers_fp16():
+    """The regression this device class exists for: an Apple machine
+    must not be handed the fp16 build, and a CUDA one must still get
+    it."""
+    reg = mr.load_registry(SHIPPED_CONFIG)
+    assert reg.default_entry(device="coreml").precision == "fp32"
+    assert reg.default_entry(device="gpu").precision == "fp16"
+    assert reg.default_entry(device="cpu").precision == "int8"
+    # ...for every family, not just the shipped default's
+    for fam in reg.families.values():
+        entry = reg.resolve(fam.id, device="coreml", variant="default")
+        assert entry.precision == "fp32", fam.id
+        assert entry.id == fam.default, fam.id
+
+
+def test_detect_device_reports_coreml_on_apple_silicon(monkeypatch):
+    """Darwin/arm64 is its own answer -- it used to fall through the
+    nvidia-smi probe to 'cpu', while HardwareInfo called the same
+    machine a GPU. WINMOL_DEVICE still overrides, and neither path
+    shells out."""
+    monkeypatch.delenv("WINMOL_DEVICE", raising=False)
+    monkeypatch.setattr(subprocess, "run", _boom)
+    monkeypatch.setattr(mr.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(mr.platform, "machine", lambda: "arm64")
+    mr._DEVICE_PROBE_CACHE.pop("probe", None)
+    assert mr.detect_device() == "coreml"
+
+    for forced, want in (("coreml", "coreml"), ("metal", "coreml"),
+                         ("mps", "coreml"), ("cpu", "cpu"),
+                         ("cuda", "gpu"), ("gpu", "gpu")):
+        monkeypatch.setenv("WINMOL_DEVICE", forced)
+        assert mr.detect_device() == want
+
+    # an Intel Mac / Linux box is unaffected: still the nvidia-smi probe
+    monkeypatch.delenv("WINMOL_DEVICE", raising=False)
+    monkeypatch.setattr(mr.platform, "machine", lambda: "x86_64")
+    mr._DEVICE_PROBE_CACHE["probe"] = "gpu"
+    assert mr.detect_device() == "gpu"
+    mr._DEVICE_PROBE_CACHE.pop("probe", None)
+
+
+def test_coreml_key_is_optional_and_defaults_to_fp32(tmp_path):
+    """A registry that predates the third device class still loads, and
+    a family with no ``coreml`` key still lands on its fp32 reference —
+    not on the fp16 (GPU) build, and not on the declared int8 default,
+    which is a CPU size/speed decision and 3.5x slower on CoreML."""
+    base = json.load(open(SHIPPED_CONFIG))
+    for fam in base["families"].values():
+        fam.pop("coreml", None)
+    cfg = tmp_path / "no_coreml.json"
+    cfg.write_text(json.dumps(base))
+    reg = mr.load_registry(str(cfg))
+    assert reg.families["classic_spruce_deadwood"].coreml is None
+    assert reg.default_entry(device="coreml").id == "Spruce_Deadwood"
+    assert (reg.resolve("classic_general", device="coreml",
+                        variant="default").id == "General")
+    # and an unknown reference is still rejected
+    base["families"]["classic_general"]["coreml"] = "NoSuchModel"
+    bad = tmp_path / "bad_coreml.json"
+    bad.write_text(json.dumps(base))
+    with pytest.raises(ValueError) as exc:
+        mr.load_registry(str(bad))
+    assert "NoSuchModel" in str(exc.value)
+
+
+def test_coreml_does_not_disturb_the_registry_invariants():
+    """gui_default, the ranking and the digest invariant are properties
+    of ENTRIES; adding a device key to families must not touch them."""
+    reg = mr.load_registry(SHIPPED_CONFIG)
+    assert reg.gui_default == "Spruce_Deadwood_int8"
+    assert reg.recommended[0] == reg.gui_default
+    assert reg.unpinned() == []
+    # every coreml target is a real, downloadable, visible entry
+    for fam in reg.families.values():
+        if fam.coreml is None:
+            continue
+        entry = reg.entries[fam.coreml]
+        assert entry.url and (entry.sha256 or entry.md5)
+        assert not entry.hidden
 
 
 def test_default_entry_never_downloads_or_hits_network(monkeypatch,
@@ -392,9 +490,10 @@ def test_default_variant_agrees_with_default_entry_for_every_family():
     made them diverge is now impossible to reintroduce family-wise."""
     reg = mr.load_registry(SHIPPED_CONFIG)
     for fam in reg.families.values():
-        for device in ("cpu", "gpu"):
+        for device in ("cpu", "gpu", "coreml"):
             entry = reg.resolve(fam.id, device=device, variant="default")
-            want = fam.cpu if device == "cpu" else fam.gpu
+            want = {"cpu": fam.cpu, "gpu": fam.gpu,
+                    "coreml": fam.coreml or fam.default}[device]
             assert entry.id == (want or fam.default)
 
 

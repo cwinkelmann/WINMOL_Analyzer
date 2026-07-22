@@ -187,7 +187,12 @@ def test_no_correction_when_the_session_matches(capsys):
         FakeModel("cuda", "NVIDIA GPU (CUDA)"))
 
     assert proc.config.hardware.gpu_names == ["NVIDIA GeForce RTX 4080"]
-    assert "Correction" not in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "Correction" not in out
+    # ...but the earlier "(expected; not yet verified)" line does get
+    # settled, from the observation this hook already holds.
+    assert "Device confirmed" in out
+    assert "NVIDIA GPU (CUDA)" in out
 
 
 def test_correction_tolerates_a_model_without_provider_info(capsys):
@@ -200,4 +205,26 @@ def test_correction_tolerates_a_model_without_provider_info(capsys):
 
     proc._correct_accelerator_after_load(object())
 
-    assert "Correction" not in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "Correction" not in out
+    # nothing was observed, so nothing is claimed either way
+    assert "Device confirmed" not in out
+
+
+def test_confirmation_names_the_coreml_device(capsys):
+    """The Apple case end to end: the run says, once, which device it is
+    actually on — the whole point of preferring fp32 there."""
+    proc = make_processing()
+    proc.config.hardware = HardwareInfo(
+        cpu_count=8, total_ram_gb=16.0, gpu_count=1,
+        gpu_names=["Apple M2"], gpu_memory_gb=[16.0],
+        accelerator="coreml",
+        accelerator_label="Apple Silicon GPU (Metal/CoreML)")
+
+    proc._correct_accelerator_after_load(
+        FakeModel("coreml", "Apple Silicon GPU (Metal/CoreML)"))
+
+    out = capsys.readouterr().out
+    assert "Device confirmed" in out
+    assert "Apple Silicon GPU (Metal/CoreML)" in out
+    assert proc.config.hardware.gpu_count == 1

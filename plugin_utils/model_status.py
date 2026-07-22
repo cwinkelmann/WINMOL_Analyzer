@@ -50,7 +50,8 @@ def scan(registry, models_dir, device="auto", family_id=None,
     so a caller with no selection yet still gets a sensible highlight.
 
     ``variant`` defaults to ``"default"`` — the registry's own declared
-    device default (int8 on a CPU-only box, fp16 on an NVIDIA GPU), the
+    device default (int8 on a CPU-only box, fp16 on an NVIDIA GPU, fp32
+    on Apple Silicon/CoreML), the
     same answer :meth:`Registry.default_entry` gives. It used to default
     to ``"auto"``, whose lossless-only gate refuses the shipped int8
     default and falls back to the 124 MB fp32 reference: a CPU-only
