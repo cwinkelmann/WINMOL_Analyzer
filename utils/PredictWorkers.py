@@ -534,6 +534,7 @@ def run_multi_gpu_prediction(
                     (total_tiles - done) / rate if rate > 0 else float('inf')
                 print(
                     f"Multi-GPU prediction {done}/{total_tiles} | "
+                    f"prediction tile | "
                     f"{done / total_tiles:.1%} | {rate * 60:.1f} tiles/min"
                     f" | ETA {_format_eta(eta_s)} | avg read "
                     f"{total_read_s / max(done, 1):.3f}s infer "

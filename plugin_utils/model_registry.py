@@ -125,6 +125,18 @@ class Registry:
                 f"unknown model {name!r}; known models: {known}")
         return self.entries[canonical]
 
+    def _device_variant(self, fam, device) -> Optional[ModelEntry]:
+        """The family's variant for ``device`` (cpu->int8, gpu->fp16), or
+        None when the family declares none.
+
+        The ONE place the device->variant rule lives: both
+        ``resolve(variant="default")`` and :meth:`default_entry` go
+        through it, so the two APIs cannot answer "what runs on this
+        machine" differently again.
+        """
+        cand_id = fam.cpu if device == "cpu" else fam.gpu
+        return self.entries.get(cand_id) if cand_id else None
+
     def resolve(self, name, device="auto", variant="auto") -> ModelEntry:
         """Resolve a model or family name to a concrete entry.
 
@@ -134,8 +146,11 @@ class Registry:
         * A family id picks the family default; with ``variant="auto"``
           the device variant (cpu->int8, gpu->fp16) is substituted ONLY
           when that variant is certified lossless, keeping results
-          stable. A forced variant ("fp32"/"int8"/"fp16") selects that
-          variant or raises ValueError if the family lacks it.
+          stable. ``variant="default"`` takes the device variant
+          WITHOUT that gate — it is the machine's declared default, the
+          same rule :meth:`default_entry` applies, and it is what the
+          GUI opens on. A forced variant ("fp32"/"int8"/"fp16") selects
+          that variant or raises ValueError if the family lacks it.
 
         Precedence (family ids like "unet_pt" collide case-insensitively
         with entry ids like "UNet_PT"): exact entry id, exact family id,
@@ -160,11 +175,13 @@ class Registry:
         if device == "auto":
             device = detect_device()
         if variant == "auto":
-            cand_id = fam.cpu if device == "cpu" else fam.gpu
-            cand = self.entries.get(cand_id) if cand_id else None
+            cand = self._device_variant(fam, device)
             if cand is not None and cand.lossless:
                 return cand
             return default
+        if variant == "default":
+            cand = self._device_variant(fam, device)
+            return cand if cand is not None else default
         if variant == "fp32":
             return default
         if variant in ("int8", "cpu"):
@@ -178,7 +195,8 @@ class Registry:
                     f"family '{fam.id}' has no fp16/GPU variant")
             return self.entries[fam.gpu]
         raise ValueError(
-            f"unknown variant {variant!r} (use auto/fp32/int8/fp16)")
+            f"unknown variant {variant!r} "
+            "(use default/auto/fp32/int8/fp16)")
 
     def default_entry(self, device="auto") -> ModelEntry:
         """The EFFECTIVE default model for ``device``.
@@ -191,13 +209,16 @@ class Registry:
         the declared entry itself when the family has no such variant.
 
         This deliberately does NOT go through :meth:`resolve`'s
-        lossless-only gate. ``resolve`` protects users who picked a
-        *family* from a silent, results-changing precision swap; here the
-        registry has explicitly nominated an optimised entry as the
-        default, so honouring the device is the declared intent, not a
-        substitution behind the user's back. Any explicit selection (an
-        entry id from the GUI, ``winmol_batch <MODEL>``, or a forced
-        ``--variant``) bypasses this method entirely.
+        lossless-only ``auto`` gate — it is ``resolve(family,
+        variant="default")`` applied to the declared default's family,
+        and shares its rule via :meth:`_device_variant`. ``auto``
+        protects users who picked a *family* from a silent,
+        results-changing precision swap; here the registry has
+        explicitly nominated an optimised entry as the default, so
+        honouring the device is the declared intent, not a substitution
+        behind the user's back. Any explicit selection (an entry id from
+        the GUI, ``winmol_batch <MODEL>``, or a forced ``--variant``)
+        bypasses this method entirely.
 
         Never downloads and never touches the network beyond the local
         ``detect_device()`` probe.
@@ -217,8 +238,7 @@ class Registry:
             return declared
         if device == "auto":
             device = detect_device()
-        cand_id = fam.cpu if device == "cpu" else fam.gpu
-        cand = self.entries.get(cand_id) if cand_id else None
+        cand = self._device_variant(fam, device)
         return cand if cand is not None else declared
 
     def recommended_entries(self) -> List[ModelEntry]:

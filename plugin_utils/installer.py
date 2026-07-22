@@ -296,17 +296,39 @@ def directory_size(path) -> int:
 def path_is_inside(path, root) -> bool:
     """True when ``path`` is ``root`` or a descendant of it.
 
-    realpath + normcase are mandatory rather than a plain
-    ``os.path.commonpath``: on Windows a user's own conda interpreter can
-    reach the same tree through a different case or an 8.3 short path,
-    and mis-classifying it is the difference between "forget this
-    setting" and "rmtree a Python we never created".
+    The ROOT is realpath'd, the candidate is not. That asymmetry is the
+    whole point: a POSIX venv's ``bin/python`` is an ABSOLUTE SYMLINK to
+    the base interpreter by construction (see ``create_venv`` — the venv
+    is deliberately built without ``--copies``, because symlinks are
+    mandatory on macOS), so realpath'ing the leaf resolved WINMOL's own
+    managed interpreter to something like
+    ``/opt/homebrew/.../bin/python3.11`` and this predicate answered
+    False for every macOS and Linux install. Fallout: deletion_plan()
+    classified the managed venv as "bring your own" and the Setup tab's
+    "Delete environment…" silently deleted nothing, ``EnvInfo.managed``
+    was False so half-built venvs were never reported, and the stale
+    interpreter setting was not cleared after a deletion.
+
+    Nothing here deletes ``path``; callers use it to ask "is this
+    interpreter WINMOL's own?" and then rmtree the ROOT (which removes a
+    symlink entry, never its target). So a symlink that merely LIVES
+    inside the root is correctly inside, while an interpreter that lives
+    elsewhere stays outside and keeps its "forget the setting" treatment.
+
+    The realpath'd candidate is still tried as a fallback, so a path
+    that reaches the root through a symlinked *directory* (``/var`` ->
+    ``/private/var`` on macOS) or a Windows 8.3 short path is caught
+    too — and normcase keeps the Windows case-insensitivity the original
+    docstring was written for.
     """
     if not path or not root:
         return False
-    a = os.path.normcase(os.path.realpath(path))
     b = os.path.normcase(os.path.realpath(root))
-    return a == b or a.startswith(b + os.sep)
+    for candidate in (os.path.abspath(path), os.path.realpath(path)):
+        a = os.path.normcase(candidate)
+        if a == b or a.startswith(b + os.sep):
+            return True
+    return False
 
 
 def _managed_roots(plugin_dir) -> tuple:

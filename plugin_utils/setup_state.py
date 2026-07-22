@@ -41,6 +41,20 @@ TXT_DETAIL_DEPS_BAD = "dependencies missing"
 TXT_DETAIL_DEPS_UNKNOWN = "dependencies not checked"
 TXT_DETAIL_RUNTIME = "runtime {size}"
 
+#: Where the managed environment lives, and the honest caveat about what
+#: uninstalling the plugin does NOT do. QGIS's plugin uninstall is
+#: unloadPlugin() + removeDir(<profile>/python/plugins/WINMOL_Analyzer)
+#: and nothing else (pyplugin_installer/installer.py::uninstallPlugin),
+#: and the managed root is deliberately a SIBLING of the plugin folder
+#: (installer.managed_root) so that recursive delete cannot trip over
+#: venv symlinks. There is no uninstall hook in the QGIS plugin API, so
+#: this leftover has to be discoverable and removable by hand.
+TXT_ENV_LOCATION = (
+    "WINMOL's environment lives in {path}{size}. Uninstalling the plugin "
+    "does NOT remove it — QGIS only deletes the plugin folder. Use "
+    "“Delete environment…” here before uninstalling, or "
+    "delete that folder yourself afterwards.")
+
 TXT_BLOCK_NO_ENV = (
     "No Python environment yet — open the Setup tab and create one.")
 TXT_BLOCK_VERSION = (
@@ -291,6 +305,29 @@ def env_detail_text(info, usage=None) -> str:
         parts.append(TXT_DETAIL_RUNTIME.format(
             size=human_bytes(usage["runtime"])))
     return " · ".join(parts)
+
+
+def env_location_text(plugin_dir, usage=None) -> str:
+    """The gray line naming the managed root, and saying plainly that
+    uninstalling the plugin leaves it behind.
+
+    The user's report: "'<profile>/winmol' stays untouched after
+    deinstalling". It does, by design and unavoidably — QGIS offers no
+    uninstall hook at all (a plugin's ``unload()`` is called identically
+    on disable, reload and shutdown, so deleting from there would wipe a
+    multi-GB venv every time QGIS closes). The only honest answer is to
+    say where it is and how to remove it.
+
+    ``usage`` is the same optional ``{'venv': bytes, 'runtime': bytes}``
+    map :func:`env_detail_text` takes; the total is appended when known.
+    """
+    root = installer.managed_root(plugin_dir)
+    if not root:
+        return ""
+    total = sum(int(usage.get(key) or 0)
+                for key in ("venv", "runtime")) if usage else 0
+    size = f" ({human_bytes(total)})" if total else ""
+    return TXT_ENV_LOCATION.format(path=root, size=size)
 
 
 def env_ready(info) -> bool:

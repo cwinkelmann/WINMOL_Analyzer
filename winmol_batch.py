@@ -358,13 +358,15 @@ def main(argv: List[str]) -> int:
     )
     parser.add_argument(
         "--variant",
-        choices=["auto", "fp32", "int8", "fp16"],
+        choices=["auto", "default", "fp32", "int8", "fp16"],
         default="auto",
         help=(
             "Precision variant when MODEL is a family id (e.g. unet_pt): "
             "'auto' substitutes the device variant only when it is "
-            "certified lossless; fp32/int8/fp16 force one. Explicit model "
-            "ids (e.g. Spruce_Deadwood, UNet_PT_int8) are never rewritten."
+            "certified lossless; 'default' takes the device variant "
+            "(int8 on CPU, fp16 on GPU) regardless — what the GUI opens "
+            "on; fp32/int8/fp16 force one. Explicit model ids (e.g. "
+            "Spruce_Deadwood, UNet_PT_int8) are never rewritten."
         ),
     )
     parser.add_argument(

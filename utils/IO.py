@@ -1132,7 +1132,10 @@ def _log_merge_tile_read(tile_id, gpkg_path, stems, nodes, vectors,
     feature counts) is the part that was too noisy for a normal run, so that
     stays behind ``debug``.
     """
-    head = f"MERGE TILE READ | tile {tile_id}"
+    # " | vector tile" names the unit: these are the few huge vector
+    # tiles being stitched, not the hundreds of small prediction tiles.
+    # Appended AFTER the parsed prefix, which stays byte-identical.
+    head = f"MERGE TILE READ | tile {tile_id} | vector tile"
     if not Log.is_debug():
         Log.info(head)
         return

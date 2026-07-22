@@ -34,6 +34,54 @@ Install from the release ZIP (QGIS → Plugins → Install from ZIP), or for loc
 development `make deploy` (copies the full plugin, including the compute core,
 into your QGIS profile).
 
+### Where the plugin's environment lives — and how to remove it
+
+Everything the plugin builds for itself lives **outside** the plugin folder,
+under the QGIS profile directory:
+
+```
+<QGIS profile>/winmol/
+├── winmol_venv/            the managed virtual environment (~1–2 GB)
+├── py311/                  a downloaded Python 3.11 runtime, if one was needed
+└── .winmol_autotune.json   the batch-size autotune cache
+<QGIS profile>/python/plugins/WINMOL_Analyzer/
+└── models/                 downloaded .onnx models (31 MB – 375 MB each)
+```
+
+`<QGIS profile>` is what *Settings → User Profiles → Open Active Profile
+Folder* opens (e.g. `~/Library/Application Support/QGIS/QGIS3/profiles/default`
+on macOS, `~/.local/share/QGIS/QGIS3/profiles/default` on Linux,
+`%APPDATA%\QGIS\QGIS3\profiles\default` on Windows).
+
+The venv sits beside the plugin folder rather than inside it on purpose: QGIS
+uninstalls a plugin by recursively deleting its folder, and that delete used to
+fail on the venv's symlinks.
+
+> **Uninstalling the plugin does NOT remove `<profile>/winmol`.** This is not
+> an oversight — the QGIS plugin API has no uninstall hook.
+> `pyplugin_installer/installer.py::uninstallPlugin` is `unloadPlugin(key)`
+> followed by `removeDir(<profile>/python/plugins/WINMOL_Analyzer)`, and
+> `unloadPlugin` calls the plugin's `unload()`, which QGIS also calls on
+> *disable*, on *reload* and at *application shutdown*. Nothing in that
+> callback can tell an uninstall from QGIS simply closing, so deleting the
+> environment there would wipe a multi-gigabyte venv every time you quit.
+
+Two ways to remove it, both explicit:
+
+* **Setup tab → “Delete environment…”** — pick venv / downloaded runtime /
+  downloaded models, then confirm an itemised list with sizes. “Open folder”
+  next to it opens `<profile>/winmol` if you would rather look first. Do this
+  *before* uninstalling the plugin.
+* **By hand**, afterwards:
+
+  ```shell
+  rm -rf "<QGIS profile>/winmol"                     # macOS / Linux
+  rmdir /s /q "%APPDATA%\QGIS\QGIS3\profiles\default\winmol"   # Windows
+  ```
+
+If you want to keep the environment (it is an ordinary venv), copy it
+somewhere else first and point `winmol/python_executable` at the copy.
+
 ## Converting Keras (.hdf5) models to ONNX (dev-only)
 
 The four Zenodo Keras models are converted once, offline:

@@ -618,6 +618,19 @@ def predict_stream_to_raster(
     )
 
     total_tiles = layout['x_tiles'] * layout['y_tiles']
+    # Name the unit. "Written tile 156/182" and "Vector tiles 3/3" are
+    # counters over two completely different things — hundreds of small
+    # inference tiles vs a handful of huge vectorization tiles — and the
+    # log never said so. This header is new and unparsed; the counter
+    # lines below keep the prefixes run_progress.py pins.
+    print(
+        f"PREDICTION PHASE | {total_tiles} prediction tiles | src "
+        f"{layout['px_per_tile_x']}x{layout['px_per_tile_y']} px -> out "
+        f"{config.img_width - config.overlap_pred}x"
+        f"{config.img_width - config.overlap_pred} px each | model input "
+        f"{config.img_width} px",
+        flush=True,
+    )
     initial_batch_size = max(1, int(getattr(
         config, 'prediction_batch_size', None) or getattr(
             config, 'prediction_batch_gpu', 1)))
@@ -759,6 +772,7 @@ def predict_stream_to_raster(
                     if queue_depth > 0 else 0.0
                 print(
                     f"Written tile {done}/{total_tiles} | "
+                    f"prediction tile | "
                     f"{done / total_tiles:.1%} | "
                     f"{rate * 60:.1f} tiles/min | ETA {_format_eta(eta_s)} | "
                     f"avg read {avg_read:.3f}s prep {avg_prep:.3f}s infer "

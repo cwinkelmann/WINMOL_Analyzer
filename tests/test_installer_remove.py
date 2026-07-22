@@ -88,6 +88,81 @@ def test_path_is_inside_uses_realpath_and_normcase(tmp_path):
         assert inst.path_is_inside(str(link), str(root))
 
 
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="needs symlinks")
+def test_a_symlink_leaf_inside_the_root_counts_as_inside(tmp_path):
+    """The exact shape of a POSIX venv's bin/python: an entry INSIDE the
+    root whose target is an interpreter outside it. Realpath'ing that
+    leaf is what made WINMOL classify its own managed venv as
+    bring-your-own."""
+    root = tmp_path / "venv"
+    (root / "bin").mkdir(parents=True)
+    outside = tmp_path / "base" / "bin"
+    outside.mkdir(parents=True)
+    (outside / "python3.11").write_text("#!/bin/sh\n")
+    leaf = root / "bin" / "python"
+    try:
+        os.symlink(str(outside / "python3.11"), str(leaf))
+    except (OSError, NotImplementedError):          # pragma: no cover
+        pytest.skip("symlinks unavailable")
+    assert inst.path_is_inside(str(leaf), str(root))
+    # ...and the target itself is still outside: a bring-your-own
+    # interpreter must never become deletable.
+    assert not inst.path_is_inside(str(outside / "python3.11"), str(root))
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="needs symlinks")
+def test_a_symlink_pointing_out_of_the_root_is_still_outside(tmp_path):
+    """A link that LIVES outside and points in is not inside."""
+    root = tmp_path / "root"
+    (root / "sub").mkdir(parents=True)
+    outside_dir = tmp_path / "elsewhere"
+    outside_dir.mkdir()
+    escape = outside_dir / "python"
+    try:
+        os.symlink(str(outside_dir / "real"), str(escape))
+    except (OSError, NotImplementedError):          # pragma: no cover
+        pytest.skip("symlinks unavailable")
+    assert not inst.path_is_inside(str(escape), str(root))
+
+
+def test_a_real_venv_is_recognised_as_managed(tmp_path):
+    """The end-to-end regression: build an actual venv and assert the
+    Setup tab would offer to delete it.
+
+    Before this fix, on every macOS and Linux install deletion_plan()
+    returned kind='byo' — so "Delete environment…" routed to "forget the
+    interpreter" and removed nothing, and the leftover
+    <profile>/winmol the user complained about could not be cleaned up
+    from inside the plugin at all.
+    """
+    import venv as venv_mod
+
+    from plugin_utils import setup_state
+
+    plugin_dir = tmp_path / "plugin"
+    plugin_dir.mkdir()
+    venv_dir = inst.venv_location(str(plugin_dir))
+    try:
+        venv_mod.EnvBuilder(with_pip=False, symlinks=True).create(venv_dir)
+    except Exception as exc:                        # pragma: no cover
+        pytest.skip(f"cannot build a venv here: {exc}")
+    exe = inst.get_venv_python_path(venv_dir)
+    assert os.path.exists(exe)
+    # the shape that broke it: an absolute symlink out of the venv
+    assert os.path.islink(exe) or sys.platform == "win32"
+
+    assert inst.path_is_inside(exe, venv_dir) is True
+    plan = setup_state.deletion_plan(str(plugin_dir), exe)
+    assert plan["kind"] == "managed"
+    assert venv_dir in plan["paths"]
+    assert plan["clears_setting"] is True
+    assert setup_state.env_seed(str(plugin_dir), exe).managed is True
+
+    # ...and a bring-your-own interpreter is still bring-your-own.
+    byo = setup_state.deletion_plan(str(plugin_dir), sys.executable)
+    assert byo["kind"] == "byo"
+
+
 # --- dry run ----------------------------------------------------------------
 
 def test_dry_run_reports_paths_and_bytes_and_deletes_nothing(tmp_path):

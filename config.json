@@ -220,7 +220,7 @@
       "size_mb": 31.4,
       "f1": null,
       "lossless": false,
-      "description": "Shipped default (recommended[0]). Post-training static int8 of the SpecDS Spruce+Deadwood Keras model, domain-calibrated. NOTE: unlike the fp16 variant, this int8 build is NOT certified lossless in the models-v1 manifest — it is the default by explicit product decision (small size, fast CPU), not by a measured-equivalence claim. On a GPU host the effective default becomes the lossless Spruce_Deadwood_fp16."
+      "description": "Shipped default on a CPU-only machine (recommended[0]): 31 MB to download against 124.6 MB for the fp32 reference, and much faster on CPU. Post-training static int8 of the SpecDS Spruce+Deadwood Keras model, domain-calibrated. NOTE: unlike the fp16 variant, this int8 build is NOT certified lossless in the models-v1 manifest — it is the default by explicit product decision (small size, fast CPU), not by a measured-equivalence claim; pick 'Reference (fp32)' in the variant selector if you need results identical to the published reference. On a GPU host the effective default becomes the lossless Spruce_Deadwood_fp16."
     },
     "Spruce_Deadwood_fp16": {
       "label": "Spruce + deadwood — GPU-optimised fp16",

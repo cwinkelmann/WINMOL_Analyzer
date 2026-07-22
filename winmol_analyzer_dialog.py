@@ -74,6 +74,41 @@ SETUP_INPUTS = (
     "models_variants_checkBox",
 )
 
+#: The precision selector's items, (label, variant value), in order.
+#: Item 0 is load-bearing: a combo built from this list opens on it, so
+#: it has to be the answer the registry itself gives for this machine
+#: ("default" -> int8 on a CPU-only box, fp16 on an NVIDIA GPU). It used
+#: to be "auto", whose lossless-only gate refuses the shipped int8
+#: default and lands on the 124 MB fp32 reference instead.
+VARIANT_ITEMS = (
+    ("Recommended for this machine", "default"),
+    ("Auto — lossless only", "auto"),
+    ("Reference (fp32)", "fp32"),
+    ("CPU-optimised (int8)", "int8"),
+    ("GPU-optimised (fp16)", "fp16"),
+)
+
+#: What the precision selector claims, in full. int8 honesty is
+#: load-bearing here: only the PyTorch w05 int8 build is certified
+#: lossless against its fp32 reference; the int8 builds of the
+#: Keras-derived families are domain-calibrated post-training
+#: quantisations, measured close but not certified equivalent.
+VARIANT_TOOLTIP = (
+    "Precision variant of the selected model family.\n\n"
+    "'Recommended for this machine' picks the int8 build on a CPU-only "
+    "machine (much smaller to download, much faster on CPU) and the "
+    "fp16 build on an NVIDIA GPU.\n\n"
+    "The int8 builds of the Keras-derived families (General / Beech / "
+    "Spruce / Spruce+deadwood) are domain-calibrated post-training "
+    "quantisations — measured close, but NOT certified lossless. Only "
+    "the PyTorch w05 int8 build is certified lossless against its fp32 "
+    "reference.\n\n"
+    "'Auto — lossless only' substitutes a device variant only where it "
+    "is certified lossless, and otherwise stays on fp32. Choose "
+    "'Reference (fp32)' if you need results identical to the published "
+    "reference model."
+)
+
 #: Idle text for setup_status_label. It is NEVER empty: an empty status
 #: line during a multi-minute pip install is what read as "frozen".
 IDLE_STATUS = "Idle."
@@ -342,6 +377,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         ("models_verify_button", "clicked", "_setup_verify_selected"),
         ("models_delete_button", "clicked", "_setup_delete_selected"),
         ("models_open_folder_button", "clicked", "_open_models_dir"),
+        ("env_open_folder_button", "clicked", "_open_env_dir"),
         ("setup_go_detect_button", "clicked", "_go_to_detection"),
         ("setup_open_log_button", "clicked", "_go_to_log"),
         ("setup_banner_button", "clicked", "_go_to_setup"),
@@ -490,18 +526,12 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         except Exception:
             pass
 
-        # Preselect the precision the registry considers the effective
-        # default on THIS machine, so what the user sees is what runs.
-        # It is an ordinary selection: changing it overrides the rule.
-        combo = getattr(self, "variant_comboBox", None)
-        if combo is not None and self.registry is not None:
-            try:
-                idx = combo.findData(self._default_variant_value())
-                if idx >= 0:
-                    combo.setCurrentIndex(idx)
-            except Exception:
-                pass
-
+        # NOTE: the variant selector is NOT preset here. This method runs
+        # before _add_custom_controls() creates variant_comboBox, so the
+        # preset that used to live here was dead code on every launch —
+        # which is how a CPU-only machine ended up on 'auto' (and hence
+        # on the 124 MB fp32 model). It lives in _preset_default_variant(),
+        # called from _add_custom_controls() where the combo exists.
         self.handle_model_combo_box_change()
 
     def _registry_combo_items(self):
@@ -571,20 +601,39 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
     def _default_variant_value(self):
         """The variant to preselect so the GUI opens on exactly the
         entry the registry calls the effective default for this machine
-        (int8 on CPU, fp16 on GPU). 'auto' when the registry has no
-        opinion — auto's lossless-only gate would otherwise silently
-        downgrade a declared int8 default to fp32."""
+        (int8 on CPU, fp16 on GPU).
+
+        That is ``"default"`` for any schema-v2 registry — the registry
+        answers the device question itself, and asking for it by name
+        means the GUI cannot drift from ``Registry.default_entry()``.
+        Legacy v1 registries have no families and no variants at all (the
+        selector is hidden), so they fall back to ``"auto"``.
+        """
         reg = self.registry
         if reg is None or reg.schema < 2:
             return "auto"
+        return "default"
+
+    def _preset_default_variant(self):
+        """Select the precision the registry considers the effective
+        default on THIS machine, so what the user sees is what runs.
+
+        It is an ordinary selection: changing the combo overrides it.
+        MUST be called after the combo exists — it is called from
+        :meth:`_add_custom_controls`, which builds it. Calling it from
+        :meth:`populate_model_combo_box` (which runs first) silently did
+        nothing, and that is the whole reason CPU-only machines were
+        offered the 124 MB fp32 model.
+        """
+        combo = getattr(self, "variant_comboBox", None)
+        if combo is None:
+            return
         try:
-            from .plugin_utils import model_registry
-            entry = reg.default_entry(
-                device=model_registry.detect_device())
-        except Exception:
-            return "auto"
-        return {"int8": "int8", "fp16": "fp16"}.get(
-            entry.precision, "auto")
+            idx = combo.findData(self._default_variant_value())
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+        except Exception:                          # pragma: no cover - GUI
+            pass
 
     def handle_model_combo_box_change(self):
         selected_text = self.model_comboBox.currentText()
@@ -632,11 +681,17 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         return reg.families.get(entry.family)
 
     def _variant_value(self):
-        """Selected variant ('auto'/'fp32'/'int8'/'fp16')."""
+        """Selected variant ('default'/'auto'/'fp32'/'int8'/'fp16').
+
+        With no combo (it is only built for schema-v2 registries) the
+        answer is the registry's own device default, not 'auto' — the
+        Setup tab must not recommend a different file from the one a run
+        would load.
+        """
         combo = getattr(self, "variant_comboBox", None)
         if combo is None:
-            return "auto"
-        return combo.currentData() or "auto"
+            return self._default_variant_value()
+        return combo.currentData() or self._default_variant_value()
 
     def _selected_registry_entry(self):
         """Resolve the combo selection (+ variant, + detected device) to a
@@ -672,9 +727,14 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self._refresh_setup_state()
 
     def _refresh_variant_controls(self):
-        """Enable the variant selector for registry families and gray out
+        """Enable the variant selector for registry families, gray out
         variants the current family does not provide (e.g. DeepLab/HRNet
-        have no int8)."""
+        have no int8), and put each variant's DOWNLOAD SIZE in its label.
+
+        The size belongs at the point of choice: 31 MB against 124 MB is
+        the whole reason a CPU-only machine wants the int8 build, and it
+        was previously invisible until after the download started.
+        """
         combo = getattr(self, "variant_comboBox", None)
         if combo is None:
             return
@@ -682,18 +742,50 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             fam = self._current_family()
             combo.setEnabled(fam is not None)
             if fam is None:
+                for i, (text, _val) in enumerate(VARIANT_ITEMS):
+                    combo.setItemText(i, text)
                 return
-            avail = {"auto": True, "fp32": True,
+            avail = {"default": True, "auto": True, "fp32": True,
                      "int8": bool(fam.cpu), "fp16": bool(fam.gpu)}
             model = combo.model()
             for i in range(combo.count()):
+                value = combo.itemData(i)
                 item = model.item(i)
                 if item is not None:
-                    item.setEnabled(avail.get(combo.itemData(i), True))
+                    item.setEnabled(avail.get(value, True))
+                combo.setItemText(i, self._variant_item_text(fam, i, value))
             if not avail.get(combo.currentData(), True):
-                combo.setCurrentIndex(0)   # back to Auto
+                combo.setCurrentIndex(0)   # back to the device default
         except Exception:                          # pragma: no cover - GUI
             pass
+
+    def _variant_item_text(self, fam, index, value):
+        """'CPU-optimised (int8) — 31 MB' for one combo item."""
+        base = VARIANT_ITEMS[index][0] if index < len(VARIANT_ITEMS) \
+            else str(value)
+        entry = self._variant_entry(fam, value)
+        if entry is None:
+            return base
+        suffix = ""
+        if entry.size_mb:
+            suffix = f" — {entry.size_mb:.0f} MB"
+        if value in ("default", "auto"):
+            # These two are indirections; name the file they land on so
+            # "Recommended" is never a black box.
+            return f"{base}: {entry.precision}{suffix}"
+        return f"{base}{suffix}"
+
+    def _variant_entry(self, fam, value):
+        """The entry ``fam`` resolves to for one variant value, or None."""
+        if self.registry is None or fam is None:
+            return None
+        try:
+            from .plugin_utils import model_registry
+            return self.registry.resolve(
+                fam.id, device=model_registry.detect_device(),
+                variant=value)
+        except (KeyError, ValueError):
+            return None
 
     def _refresh_model_info(self):
         """Show what the current selection actually is (description, F1,
@@ -1465,25 +1557,20 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         gone entirely and the top of the dialog belongs to Run.
         """
         # Model variant selector + info line (registry schema v2 only).
-        # Auto picks the lossless device variant (int8 on CPU / fp16 on
-        # GPU) and otherwise stays on the fp32 reference, so results
-        # never drift unless the user opts in explicitly.
+        # Item 0 is the registry's declared default FOR THIS MACHINE
+        # (int8 on a CPU-only box, fp16 on an NVIDIA GPU); 'Auto —
+        # lossless only' is the conservative one step below it, and the
+        # fp32 reference is always one click away. See VARIANT_TOOLTIP
+        # for what int8 does and does not promise.
         #
         # It stays on the DETECTION tab, deliberately: which precision a
         # run loads is results-affecting, and a precision chosen once
         # during setup would silently change outputs months later.
         try:
             self.variant_comboBox = QtWidgets.QComboBox(self)
-            for text, val in (("Auto (recommended)", "auto"),
-                              ("Reference (fp32)", "fp32"),
-                              ("CPU-optimised (int8)", "int8"),
-                              ("GPU-optimised (fp16)", "fp16")):
+            for text, val in VARIANT_ITEMS:
                 self.variant_comboBox.addItem(text, val)
-            self.variant_comboBox.setToolTip(
-                "Precision variant of the selected model family. Auto "
-                "substitutes a faster device variant only when it is "
-                "certified lossless; otherwise it uses the fp32 "
-                "reference.")
+            self.variant_comboBox.setToolTip(VARIANT_TOOLTIP)
             self.variant_comboBox.currentIndexChanged.connect(
                 self._on_variant_changed)
             self.model_info_label = QtWidgets.QLabel(self)
@@ -1505,6 +1592,8 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             holder = getattr(self, "model_variant_widget", None)
             if (reg is None or reg.schema < 2) and holder is not None:
                 holder.hide()              # nothing to vary in v1 configs
+            # The combo exists now, so the preset can finally take.
+            self._preset_default_variant()
             self._refresh_variant_controls()
             self._refresh_model_info()
         except Exception as exc:                       # pragma: no cover - GUI
@@ -2075,10 +2164,16 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         if not getattr(self, "_setup_live", False):
             return
         info = self._env_snapshot(force=force_env)
+        usage = self._env_usage()
         self._set_label("env_state_label", setup_state.env_state_text(info))
         self._set_label("env_path_label", info.exe or "")
         self._set_label("env_detail_label",
-                        setup_state.env_detail_text(info, self._env_usage()))
+                        setup_state.env_detail_text(info, usage))
+        # Where the environment lives, and that uninstalling leaves it
+        # behind. QGIS has no uninstall hook — see _open_env_dir.
+        self._set_label(
+            "env_location_label",
+            setup_state.env_location_text(self._plugin_dir(), usage))
         self._model_rows = self._scan_models()
         self._refresh_model_tree()      # ...which applies the interlock
         self._apply_blocking_reason(info)
@@ -2431,6 +2526,14 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         layout = QtWidgets.QVBoxLayout(box)
         layout.addWidget(QtWidgets.QLabel(
             "Choose what to remove. Your own files are never touched.", box))
+        # The user's report: uninstalling the plugin leaves <profile>/winmol
+        # behind. It does, unavoidably — QGIS has no uninstall hook (see
+        # _open_env_dir) — so say so where the removal actually happens.
+        note = QtWidgets.QLabel(
+            setup_state.env_location_text(self._plugin_dir()), box)
+        note.setWordWrap(True)
+        note.setStyleSheet("color: gray;")
+        layout.addWidget(note)
         venv_cb = QtWidgets.QCheckBox("Virtual environment", box)
         venv_cb.setChecked(True)
         runtime_cb = QtWidgets.QCheckBox(
@@ -2625,6 +2728,29 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             QDesktopServices.openUrl(QUrl.fromLocalFile(self.models_dir))
         except Exception as exc:                   # pragma: no cover - GUI
             self.update_output_log(f"Could not open {self.models_dir}: {exc}")
+
+    def _open_env_dir(self):
+        """Open the managed root — the folder QGIS leaves behind.
+
+        Uninstalling the plugin runs pyplugin_installer's
+        ``uninstallPlugin``: ``unloadPlugin(key)`` then ``removeDir(
+        <profile>/python/plugins/WINMOL_Analyzer)``, and nothing else.
+        ``unload()`` is the SAME callback QGIS fires on disable, on
+        plugin reload and at application shutdown, so it cannot be used
+        to detect an uninstall — deleting from there would erase a
+        multi-GB venv every time QGIS closes. There is no uninstall hook
+        in the QGIS plugin API, so the leftover is surfaced here instead
+        of removed behind the user's back.
+        """
+        root = installer.managed_root(self._plugin_dir())
+        try:
+            if not os.path.isdir(root):
+                self.update_output_log(
+                    f"There is no WINMOL environment folder yet ({root}).")
+                return
+            QDesktopServices.openUrl(QUrl.fromLocalFile(root))
+        except Exception as exc:                   # pragma: no cover - GUI
+            self.update_output_log(f"Could not open {root}: {exc}")
 
     def load_layers_to_session(self):
         """Load outputs after processing finishes.
