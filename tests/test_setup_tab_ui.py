@@ -66,16 +66,32 @@ def _tab_pages():
 # --- tab order (the regression that _show_tab protects) ---------------------
 
 def test_the_tab_widget_has_exactly_three_pages_in_order():
+    """Setup is leftmost — the user's requirement, pinned. Every index
+    that used to be written down as a number is now resolved from these
+    names, so this assertion is the only place the order lives."""
     pages = _tab_pages()
-    assert [p.get("name") for p in pages] == ["tab", "tab_setup", "tab_2"]
+    assert [p.get("name") for p in pages] == ["tab_setup", "tab", "tab_2"]
     titles = [p.find("attribute[@name='title']/string").text for p in pages]
-    assert titles == ["Detection", "Setup", "Log"]
+    assert titles == ["Setup", "Detection", "Log"]
+
+
+def test_the_dialog_opens_on_detection_not_on_setup():
+    """The .ui's designer default is the one index a widget lookup cannot
+    replace, so it is checked against the page order rather than a
+    number. _enter_first_run may still send a fresh install to Setup."""
+    root = _root()
+    tabs = [w for w in root.iter("widget") if w.get("class") == "QTabWidget"]
+    current = tabs[0].find("property[@name='currentIndex']/number")
+    assert current is not None
+    pages = [p.get("name") for p in _tab_pages()]
+    assert pages[int(current.text)] == "tab"
 
 
 def test_no_integer_literal_reaches_set_current_index():
-    """setCurrentIndex(1) used to mean "the Log tab". With Setup inserted
-    at index 1 it would silently mean "the Setup tab", so the literal is
-    banned outright and _show_tab(page) resolves the index."""
+    """setCurrentIndex(1) used to mean "the Log tab". Setup was inserted
+    at index 1 and has since moved to index 0, so that literal would mean
+    the Setup tab and then the Detection tab; it is banned outright and
+    _show_tab(page) resolves the index from the widget."""
     tree = ast.parse(open(DIALOG_FILE, encoding="utf-8").read())
     offenders = []
     for node in ast.walk(tree):
@@ -100,6 +116,35 @@ def test_show_tab_resolves_the_index_from_the_page():
     called = {c.func.attr for c in ast.walk(node)
               if isinstance(c, ast.Call) and hasattr(c.func, "attr")}
     assert "indexOf" in called and "setCurrentIndex" in called
+
+
+def _titles_by_object_name():
+    return {p.get("name"): p.find("attribute[@name='title']/string").text
+            for p in _tab_pages()}
+
+
+@pytest.mark.parametrize("helper,title", [
+    ("_go_to_detection", "Detection"),
+    ("_go_to_log", "Log"),
+    ("_go_to_setup", "Setup"),
+])
+def test_each_navigation_helper_opens_the_tab_it_is_named_after(helper, title):
+    """Reordering tabs cannot be caught by "does it switch?" — only by
+    "does it switch to the RIGHT one?". Each helper is read for the
+    object name it hands to _show_tab, and that name is looked up in the
+    .ui to confirm the page really carries the matching title."""
+    node = _function_node(helper)
+    targets = [arg.value
+               for call in ast.walk(node) if isinstance(call, ast.Call)
+               for arg in call.args
+               if isinstance(arg, ast.Constant) and isinstance(arg.value, str)]
+    assert len(targets) == 1, (
+        f"{helper} must name exactly one page widget, found {targets}")
+    titles = _titles_by_object_name()
+    assert targets[0] in titles, f"{helper} targets a page not in the .ui"
+    assert titles[targets[0]] == title, (
+        f"{helper} opens the tab titled {titles[targets[0]]!r}, "
+        f"not {title!r} — the tab order moved underneath it")
 
 
 # --- the widget tree --------------------------------------------------------

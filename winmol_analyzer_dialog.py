@@ -316,10 +316,12 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
     def _show_tab(self, page):
         """Select a tab BY WIDGET, never by index.
 
-        The Setup page sits at index 1, between Detection and Log; the
-        three former ``setCurrentIndex(1)`` literals meant "the Log tab"
-        and would now silently open Setup. An AST test bans integer
-        literals here so the mapping cannot rot again.
+        Tab positions have already moved twice — Setup was inserted at
+        index 1, then pulled to the front, so the order is now Setup,
+        Detection, Log. The three former ``setCurrentIndex(1)`` literals
+        meant "the Log tab" and would silently open Detection today. An
+        AST test bans integer literals here so the mapping cannot rot
+        again, and test_setup_tab_ui pins the order itself.
         """
         if page is None:
             return
