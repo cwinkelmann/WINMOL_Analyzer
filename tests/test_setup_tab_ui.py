@@ -726,3 +726,163 @@ def test_no_modal_is_popped_at_construction():
                for c in deferred for a in c.args} - {None}
     assert targets == {"_enter_first_run"}
     assert "choose_environment" not in targets
+
+
+# --- window size + scrolling (BUGS.md "The GUI window is too high") ---------
+#
+# The report: "Currently I can[not] press run because it is just outside my
+# screen." The dialog declared a fixed 640x750 with no QScrollArea anywhere,
+# so on a 768/800 px laptop panel the bottom of the window — Run included —
+# sat below the desktop and the plugin could not be used at all. Three
+# things keep that from coming back: a default height a laptop can show, a
+# scroll area around each form page, and a hard rule about which controls
+# may never end up inside one.
+
+# A 800 px panel minus the macOS menu bar and dock (~100 px) minus the
+# window frame. The whole window has to live inside this.
+LAPTOP_SAFE_HEIGHT = 700
+
+
+def _form():
+    """The top-level <widget> of the form — the dialog itself."""
+    return _root().find("widget")
+
+
+def _declared_size(root, prop):
+    node = root.find("property[@name='%s']" % prop)
+    if node is None:
+        return None
+    size = node.find("rect")
+    if size is None:
+        size = node.find("size")
+    if size is None:
+        return None
+    return (int(size.find("width").text), int(size.find("height").text))
+
+
+def test_the_dialog_opens_short_enough_for_a_laptop():
+    width, height = _declared_size(_form(), "geometry")
+    assert height <= LAPTOP_SAFE_HEIGHT, (
+        f"the dialog declares {width}x{height}; anything taller than "
+        f"{LAPTOP_SAFE_HEIGHT} px puts the button row off a laptop screen")
+
+
+def test_the_dialog_may_be_shrunk_further():
+    """A minimum taller than the default would make the default a floor
+    and hand the bug straight back."""
+    minimum = _declared_size(_form(), "minimumSize")
+    assert minimum is not None, (
+        "no minimumSize: the dialog's minimum is then whatever its "
+        "content demands, which is exactly what nobody can control")
+    _, default_height = _declared_size(_form(), "geometry")
+    assert minimum[1] < default_height
+    assert minimum[1] <= 400 and minimum[0] <= 560, (
+        f"minimumSize {minimum} is too large to survive a short screen")
+
+
+def test_the_dialog_declares_no_maximum_size():
+    """It still has to be usable on a big monitor."""
+    assert _form().find("property[@name='maximumSize']") is None
+
+
+def _scroll_areas(element):
+    return [w for w in element.iter("widget")
+            if w.get("class") == "QScrollArea"]
+
+
+@pytest.mark.parametrize("page_name", ["tab_setup", "tab"])
+def test_each_form_page_scrolls(page_name):
+    """The form pages are the tall ones. Their content goes in a scroll
+    area so a short window clips nothing."""
+    page = [p for p in _tab_pages() if p.get("name") == page_name][0]
+    areas = _scroll_areas(page)
+    assert len(areas) == 1, (
+        f"{page_name} must hold exactly one QScrollArea, found "
+        f"{[a.get('name') for a in areas]}")
+    area = areas[0]
+    resizable = area.find("property[@name='widgetResizable']/bool")
+    assert resizable is not None and resizable.text == "true", (
+        "without widgetResizable the content keeps its size hint and the "
+        "scroll area is decoration")
+    # and it really WRAPS the page: the page's own controls are inside it
+    inner = _subtree_names(area)
+    outer = _subtree_names(page) - inner - {area.get("name")}
+    assert not [n for n in outer
+                if n.endswith(("_button", "_comboBox", "_lineEdit",
+                               "_checkBox", "_spinBox"))], (
+        f"{page_name} has controls outside its scroll area: "
+        f"{sorted(outer)}")
+
+
+def test_the_log_page_scrolls_on_its_own():
+    """A QPlainTextEdit already scrolls; nesting it in a scroll area
+    would give it two scrollbars and an unbounded height."""
+    page = [p for p in _tab_pages() if p.get("name") == "tab_2"][0]
+    classes = {w.get("class") for w in page.iter("widget")}
+    assert "QScrollArea" not in classes
+    assert "QPlainTextEdit" in classes
+
+
+# The controls the report is actually about. If any of these can scroll,
+# the user can once again fail to reach Run.
+NEVER_SCROLLABLE = ("run_button", "cancel_button", "close_button",
+                    "help_button", "export_button", "progress_bar")
+
+
+@pytest.mark.parametrize("name", NEVER_SCROLLABLE)
+def test_the_always_reachable_controls_never_scroll(name):
+    """An ancestry walk over the parsed tree, not a grep: the whole
+    failure mode is a widget being *nested* somewhere it scrolls away."""
+    root = _root()
+    parents = {child: parent for parent in root.iter() for child in parent}
+    matches = _named(root)[name]
+    assert len(matches) == 1, f"{name} is declared {len(matches)} times"
+    node, chain = parents.get(matches[0]), []
+    while node is not None:
+        chain.append((node.get("class"), node.get("name")))
+        node = parents.get(node)
+    scrolled = [c for c in chain if c[0] == "QScrollArea"]
+    assert not scrolled, (
+        f"{name} sits inside {scrolled}; it must stay pinned outside "
+        "every scroll area so it is reachable at any window height")
+    assert ("QTabWidget", "log_widget") not in chain, (
+        f"{name} is trapped inside the tabs")
+
+
+def test_the_dialog_clamps_itself_to_the_screen_at_construction():
+    """The declared default is still too tall for a netbook. The runtime
+    clamp is the backstop — and it must be guarded, because the test
+    suite and any headless QGIS have no QScreen at all."""
+    init = _function_node("__init__")
+    called = {getattr(c.func, "attr", None) for c in ast.walk(init)
+              if isinstance(c, ast.Call)}
+    assert "_fit_to_available_screen" in called
+
+    fit = _function_node("_fit_to_available_screen")
+    names = {getattr(c.func, "attr", None) for c in ast.walk(fit)
+             if isinstance(c, ast.Call)}
+    assert "availableGeometry" in names, "it must consult the real screen"
+    assert "resize" in names
+    assert any(isinstance(n, ast.Try) for n in ast.walk(fit)), (
+        "an absent QScreen must not break the constructor")
+
+
+def test_only_the_constructor_resizes_the_dialog():
+    """A resize from a slot would undo whatever the user dragged the
+    window to."""
+    offenders = []
+    for func in ast.walk(_module()):
+        if not isinstance(func, ast.FunctionDef):
+            continue
+        if func.name == "_fit_to_available_screen":
+            continue
+        for call in ast.walk(func):
+            if not isinstance(call, ast.Call):
+                continue
+            if getattr(call.func, "attr", None) != "resize":
+                continue
+            if getattr(getattr(call.func, "value", None), "id", None) == \
+                    "self":
+                offenders.append((func.name, call.lineno))
+    assert not offenders, (
+        f"the dialog resizes itself outside construction: {offenders}")
