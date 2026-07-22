@@ -311,9 +311,22 @@ class ImageProcessing:
                     work_dir, f"{job.tile_id}_roi_stem_map.tif")
                 IO.write_tile_raster(pred_tile, tile_profile, tile_path)
                 tile_paths.append(tile_path)
+            vector_tile_px = int(plan.tile_inner_px) + 2 * int(halo_px)
             print(
                 f"Prepared {len(tile_paths)}/{len(jobs)} vector tiles "
                 f"with foreground | skipped_empty {skipped_tiles}"
+            )
+            # A vector tile is a completely different unit from a
+            # prediction tile — inner 4096 px plus halo against ~727 px —
+            # and the log used to call both of them "tile". Standalone,
+            # unparsed line: run_progress.py keys off the "Prepared n/m"
+            # line above, which is untouched.
+            print(
+                f"VECTOR PHASE | {len(tile_paths)} vector tiles | "
+                f"~{vector_tile_px}x{vector_tile_px} px each (inner "
+                f"{int(plan.tile_inner_px)} + halo {int(halo_px)} per "
+                f"side, clipped at the raster edge)",
+                flush=True,
             )
             if not tile_paths:
                 print("No foreground tiles found for the vector stage.")
@@ -326,6 +339,7 @@ class ImageProcessing:
                 self.process_type,
                 work_dir,
                 plan.cpu_workers,
+                tile_px=vector_tile_px,
             )
             merged = self.run_merge_phase(plan, work_dir)
             if plan.keep_temp:

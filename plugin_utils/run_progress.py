@@ -58,6 +58,14 @@ CI instead of silently freezing the bar:
 * ``winmol_run.py``                ``Prepared {n}/{m} vector tiles ...``
 * ``utils/IO.py``                  ``MERGE TILE READ | tile {id} | ...``
 
+Everything up to and including the first ``|`` is the contract; the payload
+after it is free. The unit labels the producers now append ("prediction
+tile", "vector tile ~4144x4144 px") and the standalone ``PREDICTION PHASE``
+/ ``VECTOR PHASE`` headers live entirely in that free part, and
+``tests/test_run_progress.py`` reconstructs each producer's line from its
+own f-string and feeds it through :class:`RunProgress` — a source-substring
+pin alone would not catch text inserted *inside* the counter.
+
 Pure stdlib, no Qt and no QGIS imports, so it is unit-testable off QGIS.
 """
 

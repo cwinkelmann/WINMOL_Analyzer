@@ -5,6 +5,8 @@ Regression: the bar read ~78 % before the first inference because
 ``winmol_run.py`` prints ~91 setup lines before "Loading Model...".
 """
 
+import ast
+import itertools
 import os
 import re
 import sys
@@ -206,3 +208,127 @@ def test_worker_no_longer_counts_lines():
         source = fh.read()
     assert "get_total_lines" not in source
     assert re.search(r"RunProgress\(", source)
+
+
+# --- the lines the producers ACTUALLY emit, end to end ---------------------
+#
+# The source-substring pins above catch a renamed prefix, but they would
+# happily pass an edit that keeps the substring and still moves the counter
+# (e.g. text inserted between {total} and the '|'). These tests rebuild the
+# line each producer really prints, straight from its f-string, and run it
+# through the parser — which is the only thing that proves the bar still
+# advances.
+
+def _render_joined(node, values):
+    """Render an ast.JoinedStr with placeholders for its {expressions}."""
+    out = []
+    for part in node.values:
+        if isinstance(part, ast.Constant):
+            out.append(str(part.value))
+        else:
+            out.append(next(values))
+    return "".join(out)
+
+
+def _emitted_line(relpath, head, done="156", total="182"):
+    """The line ``relpath`` prints, with ``done``/``total`` substituted
+    for its first two {expressions} and 9 for the rest."""
+    with open(os.path.join(REPO, relpath), encoding="utf-8") as handle:
+        tree = ast.parse(handle.read())
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.JoinedStr):
+            continue
+        line = _render_joined(
+            node, itertools.chain([done, total], itertools.repeat("9")))
+        if line.startswith(head):
+            return line
+    pytest.fail(f"{relpath} no longer emits a line starting {head!r}")
+
+
+PRODUCER_LINES = [
+    ("utils/Prediction.py", "Written tile "),
+    ("utils/PredictWorkers.py", "Multi-GPU prediction "),
+    ("utils/VectorTilePipeline.py", "Vector tiles "),
+    ("winmol_run.py", "Prepared "),
+    ("utils/IO.py", "MERGE TILE READ | tile "),
+]
+
+
+@pytest.mark.parametrize("relpath,head", PRODUCER_LINES)
+def test_the_line_the_producer_emits_is_still_recognised(relpath, head):
+    line = _emitted_line(relpath, head)
+    progress = RunProgress("Trees")
+    progress.feed(line)
+    if head == "Prepared ":
+        # Prepared only sets the merge denominator; it moves nothing.
+        assert progress._merge_total == 156
+        return
+    assert progress.matched, (
+        f"{relpath} emits {line!r}, which plugin_utils/run_progress.py no "
+        "longer parses — the progress bar would silently freeze")
+
+
+def test_the_new_unit_labels_do_not_move_the_counters():
+    """Prediction tiles and vector tiles now say which they are. The
+    counter still has to sit in exactly the same place."""
+    progress = RunProgress("Trees")
+    progress.feed(
+        "Written tile 50/100 | prediction tile | 50.0% | 12.0 tiles/min | "
+        "ETA 1m | src 727x727 -> out 504x504")
+    assert progress.percent == pytest.approx(
+        SETUP_END + (BANDS["Trees"][0] - SETUP_END) // 2, abs=1)
+
+    progress.feed(
+        "Written tile 100/100 | prediction tile | 100.0% | 12 tiles/min")
+    assert progress.percent == BANDS["Trees"][0]
+
+    progress.feed("Prepared 2/9 vector tiles with foreground | skipped 7")
+    progress.feed(
+        "Vector tiles 1/2 | vector tile ~4144x4144 px | 50.0% | 0.1 "
+        "tiles/min | ETA 1m | wrote 1 | empty 0 | no_output 0 | avg total "
+        "12.707s quant 1.008s connect 2.854s")
+    assert BANDS["Trees"][0] < progress.percent < BANDS["Trees"][1]
+    progress.feed(
+        "Vector tiles 2/2 | vector tile ~4144x4144 px | 100.0% | 0.1 "
+        "tiles/min | ETA 0s | wrote 2 | empty 0 | no_output 0 | avg total "
+        "12.707s quant 1.008s connect 2.854s")
+    assert progress.percent == BANDS["Trees"][1]
+
+    for i in range(2):
+        progress.feed(f"MERGE TILE READ | tile {i} | vector tile")
+    assert progress.percent == BANDS["Trees"][2] == 99
+
+
+def test_the_empty_vector_stage_line_still_parses_with_its_unit():
+    progress = RunProgress("Trees")
+    progress.feed("Vector tiles 0/0 | vector tile | no foreground tiles "
+                  "queued")
+    assert progress.percent == BANDS["Trees"][0]
+
+
+def test_the_vector_stage_names_its_tile_size():
+    """VectorTilePipeline gets the size handed down from winmol_run.py
+    (it must not reopen a raster just to log), and renders it into every
+    'Vector tiles' line and its own phase header."""
+    size = _emitted_line("utils/VectorTilePipeline.py", "vector tile ~")
+    assert size == "vector tile ~156x182 px"
+    header = _emitted_line("utils/VectorTilePipeline.py", "VECTOR PHASE")
+    assert "vector tiles" in header
+
+
+@pytest.mark.parametrize("relpath,head,unit", [
+    ("utils/Prediction.py", "PREDICTION PHASE", "prediction tiles"),
+    ("winmol_run.py", "VECTOR PHASE", "vector tiles"),
+])
+def test_each_phase_announces_its_unit_and_tile_size(relpath, head, unit):
+    """The user's complaint: '182 tiles' and '3 tiles' were the same
+    word for a 727 px inference tile and a ~4144 px vector tile. Each
+    phase now opens by saying which unit it is counting and how big it
+    is. These headers are new and standalone — the parser ignores them,
+    so they cannot freeze the bar."""
+    line = _emitted_line(relpath, head)
+    assert unit in line
+    assert "px" in line
+    progress = RunProgress("Trees")
+    assert progress.feed(line) is None
+    assert not progress.matched
