@@ -26,7 +26,7 @@ get a loud `WARNING:` naming the demoted provider and why.
 
 **A CPU environment can never use CUDA.** `requirements/cpu.txt` installs
 `onnxruntime` — the CPU-only wheel. `onnxruntime-gpu` (which
-`requirements/gpu.txt` installs, via `requirements/cuda.txt`) is a **different
+`requirements/gpu.txt` installs) is a **different
 package**; CUDA support is not a flag you turn on, it is a different
 distribution, and the two can never be installed side by side. This is why an
 RTX 4080 can sit at 0 % utilisation while a run crawls — and why an environment
@@ -51,8 +51,8 @@ under your QGIS profile directory). Then **swap** the wheel — never install bo
 # 1. remove the CPU-only wheel (both packages provide the `onnxruntime` module)
 <venv>/bin/pip uninstall -y onnxruntime
 
-# 2. install the CUDA build
-<venv>/bin/pip install -r requirements/cuda.txt
+# 2. install the CUDA build (pip finds core.txt already satisfied)
+<venv>/bin/pip install -r requirements/gpu.txt
 
 # 3. VERIFY — installing is not the same as working
 <venv>/bin/python -c "import onnxruntime as ort; print(ort.get_available_providers())"
@@ -74,10 +74,11 @@ analyzer and confirm the banner says:
 The `[cuda,cudnn]` extras ship the CUDA userspace as wheels, so you do **not**
 need a system CUDA toolkit — only a recent enough NVIDIA driver. But
 `onnxruntime-gpu` 1.27 moved those extras to **CUDA 13**, while earlier releases
-use CUDA 12. `requirements/cuda.txt` therefore pins the window
+use CUDA 12. `requirements/gpu.txt` therefore pins the window
 `>=1.26,<1.27`, and it is the only file in the repo that names
-`onnxruntime-gpu`, so that is the one line to edit. If your driver predates even
-that, pin an older cu12-era release there:
+`onnxruntime-gpu` (`tests/test_requirements_layout.py` asserts that), so that is
+the one line to edit. If your driver predates even that, pin an older cu12-era
+release there:
 
 ```
 onnxruntime-gpu[cuda,cudnn]==1.22.0
@@ -106,8 +107,10 @@ Reason: CUDAExecutionProvider is offered by this build but did not initialise,
 so it is not in the active provider list; inference runs on the CPU
 ```
 
-Containers are unaffected: `docker/gpu/` builds from `requirements/gpu.txt`,
-which pulls the same `requirements/cuda.txt`. See `docs/CONTAINERS.md`.
+Containers are unaffected: `docker/gpu/` builds from the very same
+`requirements/gpu.txt` the plugin installs, so the container and the plugin
+cannot drift apart on the GPU path. See `docs/CONTAINERS.md` and
+[requirements/README.md](../requirements/README.md#the-four-environments).
 
 ### …and its usual cause: the CUDA libraries are not on the loader path
 

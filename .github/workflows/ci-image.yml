@@ -11,6 +11,7 @@ on:
     paths:
       - "docker/ci/**"
       - "requirements/core.txt"
+      - "requirements/cpu.txt"
       - "requirements/ci.txt"
       - "requirements/convert.txt"
       - "scripts/convert_models_to_onnx.py"

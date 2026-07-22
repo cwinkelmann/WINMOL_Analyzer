@@ -12,21 +12,25 @@ One file, once. Pick your row and skip the rest.
 | ------------------------------------------------ | -------------------------------------------------- |
 | run the analyzer (CLI or QGIS plugin, any OS)     | `pip install -r requirements/cpu.txt`               |
 | …and I have an NVIDIA GPU (Linux/Windows x86_64)  | `pip install -r requirements/gpu.txt`               |
-| …add CUDA to an environment I already have        | `pip install -r requirements/cuda.txt` (see [GPU.md](GPU.md) — uninstall `onnxruntime` first) |
+| …add CUDA to an environment I already have        | `pip install -r requirements/gpu.txt` (see [GPU.md](GPU.md) — uninstall `onnxruntime` first) |
 | run the standalone Jupyter notebooks              | `pip install -r requirements/notebook.txt`          |
 | reproduce the CI test environment exactly         | `pip install -r requirements/ci.txt`                |
 | convert an `.hdf5` model to ONNX (dev only)       | `pip install -r requirements/convert.txt`           |
 | lint and run the test suite locally               | `pip install -r requirements/cpu.txt -r requirements/dev.txt` |
 
-Two rules behind the table. **Exactly one inference runtime:** `onnxruntime`
+Three rules behind the table. **Exactly one inference runtime:** `onnxruntime`
 (CPU) and `onnxruntime-gpu` (CUDA) provide the same Python module and must never
-be co-installed, so `cpu.txt` and `gpu.txt`/`cuda.txt` are a swap, never an
-addition. **No TensorFlow** anywhere except `convert.txt`. `core.txt` is a
-shared fragment the other files pull in with `-r`; it installs no runtime, so
-installing it alone gives you an environment that cannot run a model.
+be co-installed, so `cpu.txt` and `gpu.txt` are a swap, never an
+addition. **No TensorFlow** anywhere except `convert.txt`. **CI installs what
+ships:** `ci.txt` is `-r cpu.txt` plus `pytest`, so the test suite runs in the
+environment you get. `core.txt` is a shared fragment the other files pull in
+with `-r`; it installs no runtime, so installing it alone gives you an
+environment that cannot run a model.
 
-Details, and the layout diagram, in
-[requirements/README.md](../requirements/README.md).
+Details, the layout diagram, and how the CLI, plugin, Docker and CI
+environments relate to each other, in
+[requirements/README.md](../requirements/README.md) — see
+[The four environments](../requirements/README.md#the-four-environments).
 
 ## Standalone / CLI
 

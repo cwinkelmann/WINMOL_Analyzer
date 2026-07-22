@@ -90,8 +90,10 @@ def repo_requirements_dir() -> Path:
 
 #: The two installable compute environments, by the file that defines them.
 #: See requirements/README.md: cpu.txt is core.txt + onnxruntime, gpu.txt is
-#: core.txt + cuda.txt (onnxruntime-gpu). Named here once so a rename has one
-#: place to happen; tests/test_requirements_layout.py asserts both exist.
+#: core.txt + onnxruntime-gpu. Named here once so a rename has one place to
+#: happen; tests/test_requirements_layout.py asserts both exist. These are the
+#: same two files the CI and CUDA images build from, which is what makes a CI
+#: run evidence about the environment this installer creates.
 CPU_REQUIREMENTS = "cpu.txt"
 GPU_REQUIREMENTS = "gpu.txt"
 

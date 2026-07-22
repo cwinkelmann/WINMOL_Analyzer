@@ -11,7 +11,7 @@ a build:
      than for the two the plugin happens to install.
   2. The CUDA version window (``>=1.26,<1.27``) was duplicated across three
      files and had already drifted — the container's copy had lost the
-     ceiling. It now lives in cuda.txt alone, and that is asserted.
+     ceiling. It now lives in gpu.txt alone, and that is asserted.
   3. A partial rename of cpu.txt / gpu.txt does not raise: the installer
      falls back to the CPU file, so a GPU machine silently gets a CPU
      environment. Existence is asserted here so CI catches it instead.
@@ -75,7 +75,6 @@ def test_the_installable_files_each_declare_exactly_one_runtime():
     assert "onnxruntime" in _closure("cpu.txt")
     assert "onnxruntime-gpu" in _closure("gpu.txt")
     assert "onnxruntime" in _closure("ci.txt")
-    assert "onnxruntime-gpu" in _closure("cuda.txt")
 
 
 def test_the_notebook_extras_stay_out_of_the_compute_environments():
@@ -99,18 +98,22 @@ def _payload(name):
             if ln.strip() and not ln.lstrip().startswith("#")]
 
 
-def test_only_cuda_txt_REQUIRES_the_gpu_runtime():
+def test_only_gpu_txt_REQUIRES_the_gpu_runtime():
     """Anti-drift guard. gpu.txt and plugin-gpu.txt used to duplicate this
     line and had already diverged: one carried the <1.27 ceiling and the
     other did not, so the container was one NVIDIA release away from
     silently switching to CUDA 13.
+
+    Those two files are now one, which is why the line no longer needs a
+    cuda.txt of its own to single-source it — but "exactly one owner" is
+    still the property that matters, so it is still asserted here.
 
     Comments elsewhere are free to explain the rule — it is the REQUIREMENT
     that must exist in exactly one place.
     """
     owners = [n for n in REQ_FILES
               if any("onnxruntime-gpu" in ln for ln in _payload(n))]
-    assert owners == ["cuda.txt"], owners
+    assert owners == ["gpu.txt"], owners
 
 
 def test_the_cuda_version_window_is_pinned_at_both_ends():
@@ -122,20 +125,22 @@ def test_the_cuda_version_window_is_pinned_at_both_ends():
     extras, install zero nvidia wheels and exit 0, leaving a build that
     claims success and then runs on the CPU.
     """
-    assert _payload("cuda.txt") == [CUDA_REQUIREMENT], _payload("cuda.txt")
+    assert CUDA_REQUIREMENT in _payload("gpu.txt"), _payload("gpu.txt")
 
 
-def test_the_cuda_pin_reaches_the_gpu_environment():
-    """gpu.txt must get the window by INCLUDING cuda.txt, not by copying
-    it — that copy is what drifted last time."""
+def test_the_gpu_file_declares_the_window_itself():
+    """No `-r cuda.txt` hop any more. Every `-r` names a file that must be
+    present in the shipped plugin ZIP when pip runs on a user's machine, so
+    an include that buys nothing is a failure mode that buys nothing."""
     body = (REQ_DIR / "gpu.txt").read_text()
-    assert re.search(r"^-r\s+cuda\.txt\s*$", body, re.M), body
+    assert not re.search(r"^-r\s+cuda\.txt\s*$", body, re.M), body
+    assert not (REQ_DIR / "cuda.txt").exists()
 
 
 # --- rule 3: a rename must fail loudly -------------------------------------
 
 @pytest.mark.parametrize("name", ["core.txt", "cpu.txt", "gpu.txt",
-                                  "cuda.txt", "ci.txt", "notebook.txt",
+                                  "ci.txt", "notebook.txt",
                                   "convert.txt", "dev.txt"])
 def test_every_expected_file_exists(name):
     """plugin_requirements_path() falls back to the CPU file when the GPU

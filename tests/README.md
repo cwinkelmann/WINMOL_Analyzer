@@ -20,8 +20,11 @@ pytest -m "not slow"      # fast loop: stage tests only, no TF (<30 s)
 ```
 
 The tools come from `requirements/dev.txt` (flake8 + pytest), installed on top
-of a normal `requirements/cpu.txt` environment. `requirements/ci.txt` is the
-exactly-pinned alternative — see `requirements/README.md`.
+of a normal `requirements/cpu.txt` environment. `requirements/ci.txt` is what
+the CI image installs, and it is `-r cpu.txt` plus `pytest` — deliberately the
+same environment, so a green CI run is evidence about a real user's machine.
+`tests/test_ci_parity.py` fails the build if the two ever come apart. See
+[requirements/README.md](../requirements/README.md#the-four-environments).
 
 `tests/test_standalone_pipeline.py` is the one module that imports TensorFlow at
 module scope; CI runs with `--ignore` for it. To run it locally install

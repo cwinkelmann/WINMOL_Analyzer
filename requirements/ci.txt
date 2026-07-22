@@ -1,31 +1,48 @@
-# THE CI TEST ENVIRONMENT — exact pins matching tests/fixtures/manifest.json.
+# THE CI TEST ENVIRONMENT — the shipped environment, plus a test runner.
 #
-# WHO: docker/ci/Dockerfile, and anyone reproducing a CI failure byte for byte.
-# WHEN: only for that. To simply run the analyzer, install cpu.txt instead —
-#      this file pins an older onnxruntime and omits psutil on purpose.
+# WHO: docker/ci/Dockerfile, and anyone reproducing a CI failure locally.
+# WHEN: only for that. To run the analyzer, install cpu.txt — this file adds
+#       pytest and nothing else, so the two are the same environment.
 #
-# The golden fixtures are only bit-reproducible under these versions
-# (skeletonize/GEOS/scipy implementations).
+# THIS FILE MUST STAY `-r cpu.txt` PLUS TEST-ONLY TOOLS.
 #
-# fiona 1.10 breaks geopandas-0.14's fiona READ path (docs/CODE_REVIEW_2.md
-# A-8) but ships wheels for both x86_64 and aarch64; the test suite reads
-# GeoPackages exclusively via pyogrio and only WRITES through fiona, which
-# works — matches the local dev environment (fiona 1.10.1).
--r core.txt
-numpy==1.26.4
-pandas==2.2.3
-fiona==1.10.1
-pyproj==3.6.1
-# ONNX runtime is the only inference dependency (no TensorFlow). Pinned so the
-# golden stem map stays reproducible; onnxruntime ships wheels for x86_64
-# (CI runners) and aarch64 (local Apple-Silicon docker validation).
-onnxruntime==1.19.2
-pytest==8.*
+# It used to be `-r core.txt` with its own pins, and the divergence was real
+# and measured: CI installed onnxruntime 1.19.2 while the plugin's venv
+# resolved 1.27.0 on the same day, and CI had no psutil at all. psutil is what
+# HardwareInfo uses to report RAM and what utils/Prediction.py uses for the
+# autotune memory ceiling, so that safety code was reachable in CI only
+# through test stubs — the most plausible reason a green suite kept missing
+# accelerator bugs that turned up by hand (CoreML fp16 collapse, CUDA
+# preload_dlls, provider fallback).
+#
+# The two arguments for the old split were checked and neither holds:
+#
+#   1. "psutil changes the fixtures." It cannot. Fixtures are generated with
+#      DETERMINISM_OVERRIDES (tests/generate_fixtures.py), which sets
+#      prediction_batch_autotune=False and prediction_batch_size=1, and the
+#      committed config_snapshot.json replays that for every golden test.
+#      Autotune never runs, so the psutil branch is never taken.
+#
+#   2. "onnxruntime must be 1.19.2 for the golden stem map." The stem-map
+#      comparison is agreement-based ON PURPOSE — tests/test_inference.py
+#      requires >= 0.999 pixel agreement and tolerates a 0.5% foreground
+#      drift precisely because isolated boundary pixels flip across
+#      onnxruntime builds. Every EXACT stage assertion starts from the
+#      committed stem_map.tif, not from a fresh prediction, so the runtime
+#      version cannot reach it. onnxruntime is not in manifest.json's version
+#      list either.
+#
+# The pins that DO determine the fixtures (numpy, shapely, rasterio,
+# scikit-image, scipy — manifest.json's own list) now live in core.txt, so
+# users receive them too. One place, one set of versions.
+#
+# If a future onnxruntime ever does move the stem map past the agreement
+# threshold, the fix is to regenerate the fixtures or tighten the pin in
+# cpu.txt — where users would get it too. Re-pinning CI alone just restores
+# the blind spot this file was rewritten to close.
+-r cpu.txt
 
-# INVARIANT, DO NOT "SIMPLIFY" THIS TO `-r cpu.txt`.
-# Two things would break. (1) cpu.txt pins onnxruntime>=1.17, which resolves
-# well past the 1.19.2 the golden stem map was generated with. (2) cpu.txt
-# carries psutil, and utils/Prediction.py takes a DIFFERENT autotune path when
-# psutil is importable (measured free RAM instead of AUTOTUNE_BLIND_HEADROOM) —
-# the fixtures were generated on the blind-headroom path, so adding psutil here
-# changes what CI measures. Hanging off core.txt is what keeps both true.
+# Test-only, and the ONLY thing this file may add. tests/test_ci_parity.py
+# fails the build if anything else appears here, or if cpu.txt and ci.txt ever
+# declare a different version of the same package.
+pytest==8.*

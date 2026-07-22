@@ -11,7 +11,7 @@
 #     python -m ipykernel install --user --name=WINMOL_Analyzer
 #
 # This is cpu.txt plus the plotting extras, so it inherits the CPU inference
-# runtime and must not be combined with gpu.txt / cuda.txt.
+# runtime and must not be combined with gpu.txt.
 -r cpu.txt
 ipykernel==6.27.1
 matplotlib
