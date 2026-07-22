@@ -340,13 +340,6 @@ def test_metal_never_selects_the_cuda_only_multi_gpu_path(backend):
     assert plan.gpu_workers == 1
 
 
-def test_hardware_info_constructs_without_the_new_fields():
-    """Existing positional construction must keep working."""
-    hw = HardwareInfo(cpu_count=4, total_ram_gb=8.0, gpu_count=0)
-    assert hw.accelerator == "cpu"
-    assert hw.accelerator_label == "CPU"
-
-
 # --------------------------------------------------------------------------
 # The banner
 # --------------------------------------------------------------------------

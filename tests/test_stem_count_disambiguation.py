@@ -15,16 +15,13 @@ The contract:
 * the merged total is labelled as the final result and stays parseable by
   ``benchmark/benchmark_fixes.py``.
 """
-import re
+import os
 
 import pytest
 
 from classes.Config import Config
 from utils import Log
 import utils.Vectorization as Vec
-
-# The regex benchmark/benchmark_fixes.py uses to read the run's answer.
-TOTAL_STEMS_RE = re.compile(r"Total stems written:\s+(\d+)")
 
 
 @pytest.fixture(autouse=True)
@@ -95,12 +92,34 @@ def test_merge_summary_labels_the_final_total(capsys):
         summary.count("Total stems written")
 
 
-def test_total_stems_written_format_matches_benchmark_regex():
-    """benchmark_fixes.py greps this exact shape -- keep it parseable."""
-    rendered = f"Total stems written:   {215}"
-    match = TOTAL_STEMS_RE.search(rendered)
-    assert match is not None
-    assert match.group(1) == "215"
+def test_the_benchmark_harness_can_read_the_real_merge_summary(
+        capsys, tmp_path):
+    """The two-sided contract, executed end to end.
+
+    ``benchmark/benchmark_fixes.py`` greps the run's stem count out of
+    stdout, so the producer (utils.IO) and the consumer (the harness's
+    own ``_parse_run``) have to agree on one line format. Both halves
+    are the real thing here: IO prints the merge summary, and the
+    harness's parser -- imported, not restated -- reads it back.
+    """
+    import importlib.util
+    import utils.IO as IO
+
+    spec = importlib.util.spec_from_file_location(
+        "benchmark_fixes",
+        os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "benchmark", "benchmark_fixes.py"))
+    harness = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(harness)
+
+    IO.merge_selected_tile_results(
+        [], str(tmp_path / "out.gpkg"), raster_profile=None)
+    stdout = capsys.readouterr().out
+
+    assert "Total stems written" in stdout, "the producer changed its line"
+    assert harness._parse_run(stdout)["stems_written"] == 0, (
+        "benchmark_fixes.py can no longer read the merge summary; the "
+        "'Total stems written:' line format and its regex have diverged")
 
 
 def _merge_summary_source(module):

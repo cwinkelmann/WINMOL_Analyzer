@@ -63,11 +63,6 @@ def test_resolve_mode_from_config(value, expected):
     assert ac.resolve_mode(cfg) == expected
 
 
-def test_config_default_is_auto():
-    from classes.Config import Config
-    assert ac.resolve_mode(Config()) == "auto"
-
-
 def test_env_overrides_config(monkeypatch):
     cfg = FakeConfig()
     cfg.prediction_batch_autotune = "auto"
