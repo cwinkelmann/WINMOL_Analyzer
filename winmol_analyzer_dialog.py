@@ -219,8 +219,8 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         plugin_dir = os.path.dirname(os.path.abspath(__file__))
         self.models_dir = os.path.join(plugin_dir, "models")
         self.populate_model_combo_box()
-        # Controls that aren't in the .ui: the variant selector, the Export
-        # button and a QGIS layer selector for the input raster.
+        # Controls that aren't in the .ui: the variant selector and a
+        # QGIS layer selector for the input raster.
         self._add_custom_controls()
         self._setup_live = True
         self._refresh_setup_state()
@@ -268,6 +268,9 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             _handler(Qt.Checked if _cb.isChecked() else Qt.Unchecked)
         self.close_button.clicked.connect(self.close_application)
         self.cancel_button.clicked.connect(self.cancel_process)
+        # Export lives in the bottom button row (declared in the .ui) and
+        # stays dead until a run has actually written something.
+        self.export_button.clicked.connect(self.export_results)
         self._connect_setup_tab()
 
     #: (widget name, signal name, slot name) for every Setup-tab control.
@@ -316,10 +319,12 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
     def _show_tab(self, page):
         """Select a tab BY WIDGET, never by index.
 
-        The Setup page sits at index 1, between Detection and Log; the
-        three former ``setCurrentIndex(1)`` literals meant "the Log tab"
-        and would now silently open Setup. An AST test bans integer
-        literals here so the mapping cannot rot again.
+        Tab positions have already moved twice — Setup was inserted at
+        index 1, then pulled to the front, so the order is now Setup,
+        Detection, Log. The three former ``setCurrentIndex(1)`` literals
+        meant "the Log tab" and would silently open Detection today. An
+        AST test bans integer literals here so the mapping cannot rot
+        again, and test_setup_tab_ui pins the order itself.
         """
         if page is None:
             return
@@ -1401,34 +1406,17 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
     # --- compute-environment selection --------------------------------------
 
     def _add_custom_controls(self):
-        """Add controls not present in the .ui: the Export button, the
-        model variant selector, and a QGIS layer selector for the input
-        raster. Defensive — if a widget can't be placed (e.g. an older or
-        newer QGIS gui API), everything else still works.
+        """Add controls not present in the .ui: the model variant selector
+        and a QGIS layer selector for the input raster. Defensive — if a
+        widget can't be placed (e.g. an older or newer QGIS gui API),
+        everything else still works.
 
         Environment setup, deletion and model downloads used to live in a
-        top bar here; they are declared widgets on the Setup tab now, so
-        the only thing left in the bar is Export.
+        top bar here; they are declared widgets on the Setup tab now. The
+        Export button was the last inhabitant of that bar and is a
+        declared widget too — bottom row, next to Close — so the bar is
+        gone entirely and the top of the dialog belongs to Run.
         """
-        try:
-            bar = QtWidgets.QWidget(self)
-            h = QtWidgets.QHBoxLayout(bar)
-            h.setContentsMargins(0, 0, 0, 0)
-            self.export_button = QtWidgets.QPushButton("Export…", bar)
-            self.export_button.setToolTip(
-                "Save the last run's outputs (stem map / stems) to a folder. "
-                "Runs without an output path go to a temp folder until "
-                "exported.")
-            self.export_button.setEnabled(False)
-            self.export_button.clicked.connect(self.export_results)
-            h.addStretch(1)
-            h.addWidget(self.export_button)
-            top = getattr(self, "verticalLayout_7", None) or self.layout()
-            if top is not None:
-                top.insertWidget(0, bar)
-        except Exception as exc:                       # pragma: no cover - GUI
-            print("WINMOL: could not add the Export button:", exc)
-
         # Model variant selector + info line (registry schema v2 only).
         # Auto picks the lossless device variant (int8 on CPU / fp16 on
         # GPU) and otherwise stays on the fp32 reference, so results
