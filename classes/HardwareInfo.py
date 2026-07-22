@@ -24,6 +24,10 @@ class HardwareInfo:
     # name to show the user. Defaulted so existing constructors keep working.
     accelerator: str = "cpu"
     accelerator_label: str = "CPU"
+    # NVIDIA GPUs nvidia-smi found but this onnxruntime build cannot use. Kept
+    # so the run can SAY so: the alternative is the user watching an idle RTX
+    # 4080 while inference crawls on the CPU with no explanation.
+    unusable_gpu_names: List[str] = field(default_factory=list)
 
     @classmethod
     def detect(cls) -> "HardwareInfo":
@@ -45,6 +49,8 @@ class HardwareInfo:
         kind = (None if cls._cuda_hidden_via_env()
                 else cls._detect_accelerator_kind())
 
+        unusable_gpu_names: List[str] = []
+
         if gpu_names:
             # nvidia-smi stays the authority for NVIDIA count and per-GPU
             # memory; onnxruntime only confirms it can use them. A CPU-only
@@ -57,6 +63,7 @@ class HardwareInfo:
             if kind in (None, "cuda"):
                 accelerator = "cuda"
             else:
+                unusable_gpu_names = list(gpu_names)
                 gpu_names, gpu_memory_gb = [], []
                 accelerator = "cpu"
         elif kind == "coreml" and not cls._metal_disabled_via_env():
@@ -83,6 +90,7 @@ class HardwareInfo:
             gpu_memory_gb=gpu_memory_gb,
             accelerator=accelerator,
             accelerator_label=cls._label(accelerator),
+            unusable_gpu_names=unusable_gpu_names,
         )
 
     @staticmethod
