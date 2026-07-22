@@ -80,13 +80,28 @@ def _provider_override_env():
 
 
 def accelerator():
-    """``(kind, label)`` of the device inference will actually use.
+    """``(kind, label)`` of the device inference is EXPECTED to use.
 
-    Derived from :func:`selected_providers`, so every env override is honoured
-    automatically. Note ``ort.get_device()`` is deliberately NOT used: it
-    reports "CPU" on macOS even when CoreML is available and selected.
+    Derived from :func:`selected_providers`, i.e. from what will be REQUESTED —
+    a prediction, not an observation. onnxruntime happily builds a CPU session
+    when a requested provider is unavailable (only a Python UserWarning), so
+    this must never be the last word once a session exists: use
+    :func:`active_accelerator` on ``session.get_providers()`` for that.
+
+    Note ``ort.get_device()`` is deliberately NOT used: it reports "CPU" on
+    macOS even when CoreML is available and selected.
     """
-    providers = selected_providers()
+    return active_accelerator(selected_providers())
+
+
+def active_accelerator(providers):
+    """``(kind, label)`` for a provider list, e.g. ``session.get_providers()``.
+
+    Same mapping as :func:`accelerator`, but driven by whichever list the
+    caller passes — so it can report what a session actually BOUND rather than
+    what was asked for.
+    """
+    providers = list(providers or [])
     if "CUDAExecutionProvider" in providers:
         return "cuda", ACCELERATOR_LABELS["cuda"]
     # onnxruntime lists CoreMLExecutionProvider on Intel macOS builds too;
@@ -98,8 +113,66 @@ def accelerator():
     return "cpu", ACCELERATOR_LABELS["cpu"]
 
 
+def verify_session_providers(requested, active):
+    """Compare what was asked for against what the session actually bound.
+
+    Returns ``(active, demoted, reason)``. ``demoted`` lists the requested
+    accelerator providers missing from ``active`` — CPU is excluded because it
+    is always appended as a deliberate fallback, so its absence is not a
+    demotion. ``reason`` explains the FIRST demotion and is None when there is
+    none.
+
+    Two distinct causes, which need two very different remedies:
+
+    * the provider is not in this onnxruntime build at all — the CPU-only
+      ``onnxruntime`` wheel has no CUDA. Fix: install ``onnxruntime-gpu``.
+    * the provider is offered but did not bind — typically a CUDA/cuDNN/driver
+      mismatch. We cannot diagnose that from here, so the message stays factual.
+    """
+    active = list(active or [])
+    requested = list(requested or [])
+    demoted = [p for p in requested
+               if p not in active and p != "CPUExecutionProvider"]
+    if not demoted:
+        return active, [], None
+
+    try:
+        available = set(_available_providers())
+    except Exception:
+        available = set()
+
+    first = demoted[0]
+    if first not in available:
+        reason = (
+            f"{first} is not provided by this onnxruntime build. "
+            "'onnxruntime' (CPU-only) and 'onnxruntime-gpu' are DIFFERENT "
+            "packages and cannot be co-installed — see docs/GPU.md"
+        )
+    else:
+        reason = (
+            f"{first} is offered by this build but did not initialise, so it "
+            "is not in the active provider list; inference runs on the CPU"
+        )
+    return active, demoted, reason
+
+
+# Last verified session result, so the banner printed BEFORE the model is
+# loaded ("Hardware detected: ...") can be corrected afterwards.
+_LAST_ACTIVE = None
+
+
+def last_active_report():
+    """The most recent verified session result, or None if none was built."""
+    return dict(_LAST_ACTIVE) if _LAST_ACTIVE else None
+
+
 def runtime_report():
-    """Everything the startup banner needs about the inference runtime."""
+    """Everything the startup banner needs about the inference runtime.
+
+    ``accelerator``/``accelerator_label`` are EXPECTED values derived from the
+    requested providers. Once a session exists, prefer
+    :func:`last_active_report` — that is the observed truth.
+    """
     kind, label = accelerator()
     return {
         "onnxruntime_version": getattr(ort, "__version__", "unknown"),
@@ -147,12 +220,46 @@ class OnnxSegmenter:
             atexit.register(self._flush_profile)
             print(f"[onnx-profile] enabled (prefix {self._profile_prefix})",
                   flush=True)
+        self._verify_providers()
         inp = self.session.get_inputs()[0]
         out = self.session.get_outputs()[0]
         self.input_name = inp.name
         self.output_name = out.name
         self.input_layout = _layout(inp.shape, IN_CHANNELS)
         self.output_layout = _layout(out.shape, OUT_CHANNELS)
+
+    def _verify_providers(self):
+        """Record what the session BOUND and say so when it is not what we
+        asked for. onnxruntime does not raise on an unavailable provider — it
+        quietly builds a CPU session — so without this the analyzer would go on
+        reporting a GPU it is not using."""
+        global _LAST_ACTIVE
+        try:
+            active = list(self.session.get_providers())
+        except Exception:
+            # Never let reporting break inference.
+            active = list(self.providers)
+        self.active_providers, self.demoted, self.demotion_reason = (
+            verify_session_providers(self.providers, active))
+        self.accelerator, self.accelerator_label = active_accelerator(
+            self.active_providers)
+        _LAST_ACTIVE = {
+            "active_providers": list(self.active_providers),
+            "requested_providers": list(self.providers),
+            "demoted": list(self.demoted),
+            "reason": self.demotion_reason,
+            "accelerator": self.accelerator,
+            "accelerator_label": self.accelerator_label,
+        }
+        if self.demoted:
+            print(
+                "WARNING: requested execution provider(s) "
+                f"{', '.join(self.demoted)} are NOT active — onnxruntime is "
+                f"running this model on: {', '.join(self.active_providers)} "
+                f"(device: {self.accelerator_label}). "
+                f"Reason: {self.demotion_reason}",
+                flush=True,
+            )
 
     def _flush_profile(self):
         try:

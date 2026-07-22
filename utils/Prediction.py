@@ -213,6 +213,14 @@ def _prediction_batch_candidates(config, initial_batch: int) -> list[int]:
         initial,
         int(max_batch_attr if max_batch_attr is not None else initial),
     )
+    # On CoreML larger batches are strictly slower per image, so sweeping up to
+    # prediction_batch_max_gpu only burns time measuring known losers (see
+    # Config.prediction_batch_max_coreml).
+    hardware = getattr(config, 'hardware', None)
+    if getattr(hardware, 'accelerator', None) == 'coreml':
+        cap = getattr(config, 'prediction_batch_max_coreml', 2)
+        if cap is not None:
+            max_batch = max(initial, min(max_batch, int(cap)))
     return list(range(initial, max_batch + 1))
 
 
@@ -405,6 +413,41 @@ def _time_batch_candidate(
     return warm_used, per_tile, oomed
 
 
+def _autotune_stop_reason(
+    cand,
+    used,
+    per_tile,
+    best_batch,
+    best_per_tile,
+    stale_steps,
+    patience,
+    runaway_factor,
+):
+    """Why the sweep should stop after this candidate, or None to continue.
+
+    Only ever stops on candidates LARGER than the current best, so the knee is
+    always explored before giving up.
+
+    The runaway rule exists because `patience` alone is not enough: when the
+    curve degrades monotonically (CoreML, and CPU past its optimum) each extra
+    candidate is both slower per tile AND larger, so the sweep gets
+    progressively more expensive exactly when it has least to gain. A user
+    watched b4..b9 climb 0.340 -> 1.135 s/tile without it stopping.
+    """
+    if cand <= best_batch:
+        return None
+    if (runaway_factor > 0.0
+            and np.isfinite(best_per_tile)
+            and per_tile > best_per_tile * runaway_factor):
+        return (
+            f"stopped: b{used} is {per_tile / best_per_tile:.1f}x slower "
+            f"than the best (b{best_batch}); larger batches only get worse"
+        )
+    if stale_steps >= patience:
+        return f"stopped after {stale_steps} non-improving step(s)"
+    return None
+
+
 def _autotune_batch_size(
     sample_tiles,
     sample_masks,
@@ -466,6 +509,9 @@ def _autotune_batch_size(
         1,
         int(getattr(config, 'prediction_batch_autotune_repeats', 2)),
     )
+    runaway_factor = max(0.0, float(getattr(
+        config, 'prediction_batch_autotune_runaway_factor', 1.5,
+    )))
 
     candidates = [
         c for c in _prediction_batch_candidates(config, initial)
@@ -526,10 +572,11 @@ def _autotune_batch_size(
             )
             break
 
-        if stale_steps >= patience and cand > best_batch:
-            stop_reason = (
-                f"stopped after {stale_steps} non-improving step(s)"
-            )
+        stop_reason = _autotune_stop_reason(
+            cand, used, per_tile, best_batch, best_per_tile,
+            stale_steps, patience, runaway_factor,
+        )
+        if stop_reason is not None:
             break
 
     if results:
