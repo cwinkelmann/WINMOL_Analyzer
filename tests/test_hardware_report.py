@@ -16,6 +16,7 @@ import platform
 
 import pytest
 
+from classes.Config import Config
 from classes.ExecutionPlan import build_execution_plan
 from classes.HardwareInfo import HardwareInfo
 from utils import onnx_runtime
@@ -217,6 +218,20 @@ def test_force_cpu_env_is_honoured_on_apple_silicon(monkeypatch):
     assert hw.accelerator_label == "CPU"
 
 
+def test_force_cpu_env_is_honoured_on_an_nvidia_box(monkeypatch):
+    """The deliberate CPU pin must still win over a visible CUDA GPU."""
+    fake_platform(monkeypatch, "Linux")
+    fake_nvidia_smi(monkeypatch, ["NVIDIA A100"], [40.0])
+    fake_providers(monkeypatch, CUDA_PROVIDERS)
+    monkeypatch.setenv("WINMOL_ONNX_FORCE_CPU", "1")
+
+    hw = HardwareInfo.detect()
+
+    assert hw.gpu_count == 0
+    assert hw.gpu_names == []
+    assert hw.accelerator == "cpu"
+
+
 def test_explicit_cpu_provider_list_is_honoured(monkeypatch):
     fake_platform(monkeypatch, "Darwin", "arm64")
     no_nvidia_smi(monkeypatch)
@@ -236,6 +251,30 @@ def test_disable_metal_escape_hatch_still_works(monkeypatch):
     monkeypatch.setenv("WINMOL_DISABLE_METAL", "1")
 
     assert HardwareInfo.detect().gpu_count == 0
+
+
+@pytest.mark.parametrize("value", ["1", "true", "yes"])
+def test_disable_metal_does_not_discard_nvidia_gpus(monkeypatch, value):
+    """WINMOL_DISABLE_METAL is a Metal-only escape hatch.
+
+    It once shared a helper with the CUDA_VISIBLE_DEVICES check, so exporting
+    it on a CUDA box reported GPUs=0 -> cpu_stream -> WINMOL_ONNX_FORCE_CPU=1:
+    a silent, total loss of GPU acceleration.
+    """
+    fake_platform(monkeypatch, "Linux")
+    fake_nvidia_smi(monkeypatch, ["NVIDIA A100"], [40.0])
+    fake_providers(monkeypatch, CUDA_PROVIDERS)
+    monkeypatch.setenv("WINMOL_DISABLE_METAL", value)
+
+    hw = HardwareInfo.detect()
+
+    assert hw.accelerator == "cuda"
+    assert hw.gpu_count == 1
+    assert hw.gpu_names == ["NVIDIA A100"]
+    assert hw.gpu_memory_gb == [40.0]
+
+    plan = build_execution_plan(Config(), hw, RASTER, "Trees")
+    assert plan.prediction_mode == "stream"
 
 
 # --------------------------------------------------------------------------
@@ -292,8 +331,6 @@ def coreml_hardware():
 
 @pytest.mark.parametrize("backend", ["auto", "single_gpu", "multi_gpu"])
 def test_metal_never_selects_the_cuda_only_multi_gpu_path(backend):
-    from classes.Config import Config
-
     config = Config()
     config.prediction_backend = backend
 

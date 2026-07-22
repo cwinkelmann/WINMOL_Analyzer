@@ -39,20 +39,27 @@ class HardwareInfo:
         # Ask the runtime that actually performs inference (onnxruntime) which
         # device it will use, rather than inferring one from installed
         # packages. Returns None when onnxruntime cannot be imported at all.
-        cpu_forced = cls._cpu_forced_via_env()
-        kind = None if cpu_forced else cls._detect_accelerator_kind()
+        # CUDA_VISIBLE_DEVICES="" / "-1" is a whole-process CPU pin, so it
+        # short-circuits the probe; _apply_cuda_visible_devices above has
+        # already emptied the NVIDIA list for it.
+        kind = (None if cls._cuda_hidden_via_env()
+                else cls._detect_accelerator_kind())
 
         if gpu_names:
             # nvidia-smi stays the authority for NVIDIA count and per-GPU
             # memory; onnxruntime only confirms it can use them. A CPU-only
             # onnxruntime build (or a forced CPU run) means those GPUs are
             # unreachable, so do not let the planner size a GPU run for them.
-            if cpu_forced or kind not in (None, "cuda"):
+            # kind is None only when onnxruntime could not be asked at all --
+            # trust nvidia-smi then rather than downgrading a working box.
+            # WINMOL_DISABLE_METAL is deliberately NOT consulted here: it is a
+            # Metal-only escape hatch and must never discard NVIDIA GPUs.
+            if kind in (None, "cuda"):
+                accelerator = "cuda"
+            else:
                 gpu_names, gpu_memory_gb = [], []
                 accelerator = "cpu"
-            else:
-                accelerator = "cuda"
-        elif kind == "coreml":
+        elif kind == "coreml" and not cls._metal_disabled_via_env():
             # Apple Silicon: no nvidia-smi, but onnxruntime runs the model on
             # the integrated GPU/ANE through CoreML.
             gpu_names, gpu_memory_gb = cls._metal_gpu(total_ram_gb)
@@ -158,10 +165,23 @@ class HardwareInfo:
             return []
 
     @staticmethod
-    def _cpu_forced_via_env() -> bool:
+    def _cuda_hidden_via_env() -> bool:
+        """True when CUDA_VISIBLE_DEVICES hides every device ("" or "-1").
+
+        The device *filtering* lives in _apply_cuda_visible_devices; this only
+        answers whether the user asked for a CPU-only process.
+        """
         raw = os.environ.get("CUDA_VISIBLE_DEVICES", None)
-        if raw is not None and raw.strip() in ("", "-1"):
-            return True
+        return raw is not None and raw.strip() in ("", "-1")
+
+    @staticmethod
+    def _metal_disabled_via_env() -> bool:
+        """WINMOL_DISABLE_METAL — the Apple-Silicon-only escape hatch.
+
+        Scoped to the CoreML branch on purpose. It once shared a helper with
+        the CUDA_VISIBLE_DEVICES check, which made setting it on an NVIDIA box
+        silently discard every GPU and drop the run to cpu_stream.
+        """
         disable = str(os.environ.get("WINMOL_DISABLE_METAL", "")).strip()
         return disable.lower() in ("1", "true", "yes")
 

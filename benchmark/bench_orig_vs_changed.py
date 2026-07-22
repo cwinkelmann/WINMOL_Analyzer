@@ -58,8 +58,13 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 PHASE_RE = re.compile(
     r"(prediction|vector|merge|skeleton|quantif\w*)\D{0,40}?([\d.]+)\s*s", re.I)
+# "Selected providers"/"Device" come from the current banner; "Visible GPUs"
+# is now printed on the NVIDIA path only, and the ORIGINAL side of the
+# comparison still prints the old TensorFlow/CUDA wording -- keep both so a
+# cross-branch run reports a device line for either.
 DEVICE_RE = re.compile(
-    r"(Visible GPUs|Hardware detected|provider\w*)\s*[:=]\s*(.+)", re.I)
+    r"(Visible GPUs|Hardware detected|Inference runtime|Device"
+    r"|provider\w*)\s*[:=]\s*(.+)", re.I)
 
 
 def _stats_code():
