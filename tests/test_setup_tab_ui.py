@@ -418,7 +418,7 @@ def test_setup_buttons_constant_matches_the_ui():
     ui_names = set(_named(_root()))
     missing = [n for n in names if n not in ui_names]
     assert not missing, f"SETUP_BUTTONS names absent from the .ui: {missing}"
-    assert len(names) == 9
+    assert len(names) == 10
 
 
 def test_the_old_env_button_is_gone():
@@ -454,6 +454,13 @@ BANNED_CALLS = (
     "env_info", "directory_size", "_python_version", "_has_compute_deps",
     "is_ready", "resolve_environment", "remove_environment",
     "remove_all", "verify_file",
+    # The accelerator verdict: detect_gpu shells out to nvidia-smi (which
+    # blocks in an uninterruptible ioctl on a wedged driver) and
+    # probe_runtime launches the child interpreter to import onnxruntime.
+    # accelerator_STATUS is pure and stays allowed; accelerator_FROM_MACHINE
+    # is the measuring one and belongs on EnvProbeWorker.
+    "accelerator_from_machine", "detect_gpu", "probe_runtime",
+    "verify_gpu_runtime", "distribution_installed",
 )
 
 

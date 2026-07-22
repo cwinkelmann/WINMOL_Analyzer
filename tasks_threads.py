@@ -104,7 +104,7 @@ class EnvSetupWorker(QObject):
     done = pyqtSignal(str)      # interpreter path on success ('' if unknown)
     failed = pyqtSignal(str)    # error message
 
-    def __init__(self, plugin_dir, target_exe=None):
+    def __init__(self, plugin_dir, target_exe=None, gpu=False):
         super().__init__()
         self.plugin_dir = plugin_dir
         # When set, install the deps INTO this existing interpreter instead of
@@ -112,6 +112,11 @@ class EnvSetupWorker(QObject):
         # it here rather than inline keeps pip off the GUI thread, which is
         # what used to freeze QGIS for the whole install.
         self.target_exe = target_exe
+        # requirements/plugin-gpu.txt (onnxruntime-gpu, ~2.4 GB) instead of
+        # plugin.txt. Decided and CONFIRMED by the dialog before we get here —
+        # a worker must never start a multi-gigabyte download on its own
+        # initiative.
+        self.gpu = bool(gpu)
         self._cancelled = False
 
     def cancel(self):
@@ -128,12 +133,14 @@ class EnvSetupWorker(QObject):
             from .plugin_utils import installer
             if self.target_exe:
                 installer.install_requirements_into(self.target_exe,
-                                                    progress=self._emit)
+                                                    progress=self._emit,
+                                                    gpu=self.gpu)
                 if not installer._has_compute_deps(self.target_exe):
                     self.failed.emit(
                         f"{self.target_exe} still lacks the WINMOL "
                         "dependencies after the install.")
                     return
+                self._verify_gpu(self.target_exe)
                 self.done.emit(self.target_exe)
                 return
             venv = installer.venv_location(self.plugin_dir)
@@ -143,10 +150,31 @@ class EnvSetupWorker(QObject):
             # failure the user could neither retry nor understand.
             info = installer.setup_environment(
                 venv, plugin_dir=self.plugin_dir, download=False,
-                progress=self._emit)
-            self.done.emit(info.get("python") or "")
+                progress=self._emit, gpu=self.gpu)
+            python = info.get("python") or ""
+            self._verify_gpu(python)
+            self.done.emit(python)
         except Exception as exc:
             self.failed.emit(str(exc))
+
+    def _verify_gpu(self, python_exe):
+        """Prove the GPU runtime is a GPU runtime, in the CHILD.
+
+        A GPU install that silently produces a CPU-only runtime is the
+        exact bug this feature fixes, so the claim is never made on the
+        strength of "pip exited 0". It is NOT promoted to ``failed``: the
+        environment still works, just slowly, and failing would strand the
+        user with no environment at all. The message says which it is.
+        """
+        if not self.gpu or not python_exe:
+            return
+        try:
+            from .plugin_utils import installer
+            installer.verify_gpu_runtime(python_exe,
+                                         plugin_dir=self.plugin_dir,
+                                         progress=self._emit)
+        except Exception as exc:                   # pragma: no cover - env
+            self._emit(f"GPU runtime verification could not run: {exc}")
 
 
 class ModelDownloadWorker(QObject):
@@ -272,7 +300,7 @@ class EnvProbeWorker(QObject):
 
     log = pyqtSignal(str)
     progress = pyqtSignal(int)
-    done = pyqtSignal(object)   # {'token','info','usage'}
+    done = pyqtSignal(object)   # {'token','info','usage','accel'}
     failed = pyqtSignal(str)
 
     def __init__(self, plugin_dir, configured_exe=None, token=0):
@@ -296,8 +324,14 @@ class EnvProbeWorker(QObject):
                 "venv": installer.directory_size(info.venv_path),
                 "runtime": installer.directory_size(info.runtime_path),
             }
+            # The accelerator verdict belongs here for the same reason
+            # everything else does: it shells out to nvidia-smi and spawns
+            # the child interpreter to list its execution providers.
+            accel = setup_state.accelerator_from_machine(
+                info.exe if info.exists else None,
+                plugin_dir=self.plugin_dir)
             self.done.emit({"token": self.token, "info": info,
-                            "usage": usage})
+                            "usage": usage, "accel": accel})
         except Exception as exc:
             self.failed.emit(str(exc))
 

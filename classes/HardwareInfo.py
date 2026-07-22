@@ -12,6 +12,14 @@ from typing import List, Optional
 # on >= 20 GB / >= 12 GB of dedicated VRAM).
 UNIFIED_MEMORY_GPU_SHARE = 0.5
 
+# Seconds before a wedged nvidia-smi is given up on. These calls used to run
+# with no timeout at all: a driver stuck in an uninterruptible ioctl then hung
+# HardwareInfo.detect(), and with it the whole run, for as long as the kernel
+# module took to give up. subprocess.TimeoutExpired lands in the existing
+# `except Exception` and degrades to "no GPUs", which is the same answer a
+# machine without nvidia-smi already gives.
+NVIDIA_SMI_TIMEOUT = 8.0
+
 
 @dataclass
 class HardwareInfo:
@@ -138,6 +146,7 @@ class HardwareInfo:
                 stderr=subprocess.PIPE,
                 text=True,
                 check=False,
+                timeout=NVIDIA_SMI_TIMEOUT,
             )
             if result.returncode != 0:
                 return []
@@ -156,6 +165,7 @@ class HardwareInfo:
                 stderr=subprocess.PIPE,
                 text=True,
                 check=False,
+                timeout=NVIDIA_SMI_TIMEOUT,
             )
             if result.returncode != 0:
                 return []

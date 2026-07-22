@@ -41,12 +41,25 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from . import gpu_probe
 from .childenv import child_env
 
 WINMOL_VENV_NAME = "winmol_venv"
 MODELS_PATH = "models"
 READY_MARKER = ".winmol_ready"
 QSETTINGS_PYTHON_KEY = "winmol/python_executable"
+
+#: The two inference runtimes, and the rule about them: they both provide
+#: the ``onnxruntime`` module, so exactly one may be installed. Every code
+#: path that installs one uninstalls the other first.
+CPU_RUNTIME_DIST = "onnxruntime"
+GPU_RUNTIME_DIST = "onnxruntime-gpu"
+
+#: The execution provider that proves the CUDA build is not just present
+#: but loadable. Its ABSENCE after a GPU install is the failure this whole
+#: feature exists to report instead of silently running on the CPU.
+CUDA_PROVIDER = "CUDAExecutionProvider"
+COREML_PROVIDER = "CoreMLExecutionProvider"
 
 # WINMOL standardises on Python 3.11 everywhere: the code is validated only on
 # 3.11 and the managed environment is always built as 3.11 (downloaded via
@@ -63,11 +76,41 @@ def repo_requirements_dir() -> Path:
     return Path(_PLUGIN_DIR, "requirements")
 
 
-def plugin_requirements_path() -> Path:
+def plugin_requirements_path(gpu=False) -> Path:
+    """The requirements file the compute environment is built from.
+
+    ``gpu=True`` selects the CUDA twin (onnxruntime-gpu). It falls back to
+    the CPU file when plugin-gpu.txt is missing, so an incomplete checkout
+    installs a working CPU environment rather than nothing at all.
+    """
+    if gpu:
+        path = repo_requirements_dir().joinpath("plugin-gpu.txt")
+        if path.exists():
+            return path
     path = repo_requirements_dir().joinpath("plugin.txt")
     if not path.exists():   # fall back to base if plugin.txt is absent
         path = repo_requirements_dir().joinpath("base.txt")
     return path
+
+
+# --- which runtime does this machine want? ----------------------------------
+
+def detect_gpu(timeout=gpu_probe.NVIDIA_SMI_TIMEOUT):
+    """:class:`gpu_probe.GpuProbe` for this machine. Never raises.
+
+    Shells out to ``nvidia-smi`` (with a timeout — see gpu_probe), so it
+    belongs on a worker thread, never on a repaint path.
+    """
+    try:
+        return gpu_probe.probe(timeout=timeout)
+    except Exception:                       # pragma: no cover - defensive
+        return gpu_probe.GpuProbe(status=gpu_probe.STATUS_NO_DRIVER,
+                                  detail="GPU detection failed.")
+
+
+def wants_gpu_runtime(probe=None) -> bool:
+    """True when this machine should get onnxruntime-gpu."""
+    return (probe if probe is not None else detect_gpu()).present
 
 
 def managed_root(plugin_dir) -> str:
@@ -255,27 +298,58 @@ def configured_python_executable():
 
 # --- sentinel (install once) -----------------------------------------------
 
-def _requirements_hash() -> str:
+def _file_hash(path) -> str:
     try:
-        data = plugin_requirements_path().read_bytes()
+        data = Path(path).read_bytes()
     except Exception:
         data = b""
     return hashlib.sha256(data).hexdigest()[:16]
+
+
+def _requirements_hash() -> str:
+    return _file_hash(plugin_requirements_path())
+
+
+def _variant_hashes() -> dict:
+    """``{'cpu': hash, 'gpu': hash}`` — the requirement files a sentinel
+    may legitimately record.
+
+    A GPU environment is installed from plugin-gpu.txt, so its marker
+    carries that file's hash; comparing it only against plugin.txt would
+    declare every GPU install "incomplete" on the next dialog open and
+    offer to reinstall it forever.
+    """
+    hashes = {"cpu": _requirements_hash()}
+    gpu_path = repo_requirements_dir().joinpath("plugin-gpu.txt")
+    if gpu_path.exists():
+        hashes["gpu"] = _file_hash(gpu_path)
+    return hashes
 
 
 def _marker_path(venv_path) -> str:
     return os.path.join(venv_path, READY_MARKER)
 
 
+def marker_variant(venv_path):
+    """``'cpu'`` / ``'gpu'`` when the sentinel matches a requirements file
+    we still ship, else None. Pure file I/O — no interpreter, no
+    nvidia-smi — so it stays safe on the GUI thread."""
+    try:
+        with open(_marker_path(venv_path)) as f:
+            stored = json.load(f).get("req_hash")
+    except Exception:
+        return None
+    for variant, digest in _variant_hashes().items():
+        if stored == digest:
+            return variant
+    return None
+
+
 def marker_matches(venv_path) -> bool:
     """True when the ``.winmol_ready`` sentinel matches the current
     requirements. Pure file I/O — no interpreter is spawned, so this is
     the part of :func:`is_ready` that is safe on a GUI thread."""
-    try:
-        with open(_marker_path(venv_path)) as f:
-            return json.load(f).get("req_hash") == _requirements_hash()
-    except Exception:
-        return False
+    return marker_variant(venv_path) is not None
 
 
 def is_ready(venv_path, version=None) -> bool:
@@ -297,10 +371,12 @@ def is_ready(venv_path, version=None) -> bool:
     return marker_matches(venv_path)
 
 
-def _write_marker(venv_path) -> None:
+def _write_marker(venv_path, gpu=False) -> None:
+    req = plugin_requirements_path(gpu=gpu)
     with open(_marker_path(venv_path), "w") as f:
-        json.dump({"req_hash": _requirements_hash(),
-                   "requirements": str(plugin_requirements_path())}, f)
+        json.dump({"req_hash": _file_hash(req),
+                   "requirements": str(req),
+                   "variant": "gpu" if gpu else "cpu"}, f)
 
 
 def invalidate_marker(venv_path) -> bool:
@@ -713,6 +789,19 @@ def _pip_line_filter(total):
 
 # --- venv creation + install -----------------------------------------------
 
+def _looks_like_missing_venv_package(exc) -> bool:
+    """True for Debian/Ubuntu's "install the python3-venv package" failure.
+
+    Matched on the distro's own wording (it is what `python3 -m venv` prints
+    when ensurepip is absent), so the hint is only offered when it is the
+    actual cause.
+    """
+    text = str(exc).lower()
+    return ("python3-venv" in text
+            or "ensurepip is not available" in text
+            or "returned non-zero exit status 1" in text and "venv" in text)
+
+
 def create_venv(venv_path, base_python=None, progress=None) -> None:
     base_python = base_python or choose_base_python()
     progress = _as_progress(progress)
@@ -728,8 +817,17 @@ def create_venv(venv_path, base_python=None, progress=None) -> None:
                       progress=progress, label="venv creation", timeout=300,
                       heartbeat=10.0)
     except RuntimeError as exc:
+        # The python3-venv hint used to live ONLY on the get-pip fallback in
+        # ensure_pip(), which a Debian/Ubuntu box never reaches: there the
+        # `python3 -m venv` above is what fails, with "You may need to use
+        # sudo ... After installing the python3-venv package". Say it here,
+        # where it is actually reachable.
         raise RuntimeError(
-            f"venv creation failed with {base_python}: {exc}") from exc
+            f"venv creation failed with {base_python}: {exc}"
+            + (" On Debian/Ubuntu install the matching python3-venv package "
+               "(e.g. `sudo apt install python3.11-venv`), or point WINMOL at "
+               "an existing interpreter with 'Choose interpreter…'."
+               if _looks_like_missing_venv_package(exc) else "")) from exc
     progress(f"Virtual environment created in "
              f"{progress.phase_elapsed():.0f}s.")
 
@@ -765,12 +863,61 @@ def ensure_pip(venv_path, progress=None) -> None:
             f"pip error: {exc}") from exc
 
 
-def install_requirements(venv_path, progress=None) -> None:
+def distribution_installed(python_exe, dist, timeout=60) -> bool:
+    """True when ``dist`` is installed in ``python_exe``.
+
+    Uses importlib.metadata rather than importing the package: asking
+    whether ``onnxruntime-gpu`` is present by importing ``onnxruntime``
+    cannot tell the two distributions apart, which is the entire problem.
+    Any failure (no such interpreter, no metadata) answers False.
+    """
+    try:
+        out = subprocess.run(
+            [python_exe, "-I", "-c",
+             "import importlib.metadata as m, sys;"
+             "sys.exit(0 if m.distribution(sys.argv[1]) else 1)", dist],
+            capture_output=True, timeout=timeout, env=child_env())
+        return out.returncode == 0
+    except Exception:
+        return False
+
+
+def uninstall_conflicting_runtime(python_exe, gpu, progress=None) -> bool:
+    """Remove the runtime that must not coexist with the one we install.
+
+    onnxruntime and onnxruntime-gpu both provide the ``onnxruntime``
+    module (see the header of requirements/gpu.txt). With both installed,
+    whichever wrote the files last wins and the other's dangling shared
+    libraries produce import errors that read like a broken CUDA install.
+    pip will not resolve this for us — the two are unrelated names.
+
+    Returns True when something was actually removed. A failure here is
+    logged, not raised: the install that follows is the thing that must
+    succeed, and it will fail loudly on its own if this mattered.
+    """
+    progress = _as_progress(progress)
+    doomed = CPU_RUNTIME_DIST if gpu else GPU_RUNTIME_DIST
+    if not distribution_installed(python_exe, doomed):
+        return False
+    progress(f"Removing {doomed}: it cannot be installed alongside "
+             f"{GPU_RUNTIME_DIST if gpu else CPU_RUNTIME_DIST} — both "
+             "provide the 'onnxruntime' module.")
+    try:
+        _run_streamed(
+            [python_exe, "-u", "-m", "pip", "uninstall", "-y", doomed],
+            progress=progress, label=f"pip uninstall {doomed}", timeout=600)
+        return True
+    except Exception as exc:
+        progress(f"Could not remove {doomed}: {exc}")
+        return False
+
+
+def install_requirements(venv_path, progress=None, gpu=False) -> None:
     install_requirements_into(get_venv_python_path(venv_path),
-                              progress=progress)
+                              progress=progress, gpu=gpu)
 
 
-def install_requirements_into(python_exe, progress=None) -> None:
+def install_requirements_into(python_exe, progress=None, gpu=False) -> None:
     """pip-install requirements/plugin.txt into an arbitrary interpreter.
 
     Used both for the managed venv and for an interpreter the user picked in
@@ -778,20 +925,197 @@ def install_requirements_into(python_exe, progress=None) -> None:
     progresses; ``--no-input`` prevents a hidden prompt that would be
     indistinguishable from a hang, and ``--progress-bar off`` stops the \\r
     bar spam that a QPlainTextEdit cannot render usefully.
+
+    ``gpu=True`` installs requirements/plugin-gpu.txt instead — the same
+    environment with onnxruntime-gpu[cuda,cudnn] (about 2.4 GB) in place of
+    onnxruntime. Either way the OTHER runtime is uninstalled first; that is
+    a correctness requirement, not tidiness.
     """
     progress = _as_progress(progress)
-    req = str(plugin_requirements_path())
+    req = str(plugin_requirements_path(gpu=gpu))
     total = len(_requirement_names(req))
+    uninstall_conflicting_runtime(python_exe, gpu, progress=progress)
     progress.phase(
         f"Installing {total} packages from {os.path.basename(req)} into "
-        f"{python_exe} — the first run downloads a few hundred MB and can "
-        "take several minutes …")
+        f"{python_exe} — the first run downloads "
+        + ("about 2.4 GB of CUDA libraries" if gpu
+           else "a few hundred MB")
+        + " and can take several minutes …")
     _run_streamed(
         [python_exe, "-u", "-m", "pip", "install", "--upgrade", "--no-input",
          "--progress-bar", "off", "-r", req],
         progress=progress, label=f"pip install -r {os.path.basename(req)}",
         timeout=3600, line_filter=_pip_line_filter(total))
     progress(f"Dependencies installed in {progress.phase_elapsed():.0f}s.")
+
+
+# --- proof that the runtime we installed is the runtime that runs -----------
+
+#: Runs in the CHILD interpreter — the one that will actually do the
+#: inference. Asking the QGIS interpreter (or this one) what providers are
+#: available answers about the wrong environment entirely.
+#:
+#: It reports the installed DISTRIBUTION names as well as the providers,
+#: because "onnxruntime-gpu is installed but CUDAExecutionProvider is
+#: missing" and "only the CPU package is installed" are different faults
+#: with different fixes, and the provider list alone cannot tell them
+#: apart. When a model file and a wanted provider are supplied it goes
+#: further and builds a real InferenceSession: availability is not
+#: usability, and a CUDA build with the wrong cuDNN lists the provider
+#: happily and then fails at session creation.
+_RUNTIME_PROBE = r"""
+import json, sys
+out = {"ok": False, "providers": [], "packages": [], "version": None,
+       "error": None, "session_providers": None}
+try:
+    import importlib.metadata as md
+    for dist in ("onnxruntime", "onnxruntime-gpu"):
+        try:
+            md.distribution(dist)
+            out["packages"].append(dist)
+        except Exception:
+            pass
+except Exception:
+    pass
+try:
+    import onnxruntime as ort
+    out["ok"] = True
+    out["version"] = getattr(ort, "__version__", None)
+    out["providers"] = list(ort.get_available_providers())
+except Exception as exc:
+    out["error"] = "%s: %s" % (type(exc).__name__, exc)
+    print(json.dumps(out))
+    sys.exit(0)
+model = sys.argv[1] if len(sys.argv) > 1 else ""
+want = sys.argv[2] if len(sys.argv) > 2 else ""
+if model and want and want in out["providers"]:
+    try:
+        sess = ort.InferenceSession(
+            model, providers=[want, "CPUExecutionProvider"])
+        out["session_providers"] = list(sess.get_providers())
+    except Exception as exc:
+        out["error"] = "%s: %s" % (type(exc).__name__, exc)
+print(json.dumps(out))
+"""
+
+
+def _empty_runtime_report(error) -> dict:
+    return {"ok": False, "providers": [], "packages": [], "version": None,
+            "error": error, "session_providers": None}
+
+
+def probe_runtime(python_exe, model_path=None, want=None,
+                  timeout=300) -> dict:
+    """What onnxruntime in ``python_exe`` can actually do.
+
+    ``{'ok', 'providers', 'packages', 'version', 'error',
+    'session_providers'}``. ``ok`` is False when onnxruntime could not
+    even be imported — which is exactly what a CUDA-13 build on a CUDA-12
+    driver does (``ImportError: libcudart.so.13``), so the error string is
+    the real diagnosis and must reach the user verbatim.
+
+    Spawns an interpreter: worker threads only. Never raises.
+    """
+    if not python_exe:
+        return _empty_runtime_report("no interpreter configured")
+    cmd = [python_exe, "-I", "-c", _RUNTIME_PROBE,
+           str(model_path or ""), str(want or "")]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True,
+                             timeout=timeout, env=child_env())
+    except Exception as exc:
+        return _empty_runtime_report(f"probe failed: {exc}")
+    for line in reversed((out.stdout or "").splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            report = json.loads(line)
+        except ValueError:
+            continue
+        report.setdefault("providers", [])
+        report.setdefault("packages", [])
+        report.setdefault("session_providers", None)
+        return report
+    return _empty_runtime_report(
+        (out.stderr or out.stdout or "no output").strip()[-400:])
+
+
+def first_model_path(plugin_dir):
+    """Any .onnx already on disk, for the session check — or None.
+
+    A real InferenceSession is the only honest proof that CUDA works, and
+    it needs a model. There is no point downloading one for the probe:
+    when nothing is on disk yet, the provider list is the best available
+    evidence and the report says so.
+    """
+    models_dir = os.path.join(plugin_dir or _PLUGIN_DIR, MODELS_PATH)
+    try:
+        names = sorted(os.listdir(models_dir))
+    except OSError:
+        return None
+    for name in names:
+        if name.lower().endswith(".onnx"):
+            path = os.path.join(models_dir, name)
+            if os.path.isfile(path) and os.path.getsize(path) > 0:
+                return path
+    return None
+
+
+def verify_gpu_runtime(python_exe, plugin_dir=None, progress=None) -> dict:
+    """Post-install proof that the GPU runtime is a GPU runtime.
+
+    Returns ``{'ok': bool, 'message': str, 'report': <probe_runtime>}``.
+    ``ok`` is True only when CUDAExecutionProvider is available AND — when
+    a model was on disk to try it with — an InferenceSession really came
+    up on it. Anything else is reported with the interpreter's own error
+    text: claiming GPU and delivering CPU is the failure mode this
+    function exists to make impossible.
+    """
+    progress = _as_progress(progress)
+    model = first_model_path(plugin_dir)
+    progress("Verifying the GPU runtime in the compute environment …")
+    report = probe_runtime(python_exe, model_path=model, want=CUDA_PROVIDER)
+    ok, message = gpu_verdict(report, checked_with_model=bool(model))
+    progress(message)
+    return {"ok": ok, "message": message, "report": report}
+
+
+def gpu_verdict(report, checked_with_model=False):
+    """``(ok, message)`` from a :func:`probe_runtime` report. Pure."""
+    if not report.get("ok"):
+        return False, (
+            "The GPU runtime was installed but onnxruntime could not be "
+            f"imported: {report.get('error')}. The environment is not "
+            "usable — reinstall the dependencies.")
+    providers = report.get("providers") or []
+    version = report.get("version") or "?"
+    if CUDA_PROVIDER not in providers:
+        packages = ", ".join(report.get("packages") or []) or "none"
+        return False, (
+            f"{CUDA_PROVIDER} is NOT available in onnxruntime {version} "
+            f"(installed: {packages}; providers: {', '.join(providers)}). "
+            "Detection will run on the CPU, several hundred times slower. "
+            "This usually means the wheel's CUDA generation does not match "
+            "the NVIDIA driver.")
+    session = report.get("session_providers")
+    if checked_with_model and session is not None:
+        if CUDA_PROVIDER not in session:
+            return False, (
+                f"{CUDA_PROVIDER} is listed by onnxruntime {version} but a "
+                f"real session fell back to {', '.join(session)}. "
+                "Detection would run on the CPU.")
+        return True, (
+            f"GPU runtime verified: onnxruntime {version} created a session "
+            f"on {CUDA_PROVIDER}.")
+    if checked_with_model and report.get("error"):
+        return False, (
+            f"{CUDA_PROVIDER} is available in onnxruntime {version}, but "
+            f"loading a model on it failed: {report.get('error')}")
+    return True, (
+        f"GPU runtime installed: onnxruntime {version} offers "
+        f"{CUDA_PROVIDER}. (No model on disk yet, so no session was "
+        "created — the first detection will confirm it.)")
 
 
 def _model_reporthook(progress, label):
@@ -895,10 +1219,16 @@ def installed_message(missing_models) -> str:
 
 
 def setup_environment(venv_path, base_python=None, download=True,
-                      plugin_dir=None, progress=None) -> dict:
+                      plugin_dir=None, progress=None, gpu=False) -> dict:
     """Create the venv and install deps (idempotent via the sentinel).
-    Returns {'python': <exe>, 'missing_models': [...]}. Raises only on a real
-    environment failure (venv/pip/deps); callers convert that to a retry.
+    Returns {'python': <exe>, 'missing_models': [...], 'gpu': bool}. Raises
+    only on a real environment failure (venv/pip/deps); callers convert that
+    to a retry.
+
+    ``gpu=True`` builds the CUDA environment (requirements/plugin-gpu.txt,
+    about 2.4 GB). It is passed in rather than detected here: the user has
+    to be ASKED before that download starts, and the caller is the one that
+    can ask. :func:`detect_gpu` is the detection half.
 
     The venv is always built on Python 3.11: ``base_python`` is used if given,
     else a 3.11 is resolved (PATH or a downloaded PBS build) via
@@ -918,8 +1248,8 @@ def setup_environment(venv_path, base_python=None, download=True,
                                                       progress=report)
             create_venv(venv_path, base, progress=report)
         ensure_pip(venv_path, progress=report)
-        install_requirements(venv_path, progress=report)
-        _write_marker(venv_path)
+        install_requirements(venv_path, progress=report, gpu=gpu)
+        _write_marker(venv_path, gpu=gpu)
     else:
         report("WINMOL environment already built; checking models …")
     missing = download_models(plugin_dir, progress=report) if download else []
@@ -928,7 +1258,7 @@ def setup_environment(venv_path, base_python=None, download=True,
     if missing:
         report(installed_message(missing))
     return {"python": get_venv_python_path(venv_path),
-            "missing_models": missing}
+            "missing_models": missing, "gpu": bool(gpu)}
 
 
 # --- top-level resolution used by classFactory -----------------------------
