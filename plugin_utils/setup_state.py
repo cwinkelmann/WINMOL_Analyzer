@@ -636,7 +636,7 @@ def accelerator_from_machine(python_exe, plugin_dir=None,
 #
 # Neither ever measures anything. They take the CACHED status the dialog is
 # already holding, which is what keeps them off the list of calls banned
-# from the GUI thread (tests/test_setup_tab_ui.py::BANNED_CALLS).
+# from the GUI thread (tests/test_dialog_lint.py::BANNED_CALLS).
 
 #: pre_run_decision kinds.
 PRERUN_NONE = "none"

@@ -417,7 +417,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         Detection, Log. The three former ``setCurrentIndex(1)`` literals
         meant "the Log tab" and would silently open Detection today. An
         AST test bans integer literals here so the mapping cannot rot
-        again, and test_setup_tab_ui pins the order itself.
+        again (tests/test_dialog_lint.py).
         """
         if page is None:
             return
