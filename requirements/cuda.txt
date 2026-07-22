@@ -1,0 +1,54 @@
+# THE CUDA RUNTIME, AND THE ONLY PLACE IN THIS REPO THAT NAMES IT.
+#
+# WHO: two callers. requirements/gpu.txt pulls this in with `-r` to build a
+#      whole CUDA environment; a user follows docs/GPU.md to add CUDA to an
+#      environment they already have.
+# WHEN: NVIDIA GPU on Linux or Windows x86_64, with a working driver. Nothing
+#      else — there is no CUDA on macOS, and no aarch64 wheel.
+#
+# THIS FILE IS A SWAP, NOT AN ADDITION.
+# `onnxruntime` and `onnxruntime-gpu` both provide the `onnxruntime` module and
+# MUST NOT be co-installed — pip will not stop you, and the result is a broken
+# import or a silent CPU session. Uninstall the CPU wheel FIRST:
+#
+#     <venv>/bin/pip uninstall -y onnxruntime
+#     <venv>/bin/pip install -r requirements/cuda.txt
+#
+# Then verify CUDA is actually offered — installing is not the same as working:
+#
+#     <venv>/bin/python -c \
+#       "import onnxruntime as ort; print(ort.get_available_providers())"
+#
+# 'CUDAExecutionProvider' must appear in that list. If it does not, the wheel
+# and your driver/CUDA runtime do not match; see docs/GPU.md.
+#
+# THE VERSION WINDOW IS LOAD-BEARING AT BOTH ENDS, AND HARDWARE-DEPENDENT.
+# The [cuda,cudnn] extras ship the CUDA userspace as wheels (cuBLAS, cuDNN,
+# cuFFT, cuRAND, nvrtc, cuda_runtime, nvJitLink), so the host needs an NVIDIA
+# DRIVER and nothing else — no system CUDA toolkit, and no LD_LIBRARY_PATH:
+# onnxruntime >= 1.26 preloads the wheel libraries itself. Measured cost about
+# 2.4 GB on disk; measured benefit on an RTX 4080 SUPER with the 512x512
+# Spruce_Deadwood fp16 model: 12.4 ms per tile on CUDAExecutionProvider against
+# 5265.7 ms on CPUExecutionProvider.
+#
+#   CEILING (<1.27): onnxruntime-gpu 1.27 moved its extras to CUDA 13
+#   (nvidia-*-cu13) and fails at import with `ImportError: libcudart.so.13` on a
+#   cu12 machine (reproduced on an RTX 4080, driver 580). The cap keeps the
+#   resolver on the cu12-era 1.26 line, which is what was verified end to end.
+#
+#   FLOOR (>=1.26): an unsatisfiable EXTRA is a pip warning, never an error.
+#   Without a floor, a narrow wheel-tag set makes pip backtrack to 1.20.2, print
+#   "does not provide the extra 'cuda'", install ZERO nvidia wheels and exit 0 —
+#   a build that claims success and then runs on the CPU. The floor turns that
+#   silent degradation into a resolver failure.
+#
+# Raise the window only after re-running the provider check in
+# docker/gpu/README.md on the target hardware. Blackwell (sm_120) in particular
+# needs a recent CUDA — verify, do not assume. If the container ever needs a
+# different pin from the plugin (say Blackwell on cu13 while the plugin stays on
+# cu12), split this file THEN, deliberately, rather than copying the line into
+# gpu.txt and letting the two drift.
+#
+# tests/test_requirements_layout.py asserts that this string appears in exactly
+# one file in requirements/, so there is only ever one thing to edit.
+onnxruntime-gpu[cuda,cudnn]>=1.26,<1.27

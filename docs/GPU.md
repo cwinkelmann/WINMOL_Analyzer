@@ -24,11 +24,14 @@ get a loud `WARNING:` naming the demoted provider and why.
 
 ## Windows / Linux with an NVIDIA GPU
 
-**The shipped plugin environment can never use CUDA.** `requirements/plugin.txt`
-pulls in `requirements/base.txt`, which installs `onnxruntime` — the CPU-only
-wheel. `onnxruntime-gpu` is a **different package**; CUDA support is not a flag
-you turn on, it is a different distribution. This is why an RTX 4080 can sit at
-0 % utilisation while a run crawls.
+**A CPU environment can never use CUDA.** `requirements/cpu.txt` installs
+`onnxruntime` — the CPU-only wheel. `onnxruntime-gpu` (which
+`requirements/gpu.txt` installs, via `requirements/cuda.txt`) is a **different
+package**; CUDA support is not a flag you turn on, it is a different
+distribution, and the two can never be installed side by side. This is why an
+RTX 4080 can sit at 0 % utilisation while a run crawls — and why an environment
+built before the plugin learned to detect GPUs, or built on a machine where
+`nvidia-smi` was not answering, stays on the CPU until you swap the wheel.
 
 You will see this at startup:
 
@@ -49,7 +52,7 @@ under your QGIS profile directory). Then **swap** the wheel — never install bo
 <venv>/bin/pip uninstall -y onnxruntime
 
 # 2. install the CUDA build
-<venv>/bin/pip install -r requirements/onnxruntime-gpu.txt
+<venv>/bin/pip install -r requirements/cuda.txt
 
 # 3. VERIFY — installing is not the same as working
 <venv>/bin/python -c "import onnxruntime as ort; print(ort.get_available_providers())"
@@ -71,12 +74,19 @@ analyzer and confirm the banner says:
 The `[cuda,cudnn]` extras ship the CUDA userspace as wheels, so you do **not**
 need a system CUDA toolkit — only a recent enough NVIDIA driver. But
 `onnxruntime-gpu` 1.27 moved those extras to **CUDA 13**, while earlier releases
-use CUDA 12. If your driver predates CUDA 13, pin a cu12-era release in
-`requirements/onnxruntime-gpu.txt`:
+use CUDA 12. `requirements/cuda.txt` therefore pins the window
+`>=1.26,<1.27`, and it is the only file in the repo that names
+`onnxruntime-gpu`, so that is the one line to edit. If your driver predates even
+that, pin an older cu12-era release there:
 
 ```
 onnxruntime-gpu[cuda,cudnn]==1.22.0
 ```
+
+Do not drop the lower bound entirely: an unsatisfiable `[cuda,cudnn]` extra is a
+pip *warning*, not an error, so an unbounded requirement can quietly resolve to
+a release without those extras, install no NVIDIA wheels at all, and leave you
+back on the CPU with a successful-looking install.
 
 Blackwell (sm_120) needs a recent CUDA — verify with step 3 on the actual
 hardware before trusting any timing.
@@ -97,7 +107,7 @@ so it is not in the active provider list; inference runs on the CPU
 ```
 
 Containers are unaffected: `docker/gpu/` builds from `requirements/gpu.txt`,
-which already uses `onnxruntime-gpu`. See `docs/CONTAINERS.md`.
+which pulls the same `requirements/cuda.txt`. See `docs/CONTAINERS.md`.
 
 ### …and its usual cause: the CUDA libraries are not on the loader path
 

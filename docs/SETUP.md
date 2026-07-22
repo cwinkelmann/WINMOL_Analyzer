@@ -4,11 +4,35 @@ WINMOL Analyzer runs inference with **ONNX models via onnxruntime — no
 TensorFlow**. Any recent Python 3.9–3.12 works; onnxruntime and the geo stack
 (rasterio/geopandas/shapely) ship wheels for macOS, Linux and Windows.
 
+## Which requirements file do I install?
+
+One file, once. Pick your row and skip the rest.
+
+| I want to…                                       | install                                            |
+| ------------------------------------------------ | -------------------------------------------------- |
+| run the analyzer (CLI or QGIS plugin, any OS)     | `pip install -r requirements/cpu.txt`               |
+| …and I have an NVIDIA GPU (Linux/Windows x86_64)  | `pip install -r requirements/gpu.txt`               |
+| …add CUDA to an environment I already have        | `pip install -r requirements/cuda.txt` (see [GPU.md](GPU.md) — uninstall `onnxruntime` first) |
+| run the standalone Jupyter notebooks              | `pip install -r requirements/notebook.txt`          |
+| reproduce the CI test environment exactly         | `pip install -r requirements/ci.txt`                |
+| convert an `.hdf5` model to ONNX (dev only)       | `pip install -r requirements/convert.txt`           |
+| lint and run the test suite locally               | `pip install -r requirements/cpu.txt -r requirements/dev.txt` |
+
+Two rules behind the table. **Exactly one inference runtime:** `onnxruntime`
+(CPU) and `onnxruntime-gpu` (CUDA) provide the same Python module and must never
+be co-installed, so `cpu.txt` and `gpu.txt`/`cuda.txt` are a swap, never an
+addition. **No TensorFlow** anywhere except `convert.txt`. `core.txt` is a
+shared fragment the other files pull in with `-r`; it installs no runtime, so
+installing it alone gives you an environment that cannot run a model.
+
+Details, and the layout diagram, in
+[requirements/README.md](../requirements/README.md).
+
 ## Standalone / CLI
 
 ```shell
 python -m venv .venv && source .venv/bin/activate    # 3.9–3.12
-pip install -r requirements/base.txt                 # geo stack + onnxruntime
+pip install -r requirements/cpu.txt                  # geo stack + onnxruntime
 ```
 
 Run the pipeline (model is `.onnx`; `.hdf5`/`.keras` also load if you separately
@@ -26,7 +50,7 @@ providers with `WINMOL_ONNX_PROVIDERS=...`.
 
 The plugin creates its own environment (onnxruntime + geo stack) on first use,
 **or** you can point it at an existing interpreter (a conda env / any venv with
-`requirements/plugin.txt` installed) via the plugin setting
+`requirements/cpu.txt` installed) via the plugin setting
 `winmol/python_executable` — the robust option if the auto-setup is blocked by a
 firewall / offline machine.
 

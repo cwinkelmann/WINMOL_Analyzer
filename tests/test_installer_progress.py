@@ -227,16 +227,16 @@ def test_ensure_pip_announces_phase_and_skips_when_present(monkeypatch):
 # --- requirement counting ---------------------------------------------------
 
 def test_requirement_names_follows_dash_r(tmp_path):
-    (tmp_path / "base.txt").write_text(
+    (tmp_path / "core.txt").write_text(
         "# geo stack\nrasterio>=1.3\ngeopandas\nshapely ; python_version>'3'\n")
-    plugin = tmp_path / "plugin.txt"
-    plugin.write_text("-r base.txt\npsutil>=5.9  # optional\n\n")
+    plugin = tmp_path / "cpu.txt"
+    plugin.write_text("-r core.txt\npsutil>=5.9  # optional\n\n")
     names = inst._requirement_names(str(plugin))
     assert names == ["rasterio", "geopandas", "shapely", "psutil"]
 
 
 def test_requirement_names_survives_a_missing_include(tmp_path):
-    plugin = tmp_path / "plugin.txt"
+    plugin = tmp_path / "cpu.txt"
     plugin.write_text("-r nope.txt\nonnxruntime\n")
     assert inst._requirement_names(str(plugin)) == ["onnxruntime"]
 

@@ -1,7 +1,7 @@
 """The GPU-runtime decision, tested on a machine that has no GPU.
 
 The bug this covers, reproduced on a Lenovo/RTX 4080 SUPER box: the QGIS
-plugin's venv installed plain ``onnxruntime`` (requirements/plugin.txt), so
+plugin's venv installed plain ``onnxruntime`` (requirements/cpu.txt), so
 ``get_available_providers()`` returned ``['AzureExecutionProvider',
 'CPUExecutionProvider']`` — CUDAExecutionProvider was not a fallback, it was
 absent from the build. Inference ran at 5265.7 ms per tile instead of the
@@ -155,14 +155,14 @@ def test_an_unreadable_driver_version_does_not_veto_the_install():
 # --- which requirements file gets installed --------------------------------
 
 @pytest.mark.parametrize("stdout,status,system,machine,expected", [
-    (SMI_4080, None, "Linux", "x86_64", "plugin-gpu.txt"),
-    (SMI_4080, None, "Windows", "amd64", "plugin-gpu.txt"),
-    ("", None, "Linux", "x86_64", "plugin.txt"),            # no GPU
-    ("", gp.STATUS_NO_DRIVER, "Linux", "x86_64", "plugin.txt"),
-    ("", gp.STATUS_TIMEOUT, "Linux", "x86_64", "plugin.txt"),
-    (SMI_4080, None, "Darwin", "arm64", "plugin.txt"),      # macOS
-    (SMI_4080, None, "Linux", "aarch64", "plugin.txt"),     # ARM
-    (SMI_OLD_DRIVER, None, "Linux", "x86_64", "plugin.txt"),
+    (SMI_4080, None, "Linux", "x86_64", "gpu.txt"),
+    (SMI_4080, None, "Windows", "amd64", "gpu.txt"),
+    ("", None, "Linux", "x86_64", "cpu.txt"),            # no GPU
+    ("", gp.STATUS_NO_DRIVER, "Linux", "x86_64", "cpu.txt"),
+    ("", gp.STATUS_TIMEOUT, "Linux", "x86_64", "cpu.txt"),
+    (SMI_4080, None, "Darwin", "arm64", "cpu.txt"),      # macOS
+    (SMI_4080, None, "Linux", "aarch64", "cpu.txt"),     # ARM
+    (SMI_OLD_DRIVER, None, "Linux", "x86_64", "cpu.txt"),
 ])
 def test_requirements_choice(stdout, status, system, machine, expected):
     probe = gp.probe(system=system, machine=machine,
@@ -171,15 +171,16 @@ def test_requirements_choice(stdout, status, system, machine, expected):
 
 
 def test_the_installer_resolves_both_requirements_files():
-    assert inst.plugin_requirements_path().name == "plugin.txt"
-    assert inst.plugin_requirements_path(gpu=True).name == "plugin-gpu.txt"
+    assert inst.plugin_requirements_path().name == "cpu.txt"
+    assert inst.plugin_requirements_path(gpu=True).name == "gpu.txt"
 
 
 def test_the_gpu_requirements_file_never_pulls_the_cpu_runtime():
     """onnxruntime and onnxruntime-gpu both provide the `onnxruntime`
-    module and MUST NOT be co-installed (requirements/gpu.txt says so).
-    plugin-gpu.txt must therefore not reach base.txt, which pins the CPU
-    build."""
+    module and MUST NOT be co-installed (requirements/README.md says so).
+    gpu.txt must therefore not reach cpu.txt, which pins the CPU build.
+    tests/test_requirements_layout.py generalises this over every file in
+    requirements/; this one keeps the plugin's own two files covered."""
     names = inst._requirement_names(inst.plugin_requirements_path(gpu=True))
     assert "onnxruntime-gpu" in names
     assert "onnxruntime" not in names
@@ -193,8 +194,8 @@ def test_the_cpu_requirements_file_never_pulls_the_gpu_runtime():
 
 def test_a_gpu_marker_is_not_read_as_a_stale_cpu_marker(tmp_path,
                                                         monkeypatch):
-    """A GPU environment is installed from plugin-gpu.txt, so its sentinel
-    carries that file's hash. Comparing it only against plugin.txt would
+    """A GPU environment is installed from gpu.txt, so its sentinel
+    carries that file's hash. Comparing it only against cpu.txt would
     call every GPU install 'incomplete' forever."""
     venv = tmp_path / "winmol_venv"
     venv.mkdir()

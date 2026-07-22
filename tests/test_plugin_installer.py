@@ -20,7 +20,7 @@ def test_module_imports_without_qgis_or_pyqt():
     assert not any(m.startswith(("qgis", "PyQt5", "PyQt6"))
                    for m in sys.modules
                    if m in ("qgis", "PyQt5", "PyQt6"))
-    assert inst.plugin_requirements_path().name in ("plugin.txt", "base.txt")
+    assert inst.plugin_requirements_path().name == "cpu.txt"
 
 
 def test_venv_python_path_platform():

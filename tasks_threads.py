@@ -116,8 +116,8 @@ class EnvSetupWorker(QObject):
         # it here rather than inline keeps pip off the GUI thread, which is
         # what used to freeze QGIS for the whole install.
         self.target_exe = target_exe
-        # requirements/plugin-gpu.txt (onnxruntime-gpu, ~2.4 GB) instead of
-        # plugin.txt. Decided and CONFIRMED by the dialog before we get here —
+        # requirements/gpu.txt (onnxruntime-gpu, ~2.4 GB) instead of
+        # cpu.txt. Decided and CONFIRMED by the dialog before we get here —
         # a worker must never start a multi-gigabyte download on its own
         # initiative.
         self.gpu = bool(gpu)

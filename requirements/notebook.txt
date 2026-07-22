@@ -1,0 +1,17 @@
+# THE STANDALONE JUPYTER WALKTHROUGH.
+#
+# WHO: readers of standalone/WINMOL_Analyzer_main.ipynb and
+#      standalone/WINMOL_Analyzer_onnx.ipynb, which `import matplotlib.pyplot`
+#      in their first cells and want a named kernel.
+# WHEN: only for the notebooks. The analyzer itself never imports either of
+#      these — that is why cpu.txt does not carry them, and why the CUDA
+#      environment stays 32 packages smaller.
+#
+#     pip install -r requirements/notebook.txt
+#     python -m ipykernel install --user --name=WINMOL_Analyzer
+#
+# This is cpu.txt plus the plotting extras, so it inherits the CPU inference
+# runtime and must not be combined with gpu.txt / cuda.txt.
+-r cpu.txt
+ipykernel==6.27.1
+matplotlib

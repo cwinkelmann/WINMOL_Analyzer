@@ -251,7 +251,7 @@ only the changed side, or build a separate TF image for the comparison.
 **`CUDAExecutionProvider` missing.** Almost always a CUDA-version mismatch.
 `onnxruntime-gpu` 1.27 moved its extras to **CUDA 13** (`nvidia-*-cu13`);
 earlier releases use `cu12`. If the host driver is older than CUDA 13 requires,
-pin a cu12-era release in `requirements/gpu.txt`:
+pin a cu12-era release in `requirements/cuda.txt`:
 
 ```
 onnxruntime-gpu[cuda,cudnn]==1.22.*
