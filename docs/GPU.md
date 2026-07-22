@@ -99,6 +99,33 @@ so it is not in the active provider list; inference runs on the CPU
 Containers are unaffected: `docker/gpu/` builds from `requirements/gpu.txt`,
 which already uses `onnxruntime-gpu`. See `docs/CONTAINERS.md`.
 
+### …and its usual cause: the CUDA libraries are not on the loader path
+
+`onnxruntime-gpu` does **not** bundle CUDA. It pulls in the `nvidia-*-cu12`
+wheels, which unpack into `<venv>/lib/python3.11/site-packages/nvidia/*/lib`
+(seven directories) — a place no dynamic loader looks. Provider creation then
+fails with
+
+```
+Failed to create CUDAExecutionProvider. Require cuDNN 9.* and CUDA 12.*.
+Please install all dependencies ... make sure they're in the PATH
+```
+
+and the session falls back to the CPU. Measured on an RTX 4080 SUPER: **10311
+ms per tile instead of 10.5 ms** — a correctly installed GPU runtime
+delivering nothing at all.
+
+WINMOL now handles this itself, twice over: `utils/onnx_runtime.py` calls
+`onnxruntime.preload_dlls()` before every CUDA session, and
+`plugin_utils/childenv.py` prepends those directories to `LD_LIBRARY_PATH`
+(`PATH` on Windows) for every child process it spawns. If you run onnxruntime
+by hand, do the same:
+
+```python
+import onnxruntime as ort
+ort.preload_dlls()          # onnxruntime >= 1.21
+```
+
 ---
 
 ## macOS (Apple Silicon)

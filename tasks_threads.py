@@ -55,7 +55,11 @@ class Worker(QObject):
                 universal_newlines=True,
                 bufsize=1,
                 startupinfo=startupinfo,
-                env=child_env(self.env_extra or None),
+                # command[0] is the compute interpreter: child_env() uses it
+                # to put that venv's CUDA/cuDNN wheel directories on the
+                # loader path, without which onnxruntime-gpu runs on the CPU.
+                env=child_env(self.env_extra or None,
+                              python_exe=self.command[0]),
             )
             for line in iter(self._popen.stdout.readline, ""):
                 text = line.rstrip("\n")

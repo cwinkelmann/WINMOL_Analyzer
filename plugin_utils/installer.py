@@ -990,6 +990,15 @@ model = sys.argv[1] if len(sys.argv) > 1 else ""
 want = sys.argv[2] if len(sys.argv) > 2 else ""
 if model and want and want in out["providers"]:
     try:
+        # Exactly what utils/onnx_runtime.py does before ITS session: the
+        # CUDA libraries live in site-packages/nvidia/*/lib and are not on
+        # the loader path, so without this the probe would measure a
+        # different runtime from the one that runs the detection.
+        if hasattr(ort, "preload_dlls"):
+            ort.preload_dlls()
+    except Exception:
+        pass
+    try:
         sess = ort.InferenceSession(
             model, providers=[want, "CPUExecutionProvider"])
         out["session_providers"] = list(sess.get_providers())
@@ -1021,8 +1030,11 @@ def probe_runtime(python_exe, model_path=None, want=None,
     cmd = [python_exe, "-I", "-c", _RUNTIME_PROBE,
            str(model_path or ""), str(want or "")]
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True,
-                             timeout=timeout, env=child_env())
+        out = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout,
+            # python_exe: the probe must see the SAME loader path as the
+            # detection run, or it verifies a runtime nobody uses.
+            env=child_env(python_exe=python_exe))
     except Exception as exc:
         return _empty_runtime_report(f"probe failed: {exc}")
     for line in reversed((out.stdout or "").splitlines()):
@@ -1081,13 +1093,55 @@ def verify_gpu_runtime(python_exe, plugin_dir=None, progress=None) -> dict:
     return {"ok": ok, "message": message, "report": report}
 
 
+def session_provider(report):
+    """The provider a REAL ``InferenceSession`` bound first, or None.
+
+    None means no session was created — either none was attempted (no model
+    on disk) or creating it raised. It never means "the CPU": a fallback
+    session reports ``['CPUExecutionProvider']`` and that is an answer, not
+    an absence.
+    """
+    session = report.get("session_providers")
+    if not session:
+        return None
+    return session[0]
+
+
+def provider_confirmed(report, provider) -> bool:
+    """True only when a real session actually RAN on ``provider``.
+
+    The single source of truth for "is the accelerator working", shared by
+    :func:`gpu_verdict` and :func:`setup_state.accelerator_status` so the
+    post-install message and the Setup tab cannot disagree. Availability is
+    not usability: ``get_available_providers()`` lists what the wheel was
+    COMPILED with, and a CUDA build whose libraries are not on the loader
+    path lists CUDAExecutionProvider and then quietly runs on the CPU.
+    """
+    return session_provider(report) == provider
+
+
+def session_attempted(report) -> bool:
+    """Whether the probe got as far as trying to build a session."""
+    return (report.get("session_providers") is not None
+            or bool(report.get("error")))
+
+
 def gpu_verdict(report, checked_with_model=False):
     """``(ok, message)`` from a :func:`probe_runtime` report. Pure."""
     if not report.get("ok"):
+        # ``ok`` is False for one reason only: ``import onnxruntime`` itself
+        # raised. Anything else — including a session that fell back to the
+        # CPU — imports fine and is diagnosed further down. Say which it was;
+        # a message that names the wrong failure sends the user to the wrong
+        # remedy (and with no error text it used to read "…could not be
+        # imported: None", which names nothing at all).
+        detail = (report.get("error") or "").strip() or (
+            "the probe produced no diagnosis, so the interpreter itself "
+            "probably died")
         return False, (
             "The GPU runtime was installed but onnxruntime could not be "
-            f"imported: {report.get('error')}. The environment is not "
-            "usable — reinstall the dependencies.")
+            f"imported in the compute environment: {detail}. The "
+            "environment is not usable — reinstall the dependencies.")
     providers = report.get("providers") or []
     version = report.get("version") or "?"
     if CUDA_PROVIDER not in providers:
@@ -1099,16 +1153,18 @@ def gpu_verdict(report, checked_with_model=False):
             "This usually means the wheel's CUDA generation does not match "
             "the NVIDIA driver.")
     session = report.get("session_providers")
-    if checked_with_model and session is not None:
-        if CUDA_PROVIDER not in session:
+    if session is not None:
+        if not provider_confirmed(report, CUDA_PROVIDER):
             return False, (
                 f"{CUDA_PROVIDER} is listed by onnxruntime {version} but a "
-                f"real session fell back to {', '.join(session)}. "
-                "Detection would run on the CPU.")
+                f"real session fell back to {', '.join(session) or 'nothing'}"
+                ". Detection would run on the CPU. The usual cause is the "
+                "CUDA/cuDNN libraries of the nvidia-* wheels not being on "
+                "the loader path — see docs/GPU.md.")
         return True, (
             f"GPU runtime verified: onnxruntime {version} created a session "
             f"on {CUDA_PROVIDER}.")
-    if checked_with_model and report.get("error"):
+    if report.get("error"):
         return False, (
             f"{CUDA_PROVIDER} is available in onnxruntime {version}, but "
             f"loading a model on it failed: {report.get('error')}")

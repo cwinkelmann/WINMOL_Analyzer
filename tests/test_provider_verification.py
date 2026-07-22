@@ -222,3 +222,63 @@ def test_hardware_leaves_unusable_empty_when_cuda_works(monkeypatch):
     assert hw.accelerator == "cuda"
     assert hw.gpu_names == ["NVIDIA GeForce RTX 4080"]
     assert hw.unusable_gpu_names == []
+
+
+# --- preload_native_libs: the reason the GPU install did nothing ----------
+#
+# Measured on the Lenovo T14 / RTX 4080 SUPER box, with onnxruntime-gpu
+# 1.26.0 correctly installed by the plugin's own GPU path:
+#
+#   get_available_providers() -> [Tensorrt, CUDA, CPU]      (looks perfect)
+#   InferenceSession(...)     -> ['CPUExecutionProvider']   (W: "Require
+#       cuDNN 9.* and CUDA 12.* ... make sure they're in the PATH")
+#   -> 10311 ms/tile, WORSE than the CPU baseline. With preload_dlls():
+#   -> ['CUDAExecutionProvider', 'CPUExecutionProvider'], 10.5 ms/tile.
+
+def test_preload_runs_before_the_session_is_created(monkeypatch):
+    """Order is the whole point: preloading after the session is useless."""
+    events = []
+    monkeypatch.setattr(onnx_runtime, "_PRELOADED", None)
+    monkeypatch.setattr(onnx_runtime.ort, "preload_dlls",
+                        lambda *a, **k: events.append("preload"),
+                        raising=False)
+    monkeypatch.setattr(
+        onnx_runtime, "_available_providers", lambda: list(CUDA_REQUEST))
+    monkeypatch.setattr(
+        onnx_runtime.ort, "InferenceSession",
+        lambda path, sess_options=None, providers=None:
+            events.append("session") or FakeSession(CUDA_REQUEST))
+
+    onnx_runtime.OnnxSegmenter("/models/fake.onnx", providers=CUDA_REQUEST)
+
+    assert events == ["preload", "session"]
+
+
+def test_preload_is_not_called_for_cpu_or_coreml(monkeypatch):
+    """It must be a no-op on the CPU wheel and on macOS/CoreML."""
+    for requested in (CPU_ONLY, COREML_REQUEST):
+        events = []
+        monkeypatch.setattr(onnx_runtime, "_PRELOADED", None)
+        monkeypatch.setattr(onnx_runtime.ort, "preload_dlls",
+                            lambda *a, **k: events.append("preload"),
+                            raising=False)
+        assert onnx_runtime.preload_native_libs(requested) is False
+        assert events == []
+
+
+def test_preload_survives_an_onnxruntime_without_it(monkeypatch):
+    """onnxruntime < 1.21 has no preload_dlls; the loader path covers it."""
+    monkeypatch.setattr(onnx_runtime, "_PRELOADED", None)
+    monkeypatch.delattr(onnx_runtime.ort, "preload_dlls", raising=False)
+    assert onnx_runtime.preload_native_libs(CUDA_REQUEST) is False
+
+
+def test_preload_survives_preload_dlls_blowing_up(monkeypatch):
+    """A broken CUDA install must not stop the CPU fallback from running."""
+    def _boom(*a, **k):
+        raise OSError("libcudnn.so.9: cannot open shared object file")
+
+    monkeypatch.setattr(onnx_runtime, "_PRELOADED", None)
+    monkeypatch.setattr(onnx_runtime.ort, "preload_dlls", _boom,
+                        raising=False)
+    assert onnx_runtime.preload_native_libs(CUDA_REQUEST) is False

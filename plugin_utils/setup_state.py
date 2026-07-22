@@ -112,6 +112,10 @@ TXT_ACCEL_GPU_NO_ENV = (
 TXT_ACCEL_GPU_ACTIVE = (
     "{gpu} — the CUDA runtime is installed and active. Detection runs on "
     "the GPU (about 12 ms per image tile).")
+TXT_ACCEL_GPU_UNVERIFIED = (
+    "{gpu} found and the CUDA runtime is installed, but nothing has run on "
+    "it yet — there is no model on disk to try it with. The first detection "
+    "will say whether the GPU is really being used.")
 TXT_ACCEL_GPU_BROKEN = (
     "{gpu} found and the GPU runtime is installed, but CUDA is not usable, "
     "so detection still runs on the CPU. {reason}")
@@ -486,7 +490,13 @@ def accelerator_status(probe=None, report=None) -> AcceleratorStatus:
         # No NVIDIA hardware. macOS gets CoreML from the stock wheel and
         # is already as fast as it is going to get; saying "CPU only"
         # there would be a lie that sends the user shopping for a GPU.
-        if installer.COREML_PROVIDER in providers:
+        # A session that was tried and did NOT bind CoreML overrides that:
+        # unlike CUDA, CoreML needs no separate libraries, so there is
+        # nothing to offer — but there is also nothing to boast about.
+        if installer.COREML_PROVIDER in providers and not (
+                installer.session_attempted(report)
+                and not installer.provider_confirmed(
+                    report, installer.COREML_PROVIDER)):
             return AcceleratorStatus(
                 ACCEL_COREML,
                 TXT_ACCEL_COREML.format(gpu="Apple GPU"),
@@ -494,8 +504,31 @@ def accelerator_status(probe=None, report=None) -> AcceleratorStatus:
         return AcceleratorStatus(ACCEL_CPU_ONLY, TXT_ACCEL_CPU_ONLY)
 
     if installer.CUDA_PROVIDER in providers:
+        # THE provider list is not evidence. onnxruntime-gpu lists
+        # CUDAExecutionProvider whenever the wheel was built with it; on a
+        # machine whose CUDA/cuDNN libraries are not on the loader path it
+        # then builds a CPU session and prints a warning nobody sees. This
+        # branch used to report "installed and active" for exactly that
+        # machine, at 10311 ms per tile. Only a session that came up on
+        # CUDA is allowed to say so — and the sentence explaining the
+        # failure is installer.gpu_verdict's, so the Setup tab and the
+        # post-install verification cannot tell two different stories.
+        ok, reason = installer.gpu_verdict(report, checked_with_model=True)
+        if ok and installer.provider_confirmed(
+                report, installer.CUDA_PROVIDER):
+            return AcceleratorStatus(
+                ACCEL_GPU_ACTIVE, TXT_ACCEL_GPU_ACTIVE.format(gpu=label),
+                gpu_label=label)
+        if installer.session_attempted(report):
+            return AcceleratorStatus(
+                ACCEL_GPU_BROKEN,
+                TXT_ACCEL_GPU_BROKEN.format(gpu=label, reason=reason),
+                gpu_label=label)
+        # Nothing was tried, so nothing is known. Not "active" (the lie
+        # this fix removes) and not "broken" either — which would nag the
+        # user into re-downloading 2.4 GB that is very likely fine.
         return AcceleratorStatus(
-            ACCEL_GPU_ACTIVE, TXT_ACCEL_GPU_ACTIVE.format(gpu=label),
+            ACCEL_UNKNOWN, TXT_ACCEL_GPU_UNVERIFIED.format(gpu=label),
             gpu_label=label)
 
     if not probe.present:
@@ -536,6 +569,11 @@ def accelerator_from_machine(python_exe, plugin_dir=None,
 
     Runs nvidia-smi and spawns the child interpreter, so it must never be
     reached from a repaint. The two seams keep the tests machine-free.
+
+    The child is asked to build a REAL session when a model is on disk —
+    :func:`accelerator_status` refuses to claim an accelerator on anything
+    less, and without a model path the probe would never try, so the answer
+    could only ever be "unverified".
     """
     detect = detect or installer.detect_gpu
     probe_fn = probe_fn or installer.probe_runtime
@@ -544,10 +582,18 @@ def accelerator_from_machine(python_exe, plugin_dir=None,
     # GPU question is still answerable and still worth answering: it is what
     # lets "Create environment for me" offer the CUDA build on the FIRST
     # install instead of a CPU one the user has to redo.
-    report = probe_fn(python_exe) if python_exe else {
-        "ok": False, "providers": [], "packages": [],
-        "version": None, "error": "no compute environment yet",
-        "session_providers": None}
+    if python_exe:
+        want = (installer.CUDA_PROVIDER
+                if probe is not None and probe.has_hardware
+                else installer.COREML_PROVIDER)
+        report = probe_fn(python_exe,
+                          model_path=installer.first_model_path(plugin_dir),
+                          want=want)
+    else:
+        report = {
+            "ok": False, "providers": [], "packages": [],
+            "version": None, "error": "no compute environment yet",
+            "session_providers": None}
     return accelerator_status(probe, report)
 
 
