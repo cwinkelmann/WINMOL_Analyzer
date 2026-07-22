@@ -754,6 +754,19 @@
             </property>
            </widget>
           </item>
+          <item row="4" column="0" colspan="3">
+           <widget class="QPushButton" name="autotune_clear_button">
+            <property name="toolTip">
+             <string>Forget the measured prediction batch size. It is
+re-measured once on the next run (a one-off pause before the first tile)
+and then reused. Normally unnecessary — the cache invalidates itself when
+the model, the execution provider or the hardware changes.</string>
+            </property>
+            <property name="text">
+             <string>Clear batch-size autotune cache</string>
+            </property>
+           </widget>
+          </item>
          </layout>
         </widget>
        </item>

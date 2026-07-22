@@ -33,6 +33,15 @@ if os.environ.get("PYTHONHASHSEED") != "0":
 # imports TensorFlow.
 os.environ.setdefault("TF_USE_LEGACY_KERAS", "1")
 
+# The prediction batch-size autotune defaults to "auto" (tune once per
+# device+model, then reuse a persisted result). Tests must be hermetic and
+# their outputs machine-independent: the micro-batch changes float
+# accumulation order in the ONNX session, so an autotuned batch would make the
+# golden fixtures depend on which machine ran them. Pin it off for the whole
+# suite -- including the subprocesses that inherit this environment. The tests
+# that exercise the autotune itself set the variable explicitly.
+os.environ.setdefault("WINMOL_BATCH_AUTOTUNE", "off")
+
 import pytest  # noqa: E402
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

@@ -148,10 +148,14 @@ class ImageProcessing:
         print(f"  producer_workers = {plan.producer_workers}")
         print(f"  progress_interval_s = {plan.progress_interval_s}")
         print(f"  est_pred_tiles   = {plan.estimated_prediction_tiles}")
-        self._apply_plan_to_config(plan)
+        self._apply_plan_to_config(plan, hardware)
         return plan
 
-    def _apply_plan_to_config(self, plan):
+    def _apply_plan_to_config(self, plan, hardware=None):
+        # Carry the detected hardware onto the config so the prediction phase
+        # can key its autotune cache on it without re-probing nvidia-smi.
+        if hardware is not None:
+            self.config.hardware = hardware
         self.config.cpu_workers = (
             plan.vector_inner_workers
             if plan.vector_mode == 'tiled'

@@ -96,6 +96,18 @@ def venv_location(plugin_dir) -> str:
     return os.path.join(managed_root(plugin_dir), WINMOL_VENV_NAME)
 
 
+def autotune_cache_location(plugin_dir) -> str:
+    """Absolute path of the prediction batch-size autotune cache.
+
+    Lives beside the venv under ``managed_root`` so it is part of WINMOL's
+    managed state: the dialog hands it to the compute child through
+    ``$WINMOL_AUTOTUNE_CACHE`` and "Delete environment" removes it. See
+    plugin_utils/autotune_cache.py.
+    """
+    from .autotune_cache import CACHE_FILENAME
+    return os.path.join(managed_root(plugin_dir), CACHE_FILENAME)
+
+
 def managed_base_python(plugin_dir, progress=None) -> str:
     """A Python 3.11 interpreter to build the venv from.
 
@@ -387,6 +399,15 @@ def remove_environment(plugin_dir, remove_venv=True, remove_runtime=False,
     # blessed by is_ready(); do this BEFORE the first rmtree.
     if remove_venv:
         invalidate_marker(venv)
+        # The autotune cache describes a batch size measured against THIS
+        # environment's onnxruntime; it goes with it. Bytes are negligible,
+        # so it is not part of the "frees N GB" accounting.
+        try:
+            from . import autotune_cache
+            if autotune_cache.clear(autotune_cache_location(plugin_dir)):
+                report.phase("Removed the batch-size autotune cache.")
+        except Exception:                              # never fatal
+            pass
 
     for path, size in list(result["planned"]):
         if path == models_dir:

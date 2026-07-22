@@ -17,6 +17,16 @@ input, resampled 15 m tiles); vector phase = 10–11 foreground tiles of
 | **total** | **495.5** | **405.0** | **236.1** |
 | script wall (incl. TF/ORT init) | 498 | 406 | 238 |
 
+These numbers were taken with the prediction batch-size autotune disabled.
+It now defaults to `"auto"` (tune once, then reuse a persisted result), so a
+comparable run must pin `WINMOL_BATCH_AUTOTUNE=off` — otherwise the first run
+carries a one-off ~60 s tuning stall that later runs do not, and the micro-batch
+may differ between machines. `benchmark/` sets this for you.
+
+This table is also where `plugin_utils/run_progress.py` gets the phase weights
+for the plugin's progress bar (prediction ~55-62 %, vector ~37-44 %, merge
+~1.5 % for the two U-Nets).
+
 ## Prediction detail (per 512² tile, averaged)
 
 | metric | zenodo | twostage U-Net | twostage DeepLab |
