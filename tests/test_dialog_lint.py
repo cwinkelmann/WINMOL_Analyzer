@@ -126,7 +126,7 @@ BANNED_CALLS = (
     # accelerator_STATUS is pure and stays allowed; accelerator_FROM_MACHINE
     # is the measuring one and belongs on EnvProbeWorker.
     "accelerator_from_machine", "detect_gpu", "probe_runtime",
-    "verify_gpu_runtime", "distribution_installed",
+    "verify_gpu_runtime", "verify_runtime_import", "distribution_installed",
 )
 
 

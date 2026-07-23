@@ -42,7 +42,7 @@ import urllib.request
 from pathlib import Path
 
 from . import gpu_probe
-from .childenv import child_env
+from .childenv import child_env, safe_child_cwd
 
 WINMOL_VENV_NAME = "winmol_venv"
 MODELS_PATH = "models"
@@ -700,7 +700,11 @@ def _run_streamed(cmd, progress=None, label="command", timeout=3600,
     progress = _as_progress(progress)
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1, env=child_env({"PYTHONUNBUFFERED": "1"}))
+        text=True, bufsize=1, env=child_env({"PYTHONUNBUFFERED": "1"}),
+        # cmd[0] is the interpreter; run pip from a neutral directory so a
+        # QGIS working directory cannot contribute shadowing DLLs on Windows
+        # (cwd is on the DLL search order). pip reads its args by abs path.
+        cwd=safe_child_cwd(cmd[0] if cmd else None))
     lines = queue.Queue()
     tail = collections.deque(maxlen=_TAIL_LINES)
 
@@ -1072,7 +1076,10 @@ def probe_runtime(python_exe, model_path=None, want=None,
             cmd, capture_output=True, text=True, timeout=timeout,
             # python_exe: the probe must see the SAME loader path as the
             # detection run, or it verifies a runtime nobody uses.
-            env=child_env(python_exe=python_exe))
+            env=child_env(python_exe=python_exe),
+            # …and the SAME (neutral) working directory, since on Windows cwd
+            # is on the DLL search order too.
+            cwd=safe_child_cwd(python_exe))
     except Exception as exc:
         return _empty_runtime_report(f"probe failed: {exc}")
     for line in reversed((out.stdout or "").splitlines()):
@@ -1127,6 +1134,48 @@ def verify_gpu_runtime(python_exe, plugin_dir=None, progress=None) -> dict:
     progress("Verifying the GPU runtime in the compute environment …")
     report = probe_runtime(python_exe, model_path=model, want=CUDA_PROVIDER)
     ok, message = gpu_verdict(report, checked_with_model=bool(model))
+    progress(message)
+    return {"ok": ok, "message": message, "report": report}
+
+
+def import_verdict(report, platform=None):
+    """``(ok, message)`` for an import-only :func:`probe_runtime` report. Pure.
+
+    Reuses :mod:`plugin_utils.onnx_diagnostics` so the Setup-tab verdict and the
+    honest message ``utils.IO._load_onnx_model`` raises at run time cannot
+    drift. ``ok`` is True only when ``import onnxruntime`` itself succeeded; on
+    failure the message distinguishes "not installed" from the Windows native
+    DLL-shadowing failure from any other load error, using the packages the
+    probe already listed as the presence signal.
+    """
+    from .onnx_diagnostics import onnx_import_error_message
+    if report.get("ok"):
+        version = report.get("version") or "?"
+        providers = ", ".join(report.get("providers") or []) or "none"
+        return True, (
+            f"onnxruntime {version} loaded in the compute environment "
+            f"(providers: {providers}).")
+    present = bool(report.get("packages"))
+    message = onnx_import_error_message(
+        report.get("error") or "", platform=platform, present=present)
+    return False, message
+
+
+def verify_runtime_import(python_exe, plugin_dir=None, progress=None) -> dict:
+    """Post-install proof that onnxruntime IMPORTS in the compute env.
+
+    Runs the same import the real run performs, through the SAME
+    ``child_env(python_exe=...)`` — so the sanitized PATH (see
+    plugin_utils/childenv.py) is exercised at setup time rather than first
+    discovered when a detection dies with "DLL initialization routine failed".
+    Returns ``{'ok', 'message', 'report'}``; ``plugin_dir`` is accepted for
+    signature parity with :func:`verify_gpu_runtime` and is unused. Spawns an
+    interpreter: worker threads only. Never raises.
+    """
+    progress = _as_progress(progress)
+    progress("Verifying onnxruntime loads in the compute environment …")
+    report = probe_runtime(python_exe)
+    ok, message = import_verdict(report)
     progress(message)
     return {"ok": ok, "message": message, "report": report}
 
