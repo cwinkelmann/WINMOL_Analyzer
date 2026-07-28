@@ -128,9 +128,9 @@ def configured_python_executable():
     """The user-provided interpreter from QgsSettings, or None."""
     try:
         from qgis.core import QgsSettings
+        val = QgsSettings().value(QSETTINGS_PYTHON_KEY, "")
     except Exception:
         return None
-    val = QgsSettings().value(QSETTINGS_PYTHON_KEY, "")
     return str(val).strip() or None
 
 

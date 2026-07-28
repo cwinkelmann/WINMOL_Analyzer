@@ -24,40 +24,8 @@
  This script initializes the plugin, making it known to QGIS.
 """
 import os
-import sys
-import site
 
-from .plugin_utils.installer import WINMOL_VENV_NAME, \
-    ensure_venv, ensure_dependencies
-
-
-def _add_venv_site_packages(venv_path: str) -> None:
-    """Make venv-installed packages importable from within QGIS' Python.
-
-    Dependencies are installed into the plugin's internal venv, but QGIS runs
-    its own Python interpreter. We therefore need to add the venv's
-    site-packages directory to sys.path before importing plugin modules that
-    depend on those packages.
-    """
-
-    if not venv_path:
-        return
-
-    if sys.platform == "win32":
-        sp = os.path.join(venv_path, "Lib", "site-packages")
-        scripts = os.path.join(venv_path, "Scripts")
-        if os.path.isdir(scripts):
-            try:
-                os.add_dll_directory(scripts)
-            except Exception:
-                # Best-effort; missing this should not stop the plugin.
-                pass
-    else:
-        pyver = f"python{sys.version_info.major}.{sys.version_info.minor}"
-        sp = os.path.join(venv_path, "lib", pyver, "site-packages")
-
-    if os.path.isdir(sp):
-        site.addsitedir(sp)
+from .plugin_utils.installer import resolve_environment
 
 
 # noinspection PyPep8Naming
@@ -69,18 +37,14 @@ def classFactory(iface):  # pylint: disable=invalid-name
     :param iface: A QGIS interface instance.
     :type iface: QgsInterface
     """
-    project_path = os.path.dirname(__file__)
+    plugin_dir = os.path.dirname(__file__)
 
-    venv_path = ensure_venv(
-        os.path.join(
-            project_path,
-            WINMOL_VENV_NAME
-        )
-    )
-    ensure_dependencies(venv_path)
-
-    # Make packages from the internal venv importable in QGIS' Python.
-    _add_venv_site_packages(venv_path)
+    # Never builds/blocks at QGIS load: a missing environment comes back
+    # as status 'needs_setup' and is built off the GUI thread on first
+    # Run (see tasks_threads.EnvSetupWorker). The compute env runs as a
+    # separate child process (see plugin_utils/childenv.py), so nothing
+    # from it is ever imported into QGIS' own interpreter.
+    env = resolve_environment(plugin_dir, prompt=False, build=False)
 
     from .winmol_analyzer import WINMOLAnalyzer
-    return WINMOLAnalyzer(iface, venv_path)
+    return WINMOLAnalyzer(iface, env)

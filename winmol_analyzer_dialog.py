@@ -39,8 +39,7 @@ from qgis.core import QgsProject, QgsVectorLayer, QgsRasterLayer
 from qgis.PyQt import QtWidgets, uic
 
 from .classes.Config import Config
-from .plugin_utils.installer import get_venv_python_path
-from .tasks_threads import Worker
+from .tasks_threads import EnvSetupWorker, Worker
 
 current_path = os.path.dirname(__file__)
 
@@ -53,7 +52,7 @@ FORM_CLASS, _ = uic.loadUiType(
 
 class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
 
-    def __init__(self, parent=None, venv_path=None):
+    def __init__(self, parent=None, env=None):
         """Constructor."""
         super(WINMOLAnalyzerDialog, self).__init__(parent)
         self.setupUi(self)
@@ -89,7 +88,15 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
 
         self.set_connections()
         self.output_log.setReadOnly(True)
-        self.venv_path = venv_path
+        # env comes from plugin_utils.installer.resolve_environment():
+        # {'status', 'python', 'venv_path', 'message'}. status is one of
+        # byo/ready (python_exe usable now) or needs_setup/error (Run
+        # triggers EnvSetupWorker first, see run_process()).
+        self.env = env or {}
+        self.venv_path = self.env.get("venv_path") or ""
+        self.python_exe = self.env.get("python")
+        self.setup_thread = None
+        self.setup_worker = None
         self.models_dir = os.path.join(os.path.dirname(self.venv_path), "models")
         self.populate_model_combo_box()
         self.process_type = None
@@ -560,20 +567,17 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             )
 
     def cancel_process(self):
-        # If the process is running, cancel it
+        # If the process is running, cancel it. cancel() terminates (then
+        # kills) the child; the worker's own finished signal, already
+        # wired to thread.quit(), tears the thread down once it exits.
         if self.worker:
-            self.worker.finished.emit()
-            self.thread.quit()
+            self.worker.cancel()
 
     def close_application(self):
         print("Closing application")
         self.close()
 
     def run_process(self):
-        # Path to the Python script
-        path_dirname = os.path.dirname(__file__)
-        script_path = os.path.join(path_dirname, "winmol_run.py")
-
         # set chosen parameters
         self.set_selected_model()
 
@@ -604,9 +608,53 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             alt = str(p.with_name(p.stem + "_new.gpkg"))
             self.check_uav_input_exists(alt)
 
-        # use python of venv (!)
+        # Switch to the log tab in the QTabWidget
+        self.log_widget.setCurrentIndex(1)
+
+        # clear the output log
+        self.output_log.clear()
+
+        if self.env.get("status") == "needs_setup":
+            self.update_output_log(
+                "Setting up the WINMOL environment (first run only)..."
+            )
+            self._run_env_setup()
+        else:
+            self._start_analysis(self.python_exe)
+
+    def _run_env_setup(self):
+        """Build the compute venv off the GUI thread, then run the
+        analysis once it reports a usable interpreter."""
+        plugin_dir = os.path.dirname(__file__)
+        self.setup_thread = QThread()
+        self.setup_worker = EnvSetupWorker(plugin_dir)
+        self.setup_worker.moveToThread(self.setup_thread)
+        self.setup_thread.started.connect(self.setup_worker.run)
+        self.setup_worker.log.connect(self.update_output_log)
+        self.setup_worker.done.connect(self._on_env_setup_done)
+        self.setup_worker.failed.connect(self._on_env_setup_failed)
+        self.setup_worker.done.connect(self.setup_thread.quit)
+        self.setup_worker.failed.connect(self.setup_thread.quit)
+        self.setup_worker.done.connect(self.setup_worker.deleteLater)
+        self.setup_worker.failed.connect(self.setup_worker.deleteLater)
+        self.setup_thread.finished.connect(self.setup_thread.deleteLater)
+        self.setup_thread.start()
+
+    def _on_env_setup_done(self, python_exe):
+        self.python_exe = python_exe
+        self.env["status"] = "ready"
+        self.update_output_log("WINMOL environment ready.")
+        self._start_analysis(python_exe)
+
+    def _on_env_setup_failed(self, message):
+        self.update_output_log(f"WINMOL environment setup failed: {message}")
+
+    def _start_analysis(self, python_exe):
+        path_dirname = os.path.dirname(__file__)
+        script_path = os.path.join(path_dirname, "winmol_run.py")
+
         command = [
-            get_venv_python_path(self.venv_path),
+            python_exe,
             "-u",
             script_path,
             self.model_path,
@@ -616,28 +664,9 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self.process_type,
         ]
 
-        # Switch to the log tab in the QTabWidget
-        self.log_widget.setCurrentIndex(1)
-
-        # clear the output log
-        self.output_log.clear()
-
         self.update_output_log("Starting the process...")
 
-        # for debugging run subprocess directly
-        # import subprocess
-        # process = subprocess.run(
-        #     command,
-        #     capture_output=True,
-        #     text=True
-        # )
-        # print(process.stdout)
-        # print(process.stderr)
-        # self.update_output_log(process.stdout)
-        # self.update_output_log(process.stderr)
-
         # Run this part for responsive GUI
-        print("Starting the process...")
         try:
             self.thread = QThread()
             self.worker = Worker(command)
@@ -649,6 +678,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self.thread.finished.connect(self.thread.deleteLater)
             self.thread.finished.connect(self.load_layers_to_session)
             self.worker.update_signal.connect(self.update_output_log)
+            self.worker.error.connect(self.update_output_log)
             self.thread.start()
         # catch out of memory error
         except MemoryError:
