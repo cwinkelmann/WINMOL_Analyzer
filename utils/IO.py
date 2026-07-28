@@ -198,36 +198,15 @@ def load_model_from_path(model_path):
     if str(model_path).lower().endswith(".onnx"):
         return _load_onnx_model(model_path)
 
-    from tensorflow import keras
-    from tensorflow.keras import layers
-    from tensorflow.keras.utils import get_custom_objects
-
-    # These pretrained WINMOL HDF5 models were saved with Keras 2 and carry
-    # layer configs that Keras 3 rejects on load:
-    #   * Dropout(seed=<float>)      -> Keras 3 requires an int seed
-    #   * Conv2DTranspose(groups=..) -> 'groups' was removed in Keras 3
-    # Register transparent shims that fix both BEFORE the (single) load, so it
-    # succeeds cleanly instead of failing with an alarming traceback and then
-    # retrying. The shims are pass-through for models that don't need them.
-    def custom_dropout(**kwargs):
-        seed = kwargs.get('seed')
-        if isinstance(seed, float):
-            kwargs['seed'] = int(seed)
-        return layers.Dropout(**kwargs)
-
-    class CustomConv2DTranspose(layers.Conv2DTranspose):
-        def __init__(self, *args, **kwargs):
-            kwargs.pop("groups", None)   # unsupported in Keras 3
-            super().__init__(*args, **kwargs)
-
-    get_custom_objects()["Dropout"] = custom_dropout
-    get_custom_objects()["Conv2DTranspose"] = CustomConv2DTranspose
-
-    try:
-        return keras.models.load_model(model_path, compile=False)
-    except Exception as e:
-        raise RuntimeError(
-            f"Failed to load Keras model {model_path}: {e}")
+    # The shipped runtime is TensorFlow-free: it loads only .onnx models via
+    # onnxruntime. Legacy Keras/TensorFlow models (.hdf5/.h5/.keras) are no
+    # longer loadable here -- convert them to ONNX first.
+    raise RuntimeError(
+        f"Unsupported model format for {model_path!r}: the WINMOL runtime "
+        "loads only .onnx models (onnxruntime, no TensorFlow). Convert legacy "
+        "Keras/TensorFlow models (.hdf5/.h5/.keras) to ONNX first with "
+        "scripts/convert_models_to_onnx.py, then pass the resulting .onnx "
+        "file.")
 
 
 def _load_onnx_model(model_path):
