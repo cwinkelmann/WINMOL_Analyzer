@@ -145,7 +145,8 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         """Fill the model dropdown from config.json.
 
         config.json is expected to be a mapping: {"ModelName": "https://.../model.hdf5"}
-        The installer downloads these into <plugin>/models/<ModelName>.hdf5.
+        The installer downloads these into models/<ModelName>.hdf5, resolved
+        beside the managed environment (not necessarily <plugin>/models).
 
         We always append a "Custom" entry that lets users pick their own *.hdf5.
         """

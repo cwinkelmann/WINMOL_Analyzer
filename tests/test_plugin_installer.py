@@ -4,6 +4,7 @@ The module must import and resolve without QGIS/PyQt/pkg_resources, the
 sentinel must key on the current requirements hash, and the requirements
 algebra is: core.txt names no runtime, cpu.txt = core + one runtime.
 """
+import ast
 import importlib
 import os
 import re
@@ -101,3 +102,62 @@ def test_stale_managed_pointer_falls_through_to_needs_setup(
     assert result["python"] is None
     assert result["venv_path"] == venv
     assert set(result) >= {"status", "python", "venv_path", "message"}
+
+
+# Files that run before/without the "does compute deps import" probe
+# (winmol_run.py -> utils.Prediction/PredictWorkers -> utils.IO), so a
+# module-level import missing from requirements crashes the first real
+# run even though the venv built successfully.
+_CLOSURE_FILES = (
+    "winmol_run.py",
+    "utils/IO.py",
+    "utils/Prediction.py",
+    "utils/PredictWorkers.py",
+    "utils/onnx_runtime.py",
+)
+_LOCAL_PACKAGES = {"utils", "classes", "plugin_utils"}
+# Import roots not literally named in requirements/*.txt because they
+# ride in as transitive deps of a package that IS: geopandas pulls in
+# fiona/pandas/pyproj, and scikit-image is imported as "skimage".
+_IMPORT_TO_REQUIREMENT_NAME = {
+    "skimage": "scikit-image",
+    "fiona": "geopandas",
+    "pandas": "geopandas",
+    "pyproj": "geopandas",
+}
+
+
+def _module_level_import_roots(path):
+    tree = ast.parse(path.read_text(), filename=str(path))
+    roots = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            roots.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0 and node.module:
+                roots.add(node.module.split(".")[0])
+    return roots
+
+
+def test_module_level_imports_are_covered_by_requirements():
+    """A module-level import (e.g. matplotlib) with no path into
+    requirements/core.txt + cpu.txt builds a fine venv and then crashes
+    on the first real run. Anything not needed at import time belongs
+    inside the one function that uses it, not at module scope."""
+    declared = set(_requirement_names(
+        (REPO / "requirements" / "core.txt").read_text())
+        + _requirement_names(
+            (REPO / "requirements" / "cpu.txt").read_text()))
+    stdlib = set(sys.stdlib_module_names)
+    missing = []
+    for rel in _CLOSURE_FILES:
+        for root in _module_level_import_roots(REPO / rel):
+            if root in stdlib or root in _LOCAL_PACKAGES:
+                continue
+            req_name = _IMPORT_TO_REQUIREMENT_NAME.get(root, root)
+            if req_name.lower() not in declared:
+                missing.append("%s: %r" % (rel, root))
+    assert not missing, (
+        "module-level imports uncovered by requirements/core.txt + "
+        "cpu.txt (lazy-import inside the one function that needs it "
+        "instead): " + ", ".join(missing))

@@ -16,7 +16,6 @@ covered by the Windows PATH-sanitizer tests in test_child_env.py.
 import os
 import subprocess
 import sys
-import tempfile
 
 import pytest
 
@@ -30,11 +29,12 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture
-def polluted(monkeypatch):
+def polluted(monkeypatch, tmp_path):
     """os.environ as QGIS leaves it: PYTHONHOME/PYTHONPATH pointing at a
     directory that is not sys.executable's own stdlib -- poison for any
     interpreter, per childenv.py's docstring."""
-    bogus = tempfile.mkdtemp(prefix="winmol-bogus-stdlib-")
+    bogus = str(tmp_path / "winmol-bogus-stdlib")
+    os.mkdir(bogus)
     monkeypatch.setenv("PYTHONHOME", bogus)
     monkeypatch.setenv("PYTHONPATH", os.path.join(bogus, "lib"))
     return bogus
