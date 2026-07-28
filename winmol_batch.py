@@ -7,8 +7,10 @@
 """
 
 import argparse
+import concurrent.futures
 import json
 import os
+import queue
 import subprocess
 import sys
 from typing import Dict, List, Optional
@@ -66,7 +68,42 @@ def list_orthomosaics(input_folder: str) -> List[str]:
     )
 
 
-def run_winmol(input_image: str, model_path: str, output_folder: str) -> None:
+def detect_gpu_count() -> int:
+    """Number of visible NVIDIA GPUs, or 0 if none / nvidia-smi unavailable."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=20)
+        if out.returncode == 0:
+            return len([ln for ln in out.stdout.splitlines() if ln.strip()])
+    except Exception:
+        pass
+    return 0
+
+
+def _with_cpu_budget(overrides_json: str, cpu_budget: int) -> str:
+    """Add a max_cpu_workers budget to WINMOL_CONFIG_OVERRIDES_JSON.
+
+    An explicit user-set max_cpu_workers wins. Unparsable JSON is passed
+    through untouched -- the child reports the real error.
+    """
+    raw = (overrides_json or "").strip()
+    overrides = {}
+    if raw:
+        try:
+            overrides = json.loads(raw)
+        except Exception:
+            return overrides_json
+        if not isinstance(overrides, dict):
+            return overrides_json
+    if "max_cpu_workers" not in overrides:
+        overrides["max_cpu_workers"] = int(cpu_budget)
+    return json.dumps(overrides)
+
+
+def run_winmol(input_image: str, model_path: str, output_folder: str,
+               gpu_id: Optional[int] = None,
+               cpu_budget: Optional[int] = None) -> None:
     base_name = os.path.splitext(os.path.basename(input_image))[0]
     output_stem_map = os.path.join(output_folder, f"{base_name}_stem_map.tif")
     output_prefix = os.path.join(output_folder, base_name)
@@ -84,9 +121,24 @@ def run_winmol(input_image: str, model_path: str, output_folder: str) -> None:
         "Nodes",
     ]
 
-    print(f"Processing {input_image} with model {os.path.basename(model_path)}")
-    subprocess.run(command, check=True)
-    print(f" ^|^s Done: {base_name}")
+    env = dict(os.environ)
+    if gpu_id is not None:
+        # Pin this ortho to one GPU. The child then plans for a SINGLE GPU --
+        # the well-tested path -- instead of every concurrent job trying to
+        # spread itself across all of them and contending.
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    if cpu_budget is not None:
+        # Each child plans against the FULL machine; with N jobs the
+        # CPU-bound vector phases would oversubscribe the cores N-fold.
+        # Give every job an equal share via the standard override knob.
+        env["WINMOL_CONFIG_OVERRIDES_JSON"] = _with_cpu_budget(
+            env.get("WINMOL_CONFIG_OVERRIDES_JSON", ""), cpu_budget)
+
+    tag = f"[gpu {gpu_id}] " if gpu_id is not None else ""
+    print(f"{tag}Processing {input_image} "
+          f"with model {os.path.basename(model_path)}", flush=True)
+    subprocess.run(command, check=True, env=env)
+    print(f"{tag}Done: {base_name}", flush=True)
 
 
 def merge_results(
@@ -102,6 +154,69 @@ def merge_results(
         output_gpkg=output_gpkg,
         edge_buffer_m=edge_buffer_m,
     )
+
+
+def process_orthos(orthos, model_path, output_folder, jobs=1):
+    """Run every orthomosaic, optionally several at once.
+
+    Returns a list of (path, reason) for those that failed -- the batch
+    always attempts all of them. Previously a single failure raised out of
+    the loop and abandoned the rest, so one bad file in an overnight batch
+    of twenty cost the other nineteen.
+
+    Why parallelise across ORTHOS rather than harder within one: a single
+    orthomosaic cannot use many GPUs (the planner caps GPU workers by tile
+    count, and under 1000 tiles that is two), and its vector phase is
+    CPU-bound anyway, so extra GPUs do not help it. Whole orthomosaics are
+    independent -- embarrassingly parallel, no coordination, and each child
+    takes the single-GPU path. It also overlaps one job's CPU-bound vector
+    phase with another's GPU-bound prediction, which is worth something even
+    on ONE GPU.
+    """
+    failures = []
+    jobs = max(1, int(jobs))
+
+    if jobs == 1 or len(orthos) == 1:
+        for ortho in orthos:
+            try:
+                run_winmol(ortho, model_path, output_folder)
+            except subprocess.CalledProcessError as e:
+                print(f"  FAILED: {ortho}: {e}", flush=True)
+                failures.append((ortho, str(e)))
+        return failures
+
+    gpus = detect_gpu_count()
+    # Worker slot -> GPU. With more slots than GPUs they share, which is
+    # deliberate: prediction and vectorisation alternate, so a GPU is idle
+    # for much of each job.
+    slots: "queue.Queue" = queue.Queue()
+    for i in range(jobs):
+        slots.put(i % gpus if gpus else None)
+
+    cpu_budget = max(1, (os.cpu_count() or 1) // jobs)
+
+    print(f"Processing {len(orthos)} orthomosaics, {jobs} at a time"
+          + (f" across {gpus} GPU(s)" if gpus else " (no GPU detected)")
+          + f" | {cpu_budget} CPU workers per job",
+          flush=True)
+
+    def _one(ortho):
+        slot = slots.get()
+        try:
+            run_winmol(ortho, model_path, output_folder, gpu_id=slot,
+                       cpu_budget=cpu_budget)
+            return ortho, None
+        except subprocess.CalledProcessError as e:
+            return ortho, str(e)
+        finally:
+            slots.put(slot)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+        for ortho, err in pool.map(_one, orthos):
+            if err:
+                print(f"  FAILED: {ortho}: {err}", flush=True)
+                failures.append((ortho, err))
+    return failures
 
 
 def main(argv: List[str]) -> int:
@@ -130,6 +245,19 @@ def main(argv: List[str]) -> int:
     )
 
     parser.add_argument(
+        "--jobs", "-j",
+        type=int,
+        default=1,
+        help=(
+            "Process this many orthomosaics concurrently (default: 1). Each "
+            "job is pinned to one GPU via CUDA_VISIBLE_DEVICES, so a machine "
+            "with N GPUs can run N orthomosaics at once. Values above the "
+            "GPU count still help: prediction and vectorisation alternate, "
+            "so one job's CPU-bound vector phase overlaps another's GPU "
+            "work."
+        ),
+    )
+    parser.add_argument(
         "--merge",
         action="store_true",
         help=(
@@ -148,8 +276,12 @@ def main(argv: List[str]) -> int:
     parser.add_argument(
         "--edge-buffer-m",
         type=float,
-        default=1.0,
-        help="Edge buffer in meters used for tile-edge filtering (default: 1)",
+        default=0.0,
+        help=(
+            "Edge buffer in meters used for tile-edge filtering at the "
+            "batch merge (default: 0). Per-ortho seam dedup already "
+            "applied; leave 0 unless you know why."
+        ),
     )
 
     args = parser.parse_args(argv)
@@ -168,12 +300,11 @@ def main(argv: List[str]) -> int:
         print(f"No orthomosaics found in {args.input}.")
         return 0
 
-    for ortho in orthos:
-        try:
-            run_winmol(ortho, model_path, args.output)
-        except subprocess.CalledProcessError as e:
-            print(f" ^|^w Failed: {ortho}. Reason: {e}")
-            continue
+    failures = process_orthos(orthos, model_path, args.output, args.jobs)
+    if failures:
+        print(f"\n{len(failures)} of {len(orthos)} orthomosaics FAILED:")
+        for path, reason in failures:
+            print(f"  {os.path.basename(path)}: {reason}")
 
     if args.merge:
         try:
