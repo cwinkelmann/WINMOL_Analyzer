@@ -3,7 +3,7 @@ import sys
 
 from qgis.PyQt.QtCore import QObject, pyqtSignal
 
-from .plugin_utils.childenv import child_env
+from .plugin_utils.childenv import child_env, safe_child_cwd
 from .plugin_utils.run_progress import RunProgress
 
 
@@ -60,6 +60,11 @@ class Worker(QObject):
                 # loader path, without which onnxruntime-gpu runs on the CPU.
                 env=child_env(self.env_extra or None,
                               python_exe=self.command[0]),
+                # On Windows the current directory is on the DLL search order,
+                # so a QGIS working directory could shadow the child's native
+                # extensions the same way an inherited PATH does. winmol_run.py
+                # takes absolute paths, so a neutral cwd is safe.
+                cwd=safe_child_cwd(self.command[0]),
             )
             for line in iter(self._popen.stdout.readline, ""):
                 text = line.rstrip("\n")
@@ -144,7 +149,7 @@ class EnvSetupWorker(QObject):
                         f"{self.target_exe} still lacks the WINMOL "
                         "dependencies after the install.")
                     return
-                self._verify_gpu(self.target_exe)
+                self._verify(self.target_exe)
                 self.done.emit(self.target_exe)
                 return
             venv = installer.venv_location(self.plugin_dir)
@@ -156,29 +161,41 @@ class EnvSetupWorker(QObject):
                 venv, plugin_dir=self.plugin_dir, download=False,
                 progress=self._emit, gpu=self.gpu)
             python = info.get("python") or ""
-            self._verify_gpu(python)
+            self._verify(python)
             self.done.emit(python)
         except Exception as exc:
             self.failed.emit(str(exc))
 
-    def _verify_gpu(self, python_exe):
-        """Prove the GPU runtime is a GPU runtime, in the CHILD.
+    def _verify(self, python_exe):
+        """Prove the runtime the install produced actually loads, in the CHILD.
 
-        A GPU install that silently produces a CPU-only runtime is the
-        exact bug this feature fixes, so the claim is never made on the
-        strength of "pip exited 0". It is NOT promoted to ``failed``: the
-        environment still works, just slowly, and failing would strand the
-        user with no environment at all. The message says which it is.
+        Two failure modes are made visible here instead of being discovered on
+        the first real run:
+
+        * onnxruntime does not IMPORT — e.g. its native library is shadowed on
+          the Windows DLL search path (the QGIS-3.28 bug). The check runs
+          through the SAME ``child_env()`` the detection uses, so the sanitized
+          PATH is exercised at setup time too.
+        * a GPU install that silently produced a CPU-only runtime.
+
+        Neither is promoted to ``failed``: a slow-but-working (or
+        clearly-diagnosed) environment beats stranding the user with none, and
+        the message says which it is. It reaches the Setup tab through the same
+        log/status channel every other install step uses.
         """
-        if not self.gpu or not python_exe:
+        if not python_exe:
             return
         try:
             from .plugin_utils import installer
-            installer.verify_gpu_runtime(python_exe,
-                                         plugin_dir=self.plugin_dir,
-                                         progress=self._emit)
+            installer.verify_runtime_import(python_exe,
+                                            plugin_dir=self.plugin_dir,
+                                            progress=self._emit)
+            if self.gpu:
+                installer.verify_gpu_runtime(python_exe,
+                                             plugin_dir=self.plugin_dir,
+                                             progress=self._emit)
         except Exception as exc:                   # pragma: no cover - env
-            self._emit(f"GPU runtime verification could not run: {exc}")
+            self._emit(f"Runtime verification could not run: {exc}")
 
 
 class ModelDownloadWorker(QObject):

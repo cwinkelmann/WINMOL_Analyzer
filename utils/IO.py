@@ -241,11 +241,12 @@ def _load_onnx_model(model_path):
     try:
         from utils.onnx_runtime import OnnxSegmenter
     except Exception as e:
-        raise RuntimeError(
-            "Loading a .onnx model requires 'onnxruntime' in this "
-            "environment. Install it: `pip install onnxruntime`. "
-            f"Original import error: {e}"
-        ) from e
+        # The old message always said "pip install onnxruntime", which is
+        # wrong (and unhelpful) when onnxruntime IS installed and it is the
+        # native library that failed to load — the Windows DLL-shadowing bug.
+        # onnx_diagnostics classifies the failure without importing onnxruntime.
+        from plugin_utils.onnx_diagnostics import onnx_import_error_message
+        raise RuntimeError(onnx_import_error_message(e)) from e
     Log.info(f"Loading ONNX model via OnnxSegmenter: {model_path}")
     return OnnxSegmenter(model_path)
 

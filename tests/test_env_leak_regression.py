@@ -77,3 +77,46 @@ def test_is_ready_does_not_reject_a_good_venv_under_pollution(
         fh.write('{"req_hash": "deadbeef"}')
 
     assert installer.is_ready(str(venv_path)) is True
+
+
+# --- the leak class extended to PATH (Windows DLL shadowing) ----------------
+#
+# The original leak was PYTHONHOME/PYTHONPATH/GDAL_DATA. The same failure of
+# nerve — inheriting the parent's environment wholesale — also leaked QGIS's
+# program directory on PATH into the child, and on Windows PATH is the DLL
+# search path: an onnxruntime native extension then bound QGIS 3.28's 2022-era
+# MSVC/Qt runtime and died with "DLL initialization routine failed". child_env
+# must strip QGIS/OSGeo directories from PATH on Windows and leave it alone
+# everywhere else.
+
+_WIN_QGIS_PATH = (
+    r"C:\Program Files\QGIS 3.28\bin;"
+    r"C:\Program Files\QGIS 3.28\apps\qgis\bin;"
+    r"C:\OSGeo4W\bin;"
+    r"C:\Windows\System32;C:\Windows"
+)
+
+
+def test_child_env_strips_qgis_from_path_on_windows(monkeypatch):
+    monkeypatch.setattr("plugin_utils.childenv.sys.platform", "win32")
+    monkeypatch.setenv("PATH", _WIN_QGIS_PATH)
+    monkeypatch.setenv("OSGEO4W_ROOT", r"C:\OSGeo4W")
+    monkeypatch.setenv("QGIS_PREFIX_PATH",
+                       r"C:\Program Files\QGIS 3.28\apps\qgis")
+    monkeypatch.setenv("GDAL_DATA",
+                       r"C:\Program Files\QGIS 3.28\apps\gdal\share\gdal")
+    entries = child_env()["PATH"].split(";")
+    assert r"C:\OSGeo4W\bin" not in entries
+    assert r"C:\Program Files\QGIS 3.28\bin" not in entries
+    assert r"C:\Program Files\QGIS 3.28\apps\qgis\bin" not in entries
+    # System32 must survive — the child needs the core Windows runtime.
+    assert r"C:\Windows\System32" in entries
+    assert r"C:\Windows" in entries
+
+
+def test_child_env_does_not_touch_path_off_windows(monkeypatch):
+    """No-op on this macOS/Linux host: PATH comes back verbatim."""
+    assert sys.platform != "win32"
+    monkeypatch.setenv("PATH", "/usr/bin:/bin:/opt/qgis/bin")
+    monkeypatch.setenv("OSGEO4W_ROOT", "/opt/osgeo4w")
+    assert child_env()["PATH"] == "/usr/bin:/bin:/opt/qgis/bin"

@@ -6,6 +6,7 @@ child processes WINMOL spawns, which run a *different* Python with its own
 vendored GDAL. See docs: the Windows "could not import runpy module" crash.
 """
 import os
+import sys
 
 import pytest
 
@@ -133,6 +134,117 @@ def test_child_env_puts_the_cuda_libraries_on_the_loader_path(gpu_venv):
     assert "nvidia" in env[var]
     # ...and only when asked about that interpreter.
     assert "nvidia" not in child_env().get(var, "")
+
+
+# --- Windows DLL-shadowing: sanitizing the child's PATH -------------------
+#
+# On the SAME Windows 10 box with the SAME plugin venv and the SAME
+# onnxruntime 1.27.0, `import onnxruntime` succeeds when the child is launched
+# from QGIS 3.44 and dies with "A dynamic link library (DLL) initialization
+# routine failed" when launched from QGIS 3.28. The only differing variable is
+# the environment the parent QGIS injects: 3.28 puts its own 2022-era
+# MSVC/Qt runtime DLLs on PATH, which is also the child's DLL search path.
+# child_env() must strip QGIS/OSGeo directories from PATH on Windows. These
+# run on macOS/Linux with stubbed Windows-style inputs — no Windows, no QGIS.
+
+from plugin_utils.childenv import (sanitize_windows_path,  # noqa: E402
+                                   safe_child_cwd)
+
+_QGIS_PATH = ";".join([
+    r"C:\Program Files\QGIS 3.28\bin",
+    r"C:\Program Files\QGIS 3.28\apps\qgis\bin",
+    r"C:\OSGeo4W\bin",
+    r"C:\OSGeo4W\apps\Python39",
+    r"C:\Windows\System32",
+    r"C:\Windows",
+    r"C:\Windows\System32\WindowsPowerShell\v1.0",
+    (r"C:\Users\me\AppData\Roaming\QGIS\QGIS3\profiles\default\winmol"
+     r"\winmol_venv\Scripts"),
+])
+
+_QGIS_MARKERS = {
+    "OSGEO4W_ROOT": r"C:\OSGeo4W",
+    "QGIS_PREFIX_PATH": r"C:\Program Files\QGIS 3.28\apps\qgis",
+    "GDAL_DATA": r"C:\Program Files\QGIS 3.28\apps\gdal\share\gdal",
+    "PROJ_LIB": r"C:\Program Files\QGIS 3.28\apps\proj\share",
+}
+
+_VENV_ROOT = (r"C:\Users\me\AppData\Roaming\QGIS\QGIS3\profiles\default"
+              r"\winmol\winmol_venv")
+
+
+def test_sanitizer_drops_qgis_and_osgeo_but_keeps_system_and_venv():
+    out = sanitize_windows_path(_QGIS_PATH, _QGIS_MARKERS,
+                                keep_roots=(_VENV_ROOT,))
+    entries = out.split(";")
+    low = out.lower()
+    # QGIS/OSGeo directories — the source of the shadowing DLLs — are gone.
+    assert r"C:\Program Files\QGIS 3.28\bin" not in entries
+    assert r"C:\Program Files\QGIS 3.28\apps\qgis\bin" not in entries
+    assert r"C:\OSGeo4W\bin" not in entries
+    assert r"C:\OSGeo4W\apps\Python39" not in entries
+    assert "osgeo4w" not in low
+    # System32 / %SystemRoot% survive — dropping them would break the child.
+    assert r"C:\Windows\System32" in entries
+    assert r"C:\Windows" in entries
+    assert r"C:\Windows\System32\WindowsPowerShell\v1.0" in entries
+    # The compute venv survives even though it sits under a \QGIS\ profile path.
+    assert any(e.endswith(r"winmol_venv\Scripts") for e in entries)
+
+
+def test_keep_roots_is_load_bearing_for_the_venv_under_a_qgis_path():
+    """Without the keep_roots exemption the venv's own Scripts directory —
+    under ...\\QGIS\\QGIS3\\... — would be dropped by the qgis heuristic."""
+    without = sanitize_windows_path(_QGIS_PATH, _QGIS_MARKERS).split(";")
+    assert not any(e.endswith(r"winmol_venv\Scripts") for e in without)
+
+
+def test_sanitizer_is_a_noop_without_qgis_markers():
+    plain = r"C:\Windows\System32;C:\Windows;C:\tools\bin"
+    assert sanitize_windows_path(plain, {}) == plain
+
+
+def test_sanitizer_drops_qgis_by_heuristic_without_any_marker():
+    """A stray QGIS PATH entry is dropped even when no marker names its root."""
+    path = r"C:\Program Files\QGIS 3.40\apps\qgis-ltr\bin;C:\Windows\System32"
+    out = sanitize_windows_path(path, {})
+    assert out == r"C:\Windows\System32"
+
+
+def test_child_env_sanitizes_path_on_windows(monkeypatch):
+    monkeypatch.setattr("plugin_utils.childenv.sys.platform", "win32")
+    monkeypatch.setenv("PATH", _QGIS_PATH)
+    for var, val in _QGIS_MARKERS.items():
+        monkeypatch.setenv(var, val)
+    path = child_env()["PATH"]
+    assert "osgeo4w" not in path.lower()
+    assert r"C:\Windows\System32" in path.split(";")
+
+
+def test_child_env_leaves_path_untouched_off_windows(monkeypatch):
+    """No-op on macOS/Linux: the loader reads DYLD/LD paths, not PATH, and a
+    POSIX PATH is never a Windows DLL search path."""
+    assert sys.platform != "win32"          # this test host
+    monkeypatch.setenv("PATH", "/usr/bin:/bin:/opt/qgis/bin")
+    assert child_env()["PATH"] == "/usr/bin:/bin:/opt/qgis/bin"
+
+
+# --- Windows DLL-shadowing: a neutral working directory ------------------
+#
+# On Windows the process current directory is also on the DLL search order, so
+# a child inheriting a QGIS working directory is a second shadowing vector.
+
+def test_safe_child_cwd_uses_the_interpreters_venv_root(tmp_path):
+    exe = tmp_path / "bin" / "python"
+    exe.parent.mkdir(parents=True)
+    exe.write_text("")
+    assert safe_child_cwd(str(exe)) == str(tmp_path)
+
+
+def test_safe_child_cwd_falls_back_to_a_temp_dir(tmp_path):
+    import tempfile
+    assert safe_child_cwd(None) == tempfile.gettempdir()
+    assert safe_child_cwd("/definitely/not/a/python") == tempfile.gettempdir()
 
 
 def test_extra_still_wins_over_the_loader_path(gpu_venv):
