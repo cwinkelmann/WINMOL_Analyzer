@@ -1,0 +1,5 @@
+# CPU compute environment: core stack + the CPU onnxruntime build.
+# This is the file the QGIS plugin installer builds the venv from.
+-r core.txt
+onnxruntime>=1.17
+psutil>=5.9

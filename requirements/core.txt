@@ -1,0 +1,10 @@
+# Shared geo/science stack, runtime-free: names NO onnxruntime variant.
+# Include from cpu.txt (or a future gpu.txt) — never install alone.
+Pillow==10.1.0
+Shapely==2.0.2
+geopandas==0.14.0
+numpy==1.26.4
+rasterio>=1.4,<1.5
+scikit-image==0.22.0
+scipy==1.11.3
+pyogrio>=0.9
