@@ -15,9 +15,59 @@ import onnxruntime as ort
 IN_CHANNELS = 3
 OUT_CHANNELS = 1
 
+#: Human-readable name of the device inference actually runs on, keyed by
+#: the accelerator "kind" the rest of the codebase reasons about.
+ACCELERATOR_LABELS = {
+    "cuda": "NVIDIA GPU (CUDA)",
+    "coreml": "Apple Silicon GPU (Metal/CoreML)",
+    "cpu": "CPU",
+}
+
+#: Providers whose native libraries ship in separate wheels and therefore
+#: need preloading (see preload_native_libs) before a session can be built.
+_CUDA_PROVIDERS = ("CUDAExecutionProvider", "TensorrtExecutionProvider")
+
+_PRELOADED = None
+
+# Last verified session result, so a banner printed before the model loads
+# can be corrected afterwards with what actually bound.
+_LAST_ACTIVE = None
+
 
 def _truthy(val):
     return str(val).strip().lower() in ("1", "true", "yes", "on")
+
+
+def preload_native_libs(providers=None):
+    """Best-effort ctypes preload of the CUDA/cuDNN libs before a session is
+    created. ``onnxruntime-gpu`` ships them in ``nvidia-*-cu12`` wheels that
+    aren't on any loader path, so without this a requested CUDA session can
+    silently fall back to CPU with nothing but a warning. No-op for anything
+    but CUDA/TensorRT; never raises -- reporting must not block inference.
+    """
+    global _PRELOADED
+    providers = list(providers or [])
+    if providers and not any(p in _CUDA_PROVIDERS for p in providers):
+        return False
+    if _PRELOADED is not None:
+        return _PRELOADED
+    fn = getattr(ort, "preload_dlls", None)
+    if fn is None:
+        _PRELOADED = False
+        return False
+    try:
+        fn()
+        _PRELOADED = True
+    except Exception as exc:                     # never block inference
+        print(f"NOTE: onnxruntime.preload_dlls() failed ({exc}); relying on "
+              "the loader path for the CUDA libraries.", flush=True)
+        _PRELOADED = False
+    return _PRELOADED
+
+
+def _available_providers():
+    """Execution providers this onnxruntime build offers (seam for tests)."""
+    return list(ort.get_available_providers())
 
 
 def _default_providers():
@@ -33,7 +83,7 @@ def _default_providers():
         return [p.strip() for p in override.split(",") if p.strip()]
     if _truthy(os.environ.get("WINMOL_ONNX_FORCE_CPU", "")):
         return ["CPUExecutionProvider"]
-    avail = set(ort.get_available_providers())
+    avail = set(_available_providers())
     if "CUDAExecutionProvider" in avail:
         return ["CUDAExecutionProvider", "CPUExecutionProvider"]
     is_apple_silicon = (platform.system() == "Darwin"
@@ -46,6 +96,68 @@ def _default_providers():
 def selected_providers():
     """The providers the analyzer will hand to onnxruntime."""
     return _default_providers()
+
+
+def active_accelerator(providers):
+    """``(kind, label)`` for a bound provider list, e.g.
+    ``session.get_providers()``. CoreML is listed on Intel macOS builds too,
+    so it only counts here on Apple Silicon, which actually has the GPU/ANE
+    this label promises."""
+    providers = list(providers or [])
+    if "CUDAExecutionProvider" in providers:
+        return "cuda", ACCELERATOR_LABELS["cuda"]
+    if ("CoreMLExecutionProvider" in providers
+            and platform.system() == "Darwin"
+            and platform.machine() == "arm64"):
+        return "coreml", ACCELERATOR_LABELS["coreml"]
+    return "cpu", ACCELERATOR_LABELS["cpu"]
+
+
+def verify_session_providers(requested, active):
+    """Compare what was asked for against what a session actually bound.
+
+    Returns ``(active, demoted, reason)``. ``demoted`` lists requested
+    providers missing from ``active`` -- CPU excluded, since it is always
+    appended as a deliberate fallback and its absence is not a demotion.
+    ``reason`` explains the first demotion, or None when there is none, as
+    one of two distinct causes with two very different remedies: the
+    provider is not in this onnxruntime build at all (the CPU-only
+    ``onnxruntime`` wheel has no CUDA -- fix: install ``onnxruntime-gpu``),
+    or it is offered but did not bind (typically a CUDA/cuDNN/driver
+    mismatch we cannot diagnose from here, so the message stays factual).
+    """
+    active = list(active or [])
+    requested = list(requested or [])
+    demoted = [p for p in requested
+               if p not in active and p != "CPUExecutionProvider"]
+    if not demoted:
+        return active, [], None
+
+    try:
+        available = set(_available_providers())
+    except Exception:
+        available = set()
+
+    first = demoted[0]
+    if first not in available:
+        reason = (
+            f"{first} is not provided by this onnxruntime build. "
+            "'onnxruntime' (CPU-only) and 'onnxruntime-gpu' are DIFFERENT "
+            "packages and cannot be co-installed -- install "
+            "'onnxruntime-gpu' to get CUDA support"
+        )
+    else:
+        reason = (
+            f"{first} is offered by this build but did not initialise, so "
+            f"it is not in the active provider list; inference runs on "
+            f"{', '.join(active) or 'CPU'}"
+        )
+    return active, demoted, reason
+
+
+def last_active_report():
+    """The most recent verified OnnxSegmenter session result, or None."""
+    return dict(_LAST_ACTIVE) if _LAST_ACTIVE else None
 
 
 def _layout(shape, channels):
@@ -63,14 +175,52 @@ class OnnxSegmenter:
     def __init__(self, model_path, providers=None):
         self.model_path = model_path
         self.providers = providers or _default_providers()
+        # Before the session, not after: an unloadable libcudnn is the
+        # difference between 10 ms and 10 s a tile, and onnxruntime reports
+        # it as a warning on a session that otherwise looks fine.
+        preload_native_libs(self.providers)
         self.session = ort.InferenceSession(
             str(model_path), providers=self.providers)
+        self._verify_providers()
         inp = self.session.get_inputs()[0]
         out = self.session.get_outputs()[0]
         self.input_name = inp.name
         self.output_name = out.name
         self.input_layout = _layout(inp.shape, IN_CHANNELS)
         self.output_layout = _layout(out.shape, OUT_CHANNELS)
+
+    def _verify_providers(self):
+        """Record what the session BOUND and warn loudly when it is not
+        what we asked for. onnxruntime does not raise on an unavailable
+        provider -- it quietly builds a CPU session -- so without this the
+        analyzer would go on reporting a GPU it is not using."""
+        global _LAST_ACTIVE
+        try:
+            active = list(self.session.get_providers())
+        except Exception:
+            active = list(self.providers)
+        self.active_providers, self.demoted, self.demotion_reason = (
+            verify_session_providers(self.providers, active))
+        self.accelerator, self.accelerator_label = active_accelerator(
+            self.active_providers)
+        _LAST_ACTIVE = {
+            "active_providers": list(self.active_providers),
+            "requested_providers": list(self.providers),
+            "demoted": list(self.demoted),
+            "reason": self.demotion_reason,
+            "accelerator": self.accelerator,
+            "accelerator_label": self.accelerator_label,
+        }
+        if self.demoted:
+            print(
+                "WARNING: requested execution provider(s) "
+                f"{', '.join(self.demoted)} are NOT active -- onnxruntime "
+                f"is running this model on: "
+                f"{', '.join(self.active_providers)} "
+                f"(device: {self.accelerator_label}). "
+                f"Reason: {self.demotion_reason}",
+                flush=True,
+            )
 
     @staticmethod
     def _as_numpy(x):

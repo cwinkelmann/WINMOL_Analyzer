@@ -141,6 +141,13 @@ class ImageProcessing:
 
         print("\nLoading Model...")
         model = IO.load_model_from_path(self.model_path)
+        from utils.onnx_runtime import last_active_report
+        report = last_active_report()
+        if report:
+            print(
+                f"Execution providers (active): "
+                f"{report['active_providers']} "
+                f"(device: {report['accelerator_label']})")
         print("\nPerforming Prediction with Resampling in stream mode...")
         profile = Pred.predict_stream_to_raster(
             self.uav_path,
