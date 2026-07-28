@@ -1,11 +1,20 @@
 #!/usr/bin/env python
 from __future__ import annotations
 
-import json
 import os
+import sys
+
+# connect_stems joins stems in the set-iteration order of string-hashed Part
+# objects, which Python salts per process — so re-exec once with a pinned
+# PYTHONHASHSEED before anything hashes into a set ('-u' re-added to keep the
+# plugin's log stream unbuffered).
+if os.environ.get("PYTHONHASHSEED") != "0":
+    os.environ["PYTHONHASHSEED"] = "0"
+    os.execv(sys.executable, [sys.executable, "-u"] + sys.argv)
+
+import json
 import shutil
 import subprocess
-import sys
 import tempfile
 
 from classes.Config import Config
@@ -287,6 +296,8 @@ class ImageProcessing:
 
 
 if __name__ == '__main__':
+    print(f"Determinism: PYTHONHASHSEED={os.environ.get('PYTHONHASHSEED')}",
+          flush=True)
     if len(sys.argv) != 6:
         print("""Usage:
             python3 -u winmol_run.py <model_path> <input_tiff> <stem_map_tiff>
