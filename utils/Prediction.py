@@ -1162,9 +1162,6 @@ def predict_stream_to_raster(
                                 pending_items[:chunk_size]]
                 sample_masks = [mask for _, _, mask in
                                 pending_items[:chunk_size]]
-                # active_batch_size = _autotune_batch_size(
-                #     sample_tiles, sample_masks, model,
-                #     config, initial_batch_size)
                 active_batch_size = _autotune_batch_size(
                     sample_tiles,
                     sample_masks,
