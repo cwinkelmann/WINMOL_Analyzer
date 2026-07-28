@@ -58,32 +58,32 @@ breaks the next release. Removing it is a coordinated edit — the file,
 the `.qrc`, the try/except import, the `setup.cfg` per-file-ignore, five
 Makefile references (`COMPILED_RESOURCE_FILES`, `RESOURCE_SRC`, the
 `compile` target and its two dependents, the `cp` in `deploy`,
-`PEP8EXCLUDE`), `pb_tool.cfg:resource_files`, and both the `required`
-list and the `EXCLUDE` list in the build script. Worth its own reviewed
-commit, not a sweep.
+`PEP8EXCLUDE`), and both the `required` list and the `EXCLUDE` list in
+the build script. Worth its own reviewed commit, not a sweep.
 
 `tests/test_plugin_package.py::test_script_requires_its_own_manifest`
 now fails immediately if the file is removed without the script edit.
 
-**`pb_tool.cfg`.** Nothing invokes pb_tool: not a workflow, not
-`requirements/`, and the Makefile never runs it. It is a stale second
-copy of the shipped-file list that can silently drift from the Makefile's
-copy. Recommended to delete together with the packaging consolidation
-rather than on its own.
+**`pb_tool.cfg`.** *Removed.* Nothing invoked pb_tool — not a workflow,
+not `requirements/`, and the Makefile never ran it. It was a stale second
+copy of the shipped-file list that could silently drift from the
+Makefile's copy, so it was deleted (and dropped from the build script's
+`EXCLUDE` list). Its only remaining trace is the "pb_tool-style" wording
+in `CLAUDE.md`, which describes the Makefile targets, not the file.
 
 ### Not repository files
 
 `Dockerfile-1`, `Dockerfile.blackwell`, `Dockerfile_carrot`,
-`Dockerfile_olive`, `push_restack.sh`, `tmp.md`, `.DS_Store`, `.idea/`,
-`.pytest_cache/` — untracked local files (`git ls-files` lists only
-`Dockerfile`). These are most of the visual clutter, and no repository
-change removes them. Fold the Dockerfile variants into the existing
-`docker/` directory or add them to `.gitignore`.
+`Dockerfile_olive`, `push_restack.sh`, `WINMOL_Analyzer-*.zip`,
+`.DS_Store`, `.idea/`, `.pytest_cache/` — untracked local files
+(`git ls-files` lists only `Dockerfile`). The Dockerfile variants, the
+restack helper and built release zips are now covered by `.gitignore`, so
+they no longer clutter `git status`; the rest were already ignored.
 
 ## What actually ships
 
 `scripts/build_plugin_zip.sh` is the single source of truth and already
-strips `.github`, `Makefile`, `pb_tool.cfg`, `setup.cfg`, `docker`,
+strips `.github`, `Makefile`, `setup.cfg`, `docker`,
 `startDocker.sh`, `scripts`, `tests`, `benchmark`, `docs`,
 `documentation`, `standalone` and `resources.qrc`. The
 "package the QGIS-only files away" goal is therefore already met in the
@@ -112,15 +112,15 @@ table above.
 1. `make deploy` flat-`cp`s `PY_FILES` and `UI_FILES` into the QGIS
    profile directory. Nested paths land in the wrong place unless the
    target learns `mkdir -p`.
-2. pb_tool flattens files into the plugin directory by design, so
-   `pb_tool.cfg` cannot express a subdirectory. The move should follow
-   deleting `pb_tool.cfg`, not precede it.
+2. pb_tool flattens files into the plugin directory by design, so its
+   config could not express a subdirectory. `pb_tool.cfg` has since been
+   deleted, so this no longer blocks the move.
 3. `winmol_analyzer_dialog.py` is ~53 KB and reaches into
    `plugin_utils/` and `winmol_run.py`. A wrong relative-import level
    fails only when QGIS loads the plugin, and no CI job loads QGIS.
 
-**Sequence if it is wanted:** remove `resources.py` → delete
-`pb_tool.cfg` → move the files → teach `make deploy` about nesting →
+**Sequence if it is wanted:** remove `resources.py` → move the files
+(`pb_tool.cfg` is already deleted) → teach `make deploy` about nesting →
 manual QGIS smoke test on macOS *and* Windows (the same manual gate the
 ONNX migration used) → merge. Nothing in CI substitutes for that last
 step.

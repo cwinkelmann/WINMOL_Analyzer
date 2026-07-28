@@ -172,3 +172,12 @@ pytest-of-*/
 winmol_fixture_tiles_*/
 winmol_test_tiles_*/
 benchmark/out/
+
+# Local dev scratch, not shared. The canonical Dockerfile is tracked; these
+# machine-specific variants are stripped from the plugin zip anyway
+# (scripts/build_plugin_zip.sh). Built release archives and one-off helpers too.
+Dockerfile-*
+Dockerfile.*
+Dockerfile_*
+WINMOL_Analyzer-*.zip
+push_restack.sh

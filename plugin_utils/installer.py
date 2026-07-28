@@ -1424,6 +1424,17 @@ def resolve_environment(plugin_dir, prompt=True, build=True) -> dict:
     result = {"venv_path": venv_path, "python": None, "missing_models": []}
 
     byo = configured_python_executable()
+    if byo and path_is_inside(byo, venv_path) and not os.path.isfile(byo):
+        # A stale pointer at WINMOL's OWN managed venv whose folder was
+        # deleted by hand (Open folder + rm -rf). It is not a user-chosen
+        # interpreter, so do not honour it and do not surface a "Python 0.0"
+        # dead-end: ignore it and fall through to is_ready/build so the env
+        # can be rebuilt. The dialog rewrites the setting via _set_python once
+        # the new venv is ready; this module never writes QgsSettings itself
+        # (see QSETTINGS_PYTHON_KEY). A missing EXTERNAL interpreter is left to
+        # the error path below, since the user needs to know their configured
+        # path is bad.
+        byo = None
     if byo:
         ver = _python_version(byo)
         if not (MIN_PY <= ver <= MAX_PY):
