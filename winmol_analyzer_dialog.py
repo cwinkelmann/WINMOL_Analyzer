@@ -97,6 +97,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.python_exe = self.env.get("python")
         self.setup_thread = None
         self.setup_worker = None
+        self._setup_running = False
         self.models_dir = os.path.join(os.path.dirname(self.venv_path), "models")
         self.populate_model_combo_box()
         self.process_type = None
@@ -615,10 +616,21 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.output_log.clear()
 
         if self.env.get("status") == "needs_setup":
+            if self._setup_running:
+                self.update_output_log(
+                    "Environment setup is already running..."
+                )
+                return
             self.update_output_log(
                 "Setting up the WINMOL environment (first run only)..."
             )
+            self._setup_running = True
             self._run_env_setup()
+        elif self.env.get("status") == "error" or self.python_exe is None:
+            self.update_output_log(
+                self.env.get("message") or "WINMOL environment is not available."
+            )
+            return
         else:
             self._start_analysis(self.python_exe)
 
@@ -641,12 +653,14 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.setup_thread.start()
 
     def _on_env_setup_done(self, python_exe):
+        self._setup_running = False
         self.python_exe = python_exe
         self.env["status"] = "ready"
         self.update_output_log("WINMOL environment ready.")
         self._start_analysis(python_exe)
 
     def _on_env_setup_failed(self, message):
+        self._setup_running = False
         self.update_output_log(f"WINMOL environment setup failed: {message}")
 
     def _start_analysis(self, python_exe):
