@@ -437,21 +437,35 @@ def remove_duplicates(stems: List[Stem], stems0=None) -> List[Stem]:
         kept.append(stems0)
         return kept, count
 
+    # Spatial prefilter. The original compared every stem against every other
+    # remaining stem: on one 4096 px tile with 1567 stems that was ~1.2 MILLION
+    # GEOS `contains` calls, the single largest entry in the vector-stage
+    # profile. A stem can only be contained in a 0.3 m buffer whose bounding
+    # box encloses it, so querying an STRtree first leaves only genuine
+    # candidates -- O(n^2) becomes ~O(n log n) with an identical result.
+    #
+    # Stems are processed longest-first (sorted above) and `alive` marks those
+    # neither kept nor already absorbed, which reproduces the original
+    # pop-the-longest / drop-the-contained sequence exactly.
+    paths = [s.path for s in stems]
+    tree = STRtree(paths)
+    alive = [True] * len(stems)
     kept = []
-    while stems:
-        base = stems.pop(0)
+    for i, base in enumerate(stems):
+        if not alive[i]:
+            continue
+        alive[i] = False
+        kept.append(base)
         buffer_geom = base.path.buffer(0.3)
-        survivors = []
-        for s in stems:
+        for j in tree.query(buffer_geom):
+            if not alive[j]:
+                continue
             try:
-                if buffer_geom.contains(s.path):
+                if buffer_geom.contains(paths[j]):
+                    alive[j] = False
                     count += 1
-                    continue
             except Exception:
                 pass
-            survivors.append(s)
-        kept.append(base)
-        stems = survivors
     return kept, count
 
 
