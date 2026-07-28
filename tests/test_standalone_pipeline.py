@@ -28,7 +28,14 @@ SOURCE_ORTHO = Path(
     "/Users/christian/data/Winmol/Winmol Orthos/WINMOL_x_OeBF/Raster/proj/"
     "repr_20250327_171_4_Kraking_Windwurf_SELEKTION.tif"
 )
+# The pipeline runs .onnx via onnxruntime (the runtime is ONNX-only). The
+# Metal forward-pass check below needs a native Keras model, so it keeps the
+# legacy .hdf5 — it is a tensorflow-metal dev-env check, not a WINMOL runtime
+# path, and TF is present in the dev/test env for exactly the converter.
 MODEL_PATH = (
+    REPO_ROOT / "standalone" / "model_onnx" / "General.onnx"
+)
+KERAS_MODEL_PATH = (
     REPO_ROOT / "standalone" / "model"
     / "model_UNet_GenDS_512_2023-02-27_211141.hdf5"
 )
@@ -53,6 +60,13 @@ def model_path():
     if not MODEL_PATH.exists():
         pytest.skip(f"Model not found: {MODEL_PATH}")
     return str(MODEL_PATH)
+
+
+@pytest.fixture(scope="session")
+def keras_model_path():
+    if not KERAS_MODEL_PATH.exists():
+        pytest.skip(f"Keras model not found: {KERAS_MODEL_PATH}")
+    return str(KERAS_MODEL_PATH)
 
 
 @pytest.fixture(scope="session")
@@ -94,7 +108,7 @@ def cropped_ortho(tmp_path):
     return str(out)
 
 
-def test_model_forward_pass_runs_on_metal(metal_gpu, model_path):
+def test_model_forward_pass_runs_on_metal(metal_gpu, keras_model_path):
     """The U-Net loads and its forward pass executes on the Metal GPU.
 
     Loads through tf.keras directly: the TF-free ONNX migration removed the
@@ -103,7 +117,7 @@ def test_model_forward_pass_runs_on_metal(metal_gpu, model_path):
     The intent — a real forward pass on the Metal PluggableDevice — is
     unchanged; only the loader it reaches for.
     """
-    model = tf.keras.models.load_model(model_path, compile=False)
+    model = tf.keras.models.load_model(keras_model_path, compile=False)
     x = np.random.rand(1, 512, 512, 3).astype("float32")
     with tf.device("/GPU:0"):
         y = model(x, training=False)

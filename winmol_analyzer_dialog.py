@@ -2169,6 +2169,18 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         if exe:
             self._set_python(exe)
             self.update_output_log("Environment ready.")
+            # pip has no clean percentage, so the bar is only driven during the
+            # model-download phase and otherwise sits at 0 — leaving a finished
+            # setup looking un-started. Snap it to 100 on success so completion
+            # is unambiguous.
+            bar = getattr(self, "setup_progress_bar", None)
+            if bar is not None:
+                try:
+                    if bar.maximum() == 0:
+                        bar.setRange(0, 100)
+                    bar.setValue(100)
+                except Exception:              # pragma: no cover - GUI
+                    pass
         else:
             self.update_output_log(
                 "Environment setup finished but returned no interpreter.")
