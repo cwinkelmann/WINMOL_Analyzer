@@ -50,6 +50,7 @@ from classes.HardwareInfo import UNIFIED_MEMORY_GPU_SHARE, HardwareInfo
 from classes.Timer import Timer
 from plugin_utils import autotune_cache
 from utils import IO
+from utils.edge_fill import fill_invalid_with_nearest
 
 
 @contextlib.contextmanager
@@ -548,7 +549,8 @@ def _prediction_batch_candidates(
 
 class TileBatchProducer(threading.Thread):
     def __init__(self, uav_path, chunk_size, jobs, n_channels,
-                 out_queue, producer_id=0, out_size=None):
+                 out_queue, producer_id=0, out_size=None,
+                 fill_invalid=True):
         super().__init__(daemon=True)
         self.uav_path = uav_path
         self.chunk_size = max(1, int(chunk_size))
@@ -559,6 +561,7 @@ class TileBatchProducer(threading.Thread):
         # (H, W) to resample each tile to *during* the GDAL read (fast, in C,
         # can use overviews). None keeps the native-resolution read.
         self.out_size = tuple(out_size) if out_size else None
+        self.fill_invalid = bool(fill_invalid)
         self.error = None
 
     def run(self):
@@ -622,6 +625,9 @@ class TileBatchProducer(threading.Thread):
                         valid_mask = pixel_mask
                     else:
                         valid_mask = gdal_mask & pixel_mask
+
+                    if self.fill_invalid:
+                        tile = fill_invalid_with_nearest(tile, valid_mask)
 
                     batch_read_s += time.perf_counter() - t0
                     batch_items.append((job, tile, valid_mask))
@@ -1117,6 +1123,8 @@ def predict_stream_to_raster(
             # Resample tiles to the model grid during the read (fast, in C);
             # the consumer's _resize_batch then short-circuits to a no-op.
             out_size=(config.img_height, config.img_width),
+            fill_invalid=bool(getattr(
+                config, "fill_invalid_before_prediction", True)),
         )
         for idx in range(len(producer_job_lists))
     ]

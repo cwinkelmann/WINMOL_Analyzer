@@ -143,6 +143,12 @@ class Config(object):
     img_bit = 8
     n_channels = 3
     num_classes = 1
+    # Replace nodata / out-of-bounds pixels with the nearest valid pixel
+    # BEFORE inference, so the U-Net never sees a hard black boundary cliff
+    # and cannot bleed spurious stems onto valid edge pixels. Output is still
+    # masked afterwards. See
+    # docs/superpowers/specs/2026-07-28-segmentation-edge-fill-design.md.
+    fill_invalid_before_prediction = True
     overlap_pred = 8
 
     # binary stem-map prediction
