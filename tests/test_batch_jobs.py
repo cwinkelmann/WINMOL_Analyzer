@@ -141,8 +141,8 @@ def test_edge_buffer_default_reaches_merge_as_zero(monkeypatch, tmp_path):
     model_path = tmp_path / "model.onnx"
     model_path.write_text("")
 
-    monkeypatch.setattr(winmol_batch, "load_model_paths",
-                        lambda: {"General": str(model_path)})
+    monkeypatch.setattr(winmol_batch, "resolve_model_path",
+                        lambda name, model_dir: str(model_path))
     monkeypatch.setattr(winmol_batch, "list_orthomosaics",
                         lambda folder: ["/in/a.tif"])
     monkeypatch.setattr(winmol_batch, "process_orthos",

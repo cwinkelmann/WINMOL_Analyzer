@@ -1,14 +1,18 @@
 """Off-QGIS tests for plugin_utils.model_registry: schema-2 parsing,
 device->variant resolution, checksum-verified atomic downloads, and the
-v1-flat fallback. All against in-test fixtures — no network, no real
-config.json (that lands once Task 2 ships it).
+v1-flat fallback. Mostly in-test fixtures — no network — plus a section
+pinning the real, shipped config.json (schema-2, models-v1 release).
 """
 import hashlib
 import json
+import os
 
 import pytest
 
 from plugin_utils import model_registry as mr
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SHIPPED_CONFIG = os.path.join(REPO_ROOT, "config.json")
 
 FIXTURE_V2 = {
     "schema": 2,
@@ -231,3 +235,67 @@ def test_load_registry_v2_from_file(tmp_path):
 def test_load_registry_missing_file_raises(tmp_path):
     with pytest.raises(FileNotFoundError):
         mr.load_registry(str(tmp_path / "nope.json"))
+
+
+# --- real, shipped config.json (schema-2, pinned to the models-v1 release) -
+
+CLASSIC_FAMILIES = ("Spruce", "Beech", "Spruce_Deadwood", "General")
+
+
+def _shipped_registry():
+    return mr.load_registry(SHIPPED_CONFIG)
+
+
+def test_shipped_config_parses_as_schema_2():
+    reg = _shipped_registry()
+    assert reg.schema == 2
+    assert reg.entries
+
+
+def test_shipped_config_every_entry_has_sha256():
+    assert_all_pinned(_shipped_registry())
+
+
+def test_shipped_config_every_entry_has_a_downloadable_url():
+    reg = _shipped_registry()
+    bad = [e.id for e in reg.entries.values()
+           if not e.url or not e.url.lower().startswith("http")]
+    assert not bad, f"entries without an http(s) url: {bad}"
+
+
+def test_shipped_config_gui_default_resolves():
+    reg = _shipped_registry()
+    assert reg.gui_default is not None
+    assert reg.gui_default in reg.entries
+    assert reg.get(reg.gui_default).sha256
+
+
+def test_shipped_config_recommended_all_resolve():
+    reg = _shipped_registry()
+    assert reg.recommended, "expected a non-empty recommended list"
+    for mid in reg.recommended:
+        assert mid in reg.entries
+    # design decision: recommended[0] is the gui_default.
+    assert reg.recommended[0] == reg.gui_default
+
+
+def test_shipped_config_classic_family_names_present():
+    reg = _shipped_registry()
+    assert set(CLASSIC_FAMILIES) <= set(reg.families)
+
+
+@pytest.mark.parametrize("family", CLASSIC_FAMILIES)
+@pytest.mark.parametrize("device", ["cpu", "gpu", "coreml"])
+def test_shipped_config_classic_families_resolve_on_every_device(
+        family, device):
+    reg = _shipped_registry()
+    entry = reg.resolve(family, device=device)
+    assert entry.sha256
+    assert entry.url.lower().startswith("http")
+
+
+def test_shipped_config_default_entry_resolves_on_cpu():
+    reg = _shipped_registry()
+    entry = reg.default_entry(device="cpu")
+    assert entry.id == reg.gui_default
+    assert entry.sha256
