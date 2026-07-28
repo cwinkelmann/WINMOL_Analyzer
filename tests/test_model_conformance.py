@@ -86,6 +86,13 @@ def preds_dir(tmp_path_factory):
 def test_model_conformance(entry, tmp_path, preds_dir):
     if not MODELS:
         pytest.skip("no models manifest found")
+    if not entry["path"].lower().endswith(".onnx"):
+        # The runtime loads only .onnx now (the legacy Keras/.hdf5 path was
+        # removed). Convert with scripts/convert_models_to_onnx.py and add the
+        # resulting .onnx to the manifest to conformance-test it.
+        pytest.skip(
+            "runtime loads only .onnx; convert .hdf5/.keras with "
+            "scripts/convert_models_to_onnx.py")
     if not os.path.exists(entry["path"]):
         pytest.skip(f"model file missing: {entry['path']}")
 

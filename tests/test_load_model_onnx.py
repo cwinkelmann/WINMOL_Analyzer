@@ -5,8 +5,9 @@ Dispatch tests inject a fake segmenter so they run without onnxruntime. A
 separate real-inference test builds a tiny NHWC and NCHW ONNX model on the fly
 (onnxruntime required) to prove the segmenter is layout-aware and returns NHWC.
 
-The Keras (``.hdf5``) branch is exercised elsewhere and deliberately not
-imported here (it would pull in TensorFlow).
+The runtime is TensorFlow-free: a non-``.onnx`` model path (a legacy Keras
+``.hdf5``/``.h5``/``.keras``) is rejected with a RuntimeError that points at
+the HDF5->ONNX converter, without importing TensorFlow at all.
 """
 
 import sys
@@ -58,6 +59,24 @@ def test_onnx_without_onnxruntime_raises_helpful_error(monkeypatch):
     with pytest.raises(RuntimeError) as exc:
         IO.load_model_from_path("/models/deeplabv3plus.onnx")
     assert "onnxruntime" in str(exc.value).lower()
+
+
+@pytest.mark.parametrize(
+    "model_path",
+    ["/models/legacy.hdf5", "/models/legacy.h5", "/models/legacy.keras",
+     "/models/LEGACY.HDF5"])
+def test_non_onnx_model_raises_converter_naming_error(model_path):
+    """The runtime is TensorFlow-free: a legacy Keras model must fail fast
+    with a clear message pointing at the HDF5->ONNX converter, and it must
+    NOT import TensorFlow to do so (no TF needed to run this test)."""
+    tf_loaded_before = "tensorflow" in sys.modules
+    with pytest.raises(RuntimeError) as exc:
+        IO.load_model_from_path(model_path)
+    msg = str(exc.value)
+    assert "scripts/convert_models_to_onnx.py" in msg
+    assert ".onnx" in msg
+    # The rejection is a pure string check -- the call imports no TensorFlow.
+    assert ("tensorflow" in sys.modules) == tf_loaded_before
 
 
 # --- vendored segmenter: real inference, layout-aware ----------------------

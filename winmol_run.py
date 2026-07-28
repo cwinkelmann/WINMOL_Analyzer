@@ -34,28 +34,6 @@ from utils.Tiling import build_tile_grid, meters_to_pixels
 VALID_PROCESS_TYPES = {'Stems', 'Trees', 'Nodes'}
 
 
-def _import_tensorflow():
-    """Return the tensorflow module, or None when it isn't installed.
-
-    Models are ONNX (onnxruntime manages its own devices); TensorFlow is only
-    present in dev environments that still load legacy .hdf5 models. All TF
-    configuration below is therefore best-effort and skipped when TF is absent.
-    """
-    try:
-        import tensorflow as tf
-        return tf
-    except Exception:
-        return None
-
-
-LEGACY_KERAS_SUFFIXES = ('.hdf5', '.h5', '.keras')
-
-
-def _is_legacy_keras_model(model_path) -> bool:
-    """True for the standalone/legacy Keras models TensorFlow still loads."""
-    return str(model_path or '').lower().endswith(LEGACY_KERAS_SUFFIXES)
-
-
 def _nvidia_driver_version():
     """The installed NVIDIA driver version, or None when there is no NVIDIA
     GPU. Absence is the normal case on macOS and CPU boxes, not an error."""
@@ -73,29 +51,7 @@ def _nvidia_driver_version():
     return first[0].strip() if first else None
 
 
-def _configure_tensorflow_runtime(model_path=None):
-    """TensorFlow device setup — only relevant for legacy Keras models.
-
-    ONNX models are run by onnxruntime, which manages its own devices, so this
-    is a silent no-op on the normal path.
-    """
-    if not _is_legacy_keras_model(model_path):
-        return None
-    tf = _import_tensorflow()
-    if tf is None:
-        return None
-    gpus = tf.config.list_physical_devices('GPU')
-    if gpus:
-        try:
-            for gpu in gpus:
-                tf.config.experimental.set_memory_growth(gpu, True)
-            print(f"Enabled memory growth for {len(gpus)} TensorFlow GPU(s).")
-        except RuntimeError as e:
-            print(f"Memory growth setup failed: {e}")
-    return tf
-
-
-def _force_cpu_only(model_path=None):
+def _force_cpu_only():
     """Pin inference to the CPU for ``prediction_backend='cpu'``.
 
     onnxruntime reads WINMOL_ONNX_FORCE_CPU when the session is created, so
@@ -105,17 +61,6 @@ def _force_cpu_only(model_path=None):
     """
     os.environ['WINMOL_ONNX_FORCE_CPU'] = '1'
     print('Pinned inference to the CPU (WINMOL_ONNX_FORCE_CPU=1).')
-    if not _is_legacy_keras_model(model_path):
-        return None
-    tf = _import_tensorflow()
-    if tf is None:
-        return None
-    try:
-        tf.config.set_visible_devices([], 'GPU')
-        print("Configured TensorFlow for CPU-only prediction.")
-    except RuntimeError as exc:
-        print(f"CPU-only TensorFlow setup failed: {exc}")
-    return tf
 
 
 class ImageProcessing:
@@ -291,7 +236,7 @@ class ImageProcessing:
         if plan.prediction_mode == 'cpu_stream':
             # Before the model is loaded: the provider list is fixed when the
             # onnxruntime session is created.
-            _force_cpu_only(self.model_path)
+            _force_cpu_only()
 
         print("\nLoading Model...")
         model = IO.load_model_from_path(self.model_path)
@@ -479,17 +424,6 @@ class ImageProcessing:
         if driver:
             print(f"  NVIDIA driver: {driver}")
 
-        # TensorFlow matters only for the legacy .hdf5/.keras models the
-        # standalone path can still load. Never report its absence as a fault.
-        if _is_legacy_keras_model(self.model_path):
-            tf = _import_tensorflow()
-            if tf is not None:
-                print("  Legacy Keras model path: TensorFlow "
-                      f"{tf.__version__}")
-            else:
-                print("  Legacy Keras model requested but TensorFlow is not "
-                      "installed.")
-
     def display_starting_text(self, plan=None):
         if plan is not None and plan.prediction_mode == 'multi_gpu_stream':
             print(
@@ -542,13 +476,6 @@ if __name__ == '__main__':
         model_path, uav_path, stem_path, trees_path, process_type)
     hardware = image_processor.detect_hardware()
     plan = image_processor.build_plan(hardware)
-    if plan.prediction_mode == 'multi_gpu_stream' and plan.gpu_workers > 1:
-        print(
-            "Skipping parent runtime configuration "
-            "for worker-local multi-GPU mode."
-        )
-    else:
-        _configure_tensorflow_runtime(model_path)
     image_processor.display_starting_text(plan)
     if process_type == 'Stems':
         image_processor.run_stem_pipeline(plan)

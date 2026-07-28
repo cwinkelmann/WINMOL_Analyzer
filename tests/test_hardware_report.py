@@ -356,7 +356,6 @@ def test_banner_has_no_tensorflow_or_cuda_noise(monkeypatch, capsys):
 
     fake_platform(monkeypatch, "Darwin", "arm64")
     fake_providers(monkeypatch, COREML_PROVIDERS)
-    monkeypatch.setattr(winmol_run, "_import_tensorflow", lambda: None)
     monkeypatch.setattr(winmol_run, "_nvidia_driver_version", lambda: None)
 
     _image_processor().report_runtime_env()
@@ -370,33 +369,12 @@ def test_banner_has_no_tensorflow_or_cuda_noise(monkeypatch, capsys):
     assert "Apple Silicon GPU (Metal/CoreML)" in out
 
 
-def test_banner_mentions_tensorflow_only_for_a_legacy_keras_model(
-        monkeypatch, capsys):
-    import winmol_run
-
-    class FakeTF:
-        __version__ = "2.16.2"
-
-    fake_platform(monkeypatch, "Linux")
-    fake_providers(monkeypatch, CPU_ONLY_PROVIDERS)
-    monkeypatch.setattr(winmol_run, "_import_tensorflow", lambda: FakeTF())
-    monkeypatch.setattr(winmol_run, "_nvidia_driver_version", lambda: None)
-
-    _image_processor("model.onnx").report_runtime_env()
-    assert "TensorFlow" not in capsys.readouterr().out
-
-    _image_processor("legacy.hdf5").report_runtime_env()
-    out = capsys.readouterr().out
-    assert "TensorFlow 2.16.2" in out
-
-
 def test_banner_reports_the_nvidia_driver_only_when_present(
         monkeypatch, capsys):
     import winmol_run
 
     fake_platform(monkeypatch, "Linux")
     fake_providers(monkeypatch, CUDA_PROVIDERS)
-    monkeypatch.setattr(winmol_run, "_import_tensorflow", lambda: None)
     monkeypatch.setattr(winmol_run, "_nvidia_driver_version", lambda: "550.54")
 
     _image_processor().report_runtime_env()

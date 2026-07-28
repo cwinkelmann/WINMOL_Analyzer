@@ -24,7 +24,7 @@ PLUGINNAME=WINMOL_Analyzer
 # imports anything under them.
 EXCLUDE=(
   .github .gitignore .gitattributes CLAUDE.md
-  Makefile pb_tool.cfg setup.cfg
+  Makefile setup.cfg
   docker startDocker.sh scripts
   tests benchmark
   docs documentation standalone

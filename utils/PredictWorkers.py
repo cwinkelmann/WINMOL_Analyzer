@@ -47,15 +47,9 @@ def _raw_tile_to_batchable(tile_img):
 def _prepare_inference_batch(raw_tiles, raw_masks, config):
     """Delegate to the migrated implementation in utils.Prediction.
 
-    This module carried its own copy that still used `tf.image.resize`, so the
-    MULTI-GPU path never left TensorFlow behind when the rest of the repo moved
-    to ONNX. It only surfaces with more than one GPU, which is why a
-    single-GPU machine never hit it:
-
-        File "utils/PredictWorkers.py", line 230, in prediction_worker
-          import tensorflow as tf
-        ModuleNotFoundError: No module named 'tensorflow'
-
+    This module once carried its own copy of the batch-prep resize, so the
+    MULTI-GPU path could diverge from the single-GPU one (it only surfaces with
+    more than one GPU, which is why a single-GPU machine never hit it).
     Delegating rather than porting the code a second time keeps the single-GPU
     and multi-GPU paths bit-identical by construction — the golden fixtures pin
     the Prediction version, and a divergent copy here could drift from them
@@ -221,10 +215,6 @@ def prediction_worker(
     # so the device is selected before any provider is created.
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
     from utils.IO import load_model_from_path
-    # There used to be a `import tensorflow` + set_memory_growth block here.
-    # It configured TENSORFLOW's allocator, which does nothing now that
-    # inference runs through onnxruntime -- and it made TensorFlow a hard
-    # runtime requirement of the multi-GPU path alone.
 
     cfg = _config_from_dict(config_dict)
     model = load_model_from_path(model_path)
@@ -262,10 +252,6 @@ def prediction_service_worker(
     # so the device is selected before any provider is created.
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
     from utils.IO import load_model_from_path
-    # There used to be a `import tensorflow` + set_memory_growth block here.
-    # It configured TENSORFLOW's allocator, which does nothing now that
-    # inference runs through onnxruntime -- and it made TensorFlow a hard
-    # runtime requirement of the multi-GPU path alone.
 
     cfg = _config_from_dict(config_dict)
     model = load_model_from_path(model_path)

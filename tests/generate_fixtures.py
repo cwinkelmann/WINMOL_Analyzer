@@ -234,7 +234,6 @@ def predict_crop(crop_path, model, config, stem_map_path):
 # ---------------------------------------------------------------------------
 
 def run_vector_chain(stem_map_path, snapshot):
-    from utils import IO  # noqa: F401  (env parity with the real pipeline)
     from utils import Quantification as Quant
     from utils import Skeletonization as Skel
     from utils import Vectorization as Vec

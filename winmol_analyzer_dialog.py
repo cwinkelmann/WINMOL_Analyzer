@@ -265,6 +265,9 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         # Controls that aren't in the .ui: the variant selector and a
         # QGIS layer selector for the input raster.
         self._add_custom_controls()
+        # The detection bar is hidden until a detection actually runs, so it
+        # never doubles up with the Setup tab's own progress bar on first open.
+        self._show_run_progress(False)
         self._setup_live = True
         self._refresh_setup_state()
         # First open lands on whichever tab matches the state of the
@@ -1504,12 +1507,14 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             # starting, so a second click can't reassign self.thread (abort) or
             # start a competing env build.
             self._run_active = True
+            self._show_run_progress(True)
             self._set_busy_ui(True)
             self._set_status(RUN_STATUS)
             self.thread.start()
         # catch out of memory error
         except MemoryError:
             self._run_active = False
+            self._show_run_progress(False)
             try:
                 self.run_button.setEnabled(True)
             except Exception:
@@ -1539,6 +1544,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         so the next run can safely build a fresh thread, and re-enable the UI.
         Offers Export if the run produced outputs on disk."""
         self._run_active = False
+        self._show_run_progress(False)
         # One repaint decides what comes back: the interlock knows about
         # an env job or a download still in flight, which the old
         # hand-rolled tuple did not.
@@ -2067,6 +2073,10 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         """
         self._status_prefix = ""
         self._setup_t0 = time.monotonic()
+        # Where the bar lands when this activity ends. _end_setup_activity runs
+        # last (on thread.finished) and would otherwise force 0, clobbering a
+        # completed setup back to "un-started". Success slots raise this to 100.
+        self._setup_final_pct = 0
         self.update_output_log(banner)
         self._append_setup_detail(banner)
         self._set_status(banner)
@@ -2093,7 +2103,10 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         if bar is not None:
             try:
                 bar.setRange(0, 100)
-                bar.setValue(0)
+                # Honour the terminal slot's verdict: 100 on success, 0 on
+                # failure/cancel. Forcing 0 here made a completed setup read
+                # as "stuck at 0%".
+                bar.setValue(getattr(self, "_setup_final_pct", 0))
             except Exception:                      # pragma: no cover - GUI
                 pass
         # A setup job finishing during a detection must not claim the
@@ -2147,6 +2160,11 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             if bar.maximum() == 0:
                 bar.setRange(0, 100)
             bar.setValue(int(percent))
+            # A download that reaches 100% should stay there when
+            # _end_setup_activity applies the final value on thread.finished;
+            # otherwise a completed download also snaps back to 0.
+            if int(percent) >= 100:
+                self._setup_final_pct = 100
         except Exception:                          # pragma: no cover - GUI
             pass
 
@@ -2169,6 +2187,11 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         if exe:
             self._set_python(exe)
             self.update_output_log("Environment ready.")
+            # Land the bar at 100% when _end_setup_activity applies the final
+            # value on thread.finished (pip emits no usable percentage, so the
+            # bar is a barber-pole during the build and this is the only place
+            # completion becomes unambiguous).
+            self._setup_final_pct = 100
         else:
             self.update_output_log(
                 "Environment setup finished but returned no interpreter.")
@@ -2298,6 +2321,25 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             f"{kind} job.")
         self._refuse_while_busy()
         return False
+
+    def _show_run_progress(self, on):
+        """Show the detection progress bar ONLY while a detection runs.
+
+        It lives in the persistent row below the tabs, so it is visible on
+        the Setup tab too — a confusing SECOND bar next to the Setup tab's
+        own bar during an environment build. Tied to the detection run (not
+        _set_busy_ui, which also fires for setup jobs) so setup never shows
+        it.
+        """
+        bar = getattr(self, "progress_bar", None)
+        if bar is None:
+            return
+        try:
+            if on:
+                bar.setValue(0)
+            bar.setVisible(bool(on))
+        except Exception:                          # pragma: no cover - GUI
+            pass
 
     def _set_busy_ui(self, busy):
         """Hard-disable Run and every Setup control before a job starts.

@@ -50,4 +50,12 @@ jobs:
         with:
           artifacts: ${{ steps.package.outputs.artifacts }}
           allowUpdates: true
+          # Any hyphen-suffixed tag is a pre-release (semver: everything after
+          # the '-' is a pre-release identifier), e.g. v0.6.1-rc10. Without
+          # this the action defaults prerelease=false, so every rc grabbed the
+          # public "Latest" pointer — the download button in index.html reads
+          # releases/latest/download — until it was flipped back by hand. Final
+          # tags (v0.6.1, v0.6.0.2) have no hyphen, stay prerelease=false, and
+          # become Latest as intended.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           token: ${{ secrets.GITHUB_TOKEN }}

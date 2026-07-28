@@ -3,6 +3,10 @@
 ### env
 the env setup isn't working, I want to install the plugin, then when opening the plugin I want menu where I can select an environment on disk (venv, or conda) or let one create
 
+
+#### installation of venv progress bar.
+The progressbar should end up with 100% when the venv setup is complete. Currently it states 0% so it is unclear the setup is finished. 
+
 ✅ FIXED — in-dialog "Environment…" picker (Choose interpreter… / Create for me),
 now also a **permanent Environment… button** in a top bar showing the active
 interpreter. Applies live via QgsSettings, no QGIS restart.
@@ -40,6 +44,10 @@ Analysis failed (exit code 1). See the log above for details."
 The installer now requires 3.10+ and rejects the macOS system 3.9. Confirmed:
 the next run came up under the conda Python 3.11 env instead.
 
+
+### Segmentation failure. 
+With the barnekow tiff at the top of the image, the segmentation artifacts are created.
+In a previous version quite huge area was left out when segmenting. which removed quite a lot of trees. Can this be fixed by adding a boarrder to the orthomosaic?  
 
 ## Bug
 Starting the process...
@@ -724,3 +732,234 @@ asset and not a single checksum changed (identical bytes, renamed files).
 basename(url) and that every digest matches the published sums, plus an
 anonymous-reachability test over every URL, opt-in via `WINMOL_NET_TESTS=1`
 so CI stays offline. Verified 26/26 reachable without auth.
+
+
+### GUI bugs
+But I have some bugs to report first. The progress bar at inferences reaches 78% before the first inference happens. I want to have 0% at "Loading Model"     
+  Then there is too verbose output like "MERGE DISCOVERY | root /Users/christian/Library/Application Support/QGIS/QGIS3/profiles/default/winmol/tmp/winmol_tiles_qq6zt6ri | gpkg_files 3
+MERGE INPUT | /Users/christian/Library/Application Support/QGIS/QGIS3/profiles/default/winmol/tmp/winmol_tiles_qq6zt6ri/raster_r00000_c00000.gpkg
+MERGE INPUT | /Users/christian/Library/Application Support/QGIS/QGIS3/profiles/default/winmol/tmp/winmol_tiles_qq6zt6ri/raster_r00000_c00001.gpkg" I dont want to see that in the normal model but allow a verbose debug mode. At the beginning the output is fine. But         
+  "Hardware detected: CPUs=8, RAM=24.0 GB, GPUs=0" on a mac is wrong, it should be 8 cpu core and a reference that we are talking about apple metal when the GPU check happens.                  
+  When an autotune never happened before it should be run. The tensforflow error seems obsolete.
+
+
+### The GUI window is too high/has not scroll bar
+Currently I can press run because it is just outside my screen. I would suggest to make the window smaller and add a scroll bar if necessary.
+
+
+
+### Button positions
+Run should be at the top
+Export at the bottom.
+The tab setup at most left
+
+
+## Code Review - fix later
+
+> **Triage 2026-07-28** (branch `fix/review-findings`). All 11 items below were
+> re-investigated against the current code. Outcome: **7 already resolved** by
+> the rc round, **2 not-a-bug / by-design**, **1 cleanup done here**
+> (messy-root, tier a), and **1 real bug fixed here** (reinstall after a manual
+> env delete). Each item is annotated with its verdict inline.
+
+### Functions in Winmol_batch
+In winmol_batch are many model helpers which seem to be off. Those should checked if they are necessary. I would suggest to move them to a helper class or remove them if they are not used.
+There is a tensorflow function remaining despite tensorflow is not used anymore. I would suggest to remove it.
+
+> _**Resolved.** The heavy model-resolution logic was extracted to
+> `plugin_utils/model_registry.py`; every function left in `winmol_batch.py`
+> is reached and tested (`tests/test_batch_jobs.py`). There is no TensorFlow
+> function in the file (there never was) — the only repo TF import is the
+> dev-only `scripts/convert_models_to_onnx.py`, sanctioned by CLAUDE.md._
+
+
+### Messy Project Root
+metadata.txt, pb_tool.cfg, resources.qrc, resurces.py, tasks_threads.py, winmol_analyzer_dialog_base.ui etc. look they don't belong in there.
+
+> _**Partly addressed here (tier a).** Full per-file audit in
+> `docs/root-layout.md`: 4 of the 6 named files are load-bearing
+> (`metadata.txt`, `tasks_threads.py`, `winmol_analyzer_dialog_base.ui` are
+> required flat by QGIS; `resources.py` is dead but hard-required by the
+> release packaging script). Done in this PR: `pb_tool.cfg` deleted (nothing
+> ran pb_tool), and the untracked Dockerfile variants / release zips /
+> `push_restack.sh` are gitignored. Deferred (own reviewed commit): removing
+> the dead `resources.py`/`resources.qrc`, and the risky `qgis_plugin/`
+> subpackage reorg (no CI loads QGIS)._
+
+
+### is mps used?
+CUrrently I am running this:
+Loading Model...
+Loading ONNX model via OnnxSegmenter: /Users/christian/Library/Application Support/QGIS/QGIS3/profiles/default/python/plugins/WINMOL_Analyzer/models/model_UNet_SpecDS_Spruce_Deadwood_512_2024-12-19_194758_fp16.onnx
+
+Performing Prediction with Resampling in stream mode...
+#######################################################
+Prediction of the semantic stem map
+Resampling tiles while analyzing (stream mode)
+Written tile 1/182 | 0.5% | 4.5 tiles/min | ETA 40m 02s | avg read 2.314s prep 0.013s infer 10.897s write 0.006s | batch 1 | queue 75% full | producers 1 | src 727x727 -> out 504x504
+Written tile 7/182 | 3.8% | 6.9 tiles/min | ETA 25m 28s | avg read 0.864s prep 0.014s infer 8.378s write 0.001s | batch 1 | queue 100% full | producers 1 | src 727x727 -> out 504x504
+Written tile 15/182 | 8.2% | 8.4 tiles/min | ETA 19m 59s | avg read 0.403s prep 0.011s infer 7.012s write 0.001s | batch 1 | queue 100% full | producers 1 | src 727x727 -> out 504x504
+Written tile 24/182 | 13.2% | 9.4 tiles/min | ETA 16m 49s | avg read 0.401s prep 0.010s infer 6.275s write 0.001s | batch 1 | queue 100% full | producers 1 | src 727x727 -> out 504x504
+Written tile 34/182 | 18.7% | 10.0 tiles/min | ETA 14m 47s | avg read 0.388s prep 0.
+It seems very slow. With previous bug fixes it should be clear that Apple MPS is used, or CUDA if not taht shoudl be fixed now.
+
+> _**Resolved.** On Apple Silicon the runtime now selects CoreML and
+> *verifies* the bound provider, surfacing a silent CPU fallback rather than
+> hiding it (`utils/onnx_runtime.py` `_default_providers`/`_verify_providers`).
+> The slow log above is the **fp16** model: on CoreML fp16 is ~14.6× slower
+> than fp32, so the Apple device default was switched fp16→fp32
+> (`plugin_utils/model_registry.py::_device_variant`, cpu→int8 / gpu→fp16 /
+> coreml→fp32). Op-level proof of what ran on Metal/ANE is available via
+> `WINMOL_ONNX_PROFILE=1`. (Separately: a CUDA→CPU provider demotion on a
+> mis-matched driver is the true cause of the "zero GPU usage" reports; it is
+> detected by `verify_session_providers` and is an environment issue, not an
+> autotune one.)_
+
+### plugin released twice
+There are two on github
+WINMOL_Analyzer-0.6.1-rc1.zip
+sha256:1404190fe3ed315e096d1f9cb9d773fa8ef12b103773b77e7e058fb222c9184e
+1
+1.84 MB
+2 hours ago
+WINMOL_Analyzer_QGIS_Plugin.zip
+sha256:1404190fe3ed315e096d1f9cb9d773fa8ef12b103773b77e7e058fb222c9184e
+1.84 MB
+2 hours ago
+
+> _**Not a bug — by design.** One archive is built and `cp`'d to a stable
+> alias: `WINMOL_Analyzer-<version>.zip` (identifiable on disk) and
+> `WINMOL_Analyzer_QGIS_Plugin.zip` (the fixed name the `releases/latest/
+> download/` permalinks in `documentation/index.html` require). Identical
+> sha256 is the expected consequence of the same bytes under two names. See
+> the comment in `.github/workflows/on-push-tags.yml` and CLAUDE.md._
+
+
+### The Autotune is a bit pointless
+It gets slower and slower
+Prediction micro-batch autotune candidate 1/13: b4 = 0.340s/tile
+Prediction micro-batch autotune candidate 2/13: b5 = 0.337s/tile
+Prediction micro-batch autotune candidate 3/13: b6 = 0.330s/tile
+Prediction micro-batch autotune candidate 4/13: b7 = 0.471s/tile
+Prediction micro-batch autotune candidate 5/13: b8 = 0.561s/tile
+But it is not stopping.
+Prediction micro-batch autotune candidate 6/13: b9 = 1.135s/tile
+
+It would be much quicker to just check for GPU memory usage and set the batch size accordingly. The autotune is a bit pointless and takes a lot of time. It should be possible to set the batch size manually in the GUI.
+I tested it on GPU T14 with the RTX 4080. It starts with a batch size of 1. GPU usage up till 5 seems to be zero. There is some CPU usage, but it is way too slow. 
+
+You need to set 
+
+#### Autotune on GPU Linux lead to crash
+THe Autotune started very slow with zero GPU usage and about 5s per tile, after a while it crashed my full machine. So There is quite some optimization potential in the autotune. It should be possible to set the batch size manually in the GUI.
+
+#### Autotue on CPU
+is surprisingly fast per tile. But the overall speed is terrible. CPU usage during that is just 40% on 4 Core CPU. at b6 performance got worse.
+
+> _**Resolved.** The sweep was rebuilt (`utils/Prediction.py`): a dual
+> improvement bar (relative + absolute s/tile) stops chasing jitter, a
+> degradation guard (`degrade_factor=1.25`) aborts as soon as a candidate is
+> ≥1.25× the best — so the report's `b7=1.43×` now halts there or earlier via
+> patience (lowered 4→2), the candidate cap is 13→6, and a pre-emptive
+> free-memory ceiling (bounded by host RAM when a CUDA run silently lands on
+> the CPU EP) prevents the host-RAM exhaustion that crashed the machine.
+> Manual control exists end-to-end: the GUI "Prediction batch size" spinbox →
+> `WINMOL_CONFIG_OVERRIDES_JSON` → `Config.prediction_batch_override` skips the
+> sweep entirely, plus a "Clear autotune cache" button. Default is now
+> `"auto"` (tune once per hardware/model/EP/tile, then persist)._
+
+### Download recommended models
+On a old CPU only windows machine it seems to work BUT downloading a 124MB spruce model cannot be the recommended one. Since we know the int8 one performaned nearly as good, that should be the recommended one. The download of the int8 model is much quicker and it should be the default one in these CPU only cases.
+
+> _**Resolved.** A CPU-only machine is now recommended and offered the 31.4 MB
+> **int8** build, not the 124.6 MB fp32 one. The declared default is int8
+> (`config.json` `gui_default="Spruce_Deadwood_int8"`), and the device-variant
+> resolver maps cpu→int8. Pinned by a regression test against the shipped
+> config: `tests/test_model_status.py::test_a_cpu_only_machine_is_recommended_the_int8_build`._
+
+
+### Logs are unclear
+The logs are ambiguous. For inference it says how quick the inference is 
+
+Written tile 156/182 | 85.7% | 153.7 tiles/min | ETA 00m 10s | avg read 0.056s prep 0.004s infer 0.382s write 0.000s | batch 6 | queue 75% full | producers 2 | src 727x727 -> out 504x504
+
+
+Vector tiles 3/3 | 100.0% | 4.7 tiles/min | ETA 0s | wrote 3 | empty 0 | no_output 0 | avg total 12.707s quant 1.008s connect 2.854s
+
+It should be clear the vector tiles are much larger.
+
+> _**Resolved.** Each phase now prints a header naming its unit and tile size
+> (`PREDICTION PHASE | … src WxH -> out WxH` / `VECTOR PHASE | … ~PxP px each`)
+> and every counter line carries a unit label + pixel dims (`… | prediction
+> tile | …` vs `… | vector tile ~4144x4144 px | …`). The `run_progress.py`
+> parser prefixes are preserved (new labels sit after the first `|`), guarded
+> by `tests/test_run_progress.py`._
+
+### uninstalling the plugin does not remove the folder
+'/Users/christian/Library/Application Support/QGIS/QGIS3/profiles/default/winmol' stays untouched after deinstalling. 
+Does it even make sense the installation is there? I would suggest to remove it on uninstall. If the user wants to keep it, he can copy it to another location before uninstalling.
+
+> _**Resolved — leave-and-warn is deliberate.** QGIS has no uninstall hook:
+> `uninstallPlugin` is `unloadPlugin()` + `removeDir(plugin_dir)`, and
+> `unload()` is the SAME callback QGIS fires on disable, reload and app quit —
+> so deleting the ~1–2 GB venv there would erase it on every QGIS close (locked
+> out by `tests/test_dialog_lint.py::test_unload_never_deletes_the_environment`).
+> Instead the env sits beside the plugin under `<profile>/winmol` so uninstall
+> can't reach it, the Setup tab warns that uninstall leaves it, and an explicit
+> itemised "Delete environment…" flow removes it on demand. See `docs/SETUP.md`._
+
+
+### Delete environment doesen't exist
+in the plugin I can't delete the environemt, but with open Folder, I did it manually.
+Reinstalling the plugin didn't work on the GPU machine.
+
+> _**Fixed here.** The "Delete environment…" action itself already exists
+> (Setup tab, thread-safe, itemised). The real residual — and the cause of
+> "Reinstalling … didn't work" after the manual `rm -rf` — was that the saved
+> `winmol/python_executable` setting still pointed at the deleted managed venv,
+> so `resolve_environment` returned a dead-end "Python 0.0" error instead of
+> rebuilding. Fix: `resolve_environment` no longer honours a configured
+> interpreter that lives inside the managed venv but no longer exists on disk —
+> it ignores it and falls through to rebuild (the dialog rewrites the key on
+> success). A genuine missing EXTERNAL interpreter still errors. Covered by
+> `tests/test_plugin_installer.py::test_resolve_environment_ignores_stale_managed_interpreter`
+> (+ the external-boundary test)._
+
+### final Plugin testing
+Windows CPU old X1 - fine with int8 model
+
+Windows CPU new (T14)
+Windows GPU RTX4080 new (T14)
+
+MacOS MPS M2 - works fine
+
+Linux CPU new (T14) - 
+Linux GPU RTX4080 new (T14) - works fine
+
+Linux GPU Blackwell H100 ( carrot )
+Linux GPU A100 ( olive )
+
+### remove the tensorflow dependency
+there are still tensorflow junk files, at least 3 requirements files. I would suggest to remove them and make sure the plugin is tensorflow free. Only for the conversion it is fine.
+
+> _**Resolved.** Requirements are the canonical 7 files; TensorFlow is isolated
+> to `requirements/convert.txt` (self-declared as the only TF file). The runtime
+> and plugin path are provably TF-free, enforced by
+> `tests/test_plugin_compute_contract.py` (runs `winmol_run.py` with TF imports
+> blocked) and `tests/test_load_model_onnx.py`. No `.hdf5/.h5/.keras` or stray
+> `requirements.txt` is tracked._
+
+
+### Installation location
+In linux there is a problem with the installation location. The plugin is installed in ....QGIS/QGIS3/profiles/default/python/plugins/Winmol_Analyzer.
+But I found the plugin to be installed in profiles/default/winmol
+
+> _**Not a bug — by design.** Two directories exist on purpose: the plugin CODE
+> (and re-downloadable models) live in `…/python/plugins/WINMOL_Analyzer`, while
+> the plugin's self-built environment (venv, downloaded py311, autotune cache,
+> tmp) lives in a SEPARATE `<profile>/winmol` so QGIS's recursive uninstall of
+> the plugin dir never chokes on thousands of venv files — this split was itself
+> the fix for an earlier uninstall-failure bug. Documented in `docs/SETUP.md`
+> ("Where the plugin's environment lives", incl. the Linux path)._
+
+

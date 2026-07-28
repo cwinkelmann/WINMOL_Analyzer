@@ -112,3 +112,36 @@ def test_resolve_environment_rejects_too_old_byo(tmp_path, monkeypatch):
     res = inst.resolve_environment(str(tmp_path))
     assert res["status"] == "error"
     assert "3.9" in res["message"]
+
+
+def test_resolve_environment_ignores_stale_managed_interpreter(
+        tmp_path, monkeypatch):
+    # The user deleted the managed venv folder by hand (Open folder + rm -rf)
+    # but the QgsSettings key still points at <venv>/bin/python, which no
+    # longer exists. That must NOT dead-end as a "Python 0.0" error: it is
+    # WINMOL's own vanished interpreter, so ignore it and fall through so the
+    # env can be rebuilt. Regression for docs/BUGS.md "Reinstalling the plugin
+    # didn't work on the GPU machine" after a manual delete.
+    venv = inst.venv_location(str(tmp_path))
+    stale_exe = inst.get_venv_python_path(venv)   # inside the venv, absent
+    assert not os.path.isfile(stale_exe)
+    monkeypatch.setattr(inst, "configured_python_executable",
+                        lambda: stale_exe)
+    res = inst.resolve_environment(str(tmp_path), prompt=True, build=False)
+    assert res["status"] == "needs_setup"
+    assert res["python"] is None
+
+
+def test_resolve_environment_still_errors_on_missing_external_byo(
+        tmp_path, monkeypatch):
+    # A genuine BYO interpreter the user chose that is now gone is NOT our
+    # managed venv, so keep the clear error rather than silently swallowing it
+    # -- the boundary that keeps the stale-managed fix from over-reaching.
+    external = os.path.join(os.sep, "opt", "gone", "bin", "python")
+    assert not inst.path_is_inside(external, inst.venv_location(str(tmp_path)))
+    monkeypatch.setattr(inst, "configured_python_executable",
+                        lambda: external)
+    monkeypatch.setattr(inst, "_python_version", lambda e: (0, 0))
+    res = inst.resolve_environment(str(tmp_path), prompt=True, build=False)
+    assert res["status"] == "error"
+    assert "0.0" in res["message"]

@@ -23,6 +23,13 @@ ADD --checksum=sha256:7314266214015f692f687f5f209e46ebbc9e94fce6d7c9ff0c3db49e44
 COPY requirements/convert.txt /tmp/convert.txt
 RUN pip install --no-cache-dir -r /tmp/convert.txt
 COPY scripts/ /src/scripts/
+# convert_models_to_onnx.py sources the HDF5->key map from the model registry
+# (plugin_utils.model_registry.load_registry(config.json)), so both must be in
+# the build context — omitting them fails with ModuleNotFoundError: plugin_utils.
+# plugin_utils/__init__.py is empty and model_registry is pure stdlib, so this
+# pulls no Qt/heavy deps into the TF-only convert stage.
+COPY plugin_utils/ /src/plugin_utils/
+COPY config.json /src/config.json
 # Convert General only (the fixture model). Parity is verified locally; this
 # build stage has no fixture, so convert without the parity assertion.
 ENV TF_USE_LEGACY_KERAS=1 TF_CPP_MIN_LOG_LEVEL=3
