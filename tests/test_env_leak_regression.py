@@ -114,9 +114,12 @@ def test_child_env_strips_qgis_from_path_on_windows(monkeypatch):
     assert r"C:\Windows" in entries
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="off-Windows no-op; the win32 path is covered by the "
+           "sanitize-on-windows regression test above")
 def test_child_env_does_not_touch_path_off_windows(monkeypatch):
     """No-op on this macOS/Linux host: PATH comes back verbatim."""
-    assert sys.platform != "win32"
     monkeypatch.setenv("PATH", "/usr/bin:/bin:/opt/qgis/bin")
     monkeypatch.setenv("OSGEO4W_ROOT", "/opt/osgeo4w")
     assert child_env()["PATH"] == "/usr/bin:/bin:/opt/qgis/bin"
