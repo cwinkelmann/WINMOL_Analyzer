@@ -11,6 +11,7 @@ from rasterio.windows import Window
 
 from classes.Config import Config
 from utils import IO
+from utils.Prediction import _prepare_inference_batch
 
 
 def _config_from_dict(config_dict: dict) -> Config:
@@ -21,57 +22,6 @@ def _config_from_dict(config_dict: dict) -> Config:
         except Exception:
             pass
     return cfg
-
-
-def _to_float32_image(arr):
-    if arr.dtype == np.float32:
-        return arr
-    if np.issubdtype(arr.dtype, np.integer):
-        return (arr / 255.0).astype(np.float32, copy=False)
-    return arr.astype(np.float32, copy=False)
-
-
-def _raw_tile_to_batchable(tile_img):
-    tile_img = _to_float32_image(tile_img)
-    if tile_img.ndim == 2:
-        tile_img = tile_img[:, :, None]
-    if tile_img.shape[2] < 3:
-        pad = np.zeros(
-            (tile_img.shape[0], tile_img.shape[1], 3 - tile_img.shape[2]),
-            dtype=np.float32,
-        )
-        tile_img = np.concatenate([tile_img, pad], axis=2)
-    return tile_img[:, :, :3]
-
-
-def _prepare_inference_batch(raw_tiles, raw_masks, config):
-    import tensorflow as tf
-
-    batch = np.stack([_raw_tile_to_batchable(t) for t in raw_tiles], axis=0)
-    tile_tensor = tf.convert_to_tensor(batch, dtype=tf.float32)
-    tile_tensor = tf.image.resize(
-        tile_tensor,
-        size=[config.img_height, config.img_width],
-        method='bicubic',
-        antialias=False,
-    )
-
-    if raw_masks is None:
-        raw_masks = [np.any(
-            _raw_tile_to_batchable(t) != 0, axis=2) for t in raw_tiles]
-
-    mask_batch = np.stack(
-        [m.astype(np.float32)[:, :, None] for m in raw_masks],
-        axis=0,
-    )
-    mask_tensor = tf.convert_to_tensor(mask_batch, dtype=tf.float32)
-    mask_tensor = tf.image.resize(
-        mask_tensor,
-        size=[config.img_height, config.img_width],
-        method='nearest',
-        antialias=False,
-    )
-    return tile_tensor, mask_tensor.numpy()
 
 
 def _resampling_layout(shape, profile, config):
@@ -227,15 +177,7 @@ def prediction_worker(
     config_dict: dict,
 ):
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
-    import tensorflow as tf
     from utils.IO import load_model_from_path
-
-    gpus = tf.config.list_physical_devices('GPU')
-    for gpu in gpus:
-        try:
-            tf.config.experimental.set_memory_growth(gpu, True)
-        except Exception:
-            pass
 
     cfg = _config_from_dict(config_dict)
     model = load_model_from_path(model_path)
@@ -270,15 +212,7 @@ def prediction_service_worker(
     config_dict: dict,
 ):
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
-    import tensorflow as tf
     from utils.IO import load_model_from_path
-
-    gpus = tf.config.list_physical_devices('GPU')
-    for gpu in gpus:
-        try:
-            tf.config.experimental.set_memory_growth(gpu, True)
-        except Exception:
-            pass
 
     cfg = _config_from_dict(config_dict)
     model = load_model_from_path(model_path)

@@ -21,37 +21,6 @@ from utils.Tiling import build_tile_grid, meters_to_pixels
 VALID_PROCESS_TYPES = {'Stems', 'Trees', 'Nodes'}
 
 
-def _import_tensorflow():
-    import tensorflow as tf
-    return tf
-
-
-def _configure_tensorflow_runtime():
-    tf = _import_tensorflow()
-    print("imports finished")
-    gpus = tf.config.list_physical_devices('GPU')
-    if gpus:
-        try:
-            for gpu in gpus:
-                tf.config.experimental.set_memory_growth(gpu, True)
-            print(f"Enabled memory growth for {len(gpus)} GPU(s).")
-        except RuntimeError as e:
-            print(f"Memory growth setup failed: {e}")
-    else:
-        print("No GPUs found. Running on CPU.")
-    return tf
-
-
-def _force_tensorflow_cpu_only():
-    tf = _import_tensorflow()
-    try:
-        tf.config.set_visible_devices([], 'GPU')
-        print('Configured TensorFlow for CPU-only prediction.')
-    except RuntimeError as exc:
-        print(f'CPU-only TensorFlow setup failed: {exc}')
-    return tf
-
-
 class ImageProcessing:
     def __init__(self, model_path, uav_path, stem_path,
                  trees_path, process_type):
@@ -159,7 +128,7 @@ class ImageProcessing:
         from utils import Prediction as Pred
 
         if plan.prediction_mode == 'cpu_stream':
-            _force_tensorflow_cpu_only()
+            os.environ["WINMOL_ONNX_FORCE_CPU"] = "1"
 
         print("\nLoading Model...")
         model = IO.load_model_from_path(self.model_path)
@@ -271,8 +240,6 @@ class ImageProcessing:
             plan, pred_path=pred_path, pred=pred, profile=profile)
 
     def check_DL_env(self):
-        tf = _import_tensorflow()
-
         def get_nvidia_driver_version():
             try:
                 result = subprocess.run(
@@ -289,28 +256,18 @@ class ImageProcessing:
 
         get_nvidia_driver_version()
         try:
-            physical_devices = tf.config.list_physical_devices('GPU')
-            cuda_version = tf.sysconfig.get_build_info().get(
-                'cuda_version', 'Unknown')
-            cudnn_version = tf.sysconfig.get_build_info().get(
-                'cudnn_version', 'Unknown')
-            print(f"CUDA is available: {cuda_version}")
-            print(f"cuDNN version: {cudnn_version}")
-            print("Num GPUs for CUDA processing:", len(physical_devices))
-            print("Tensorflow version:", tf.__version__)
-            print("Keras version:", tf.keras.__version__)
+            import onnxruntime as ort
+            from utils.onnx_runtime import selected_providers
+            print("ONNX Runtime version:", ort.__version__)
+            print("Available execution providers:",
+                  ort.get_available_providers())
+            print("Selected execution providers:", selected_providers())
         except Exception as e:
-            print("Tensorflow error: ", e)
+            print("ONNX Runtime error: ", e)
 
     def display_starting_text(self, plan=None):
-        if plan is not None and plan.prediction_mode == 'multi_gpu_stream':
-            print(
-                "Skipping parent TensorFlow initialization "
-                "for worker-local multi-GPU mode."
-            )
-        else:
-            print("Check CUDA environment")
-            self.check_DL_env()
+        print("Check CUDA environment")
+        self.check_DL_env()
         print("Command-line arguments:")
         print("Model Path:", self.model_path)
         print("Image Path:", self.uav_path)
@@ -356,13 +313,6 @@ if __name__ == '__main__':
         model_path, uav_path, stem_path, trees_path, process_type)
     hardware = image_processor.detect_hardware()
     plan = image_processor.build_plan(hardware)
-    if plan.prediction_mode == 'multi_gpu_stream' and plan.gpu_workers > 1:
-        print(
-            "Skipping parent TensorFlow runtime configuration "
-            "for worker-local multi-GPU mode."
-        )
-    else:
-        _configure_tensorflow_runtime()
     image_processor.display_starting_text(plan)
     if process_type == 'Stems':
         image_processor.run_stem_pipeline(plan)

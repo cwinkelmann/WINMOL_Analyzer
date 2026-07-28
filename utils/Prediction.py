@@ -11,7 +11,6 @@ import sys
 
 import numpy as np
 import rasterio
-import tensorflow as tf
 from rasterio import Affine
 from rasterio.windows import Window
 from skimage.transform import resize
@@ -129,15 +128,30 @@ def _default_valid_mask(tile_img):
     return np.any(tile_img != 0, axis=2)
 
 
+def _resize_batch(batch_nhwc, size, order):
+    """Resize an NHWC float32 batch to (H, W). order=3 ~ bicubic (imagery),
+    order=0 = nearest (masks). Pure skimage/numpy -- no TensorFlow.
+
+    Fast path: when the batch is already at the target size (e.g. tiles were
+    resampled during the GDAL read in stream mode), this is a no-op -- so the
+    per-tile CPU resize disappears entirely."""
+    n, h, w, c = batch_nhwc.shape
+    if (h, w) == (int(size[0]), int(size[1])):
+        return np.ascontiguousarray(batch_nhwc, dtype=np.float32)
+    out = np.empty((n, size[0], size[1], c), dtype=np.float32)
+    for i in range(n):
+        out[i] = resize(
+            batch_nhwc[i], (size[0], size[1]),
+            order=order, mode="edge",
+            anti_aliasing=False, preserve_range=True,
+        ).astype(np.float32)
+    return out
+
+
 def _prepare_inference_batch(raw_tiles, raw_masks, config):
     batch = np.stack([_raw_tile_to_batchable(t) for t in raw_tiles], axis=0)
-    tile_tensor = tf.convert_to_tensor(batch, dtype=tf.float32)
-    tile_tensor = tf.image.resize(
-        tile_tensor,
-        size=[config.img_height, config.img_width],
-        method='bicubic',
-        antialias=False,
-    )
+    size = (config.img_height, config.img_width)
+    tile_batch = _resize_batch(batch, size, order=3)
 
     if raw_masks is None:
         raw_masks = [_default_valid_mask(t) for t in raw_tiles]
@@ -146,14 +160,8 @@ def _prepare_inference_batch(raw_tiles, raw_masks, config):
         [m.astype(np.float32)[:, :, None] for m in raw_masks],
         axis=0,
     )
-    mask_tensor = tf.convert_to_tensor(mask_batch, dtype=tf.float32)
-    mask_tensor = tf.image.resize(
-        mask_tensor,
-        size=[config.img_height, config.img_width],
-        method='nearest',
-        antialias=False,
-    )
-    return tile_tensor, mask_tensor.numpy()
+    mask_resized = _resize_batch(mask_batch, size, order=0)
+    return tile_batch, mask_resized
 
 
 def _binarize_prediction_core(pred_core, mask_core, threshold: float = 0.5):
@@ -292,11 +300,11 @@ def _predict_batch_adaptive(
     try:
         return _predict_batch_core(
             raw_tiles, raw_masks, model, config), batch_size
-    except (tf.errors.ResourceExhaustedError, RuntimeError) as exc:
+    except (RuntimeError, MemoryError) as exc:
         msg = str(exc).lower()
-        if batch_size <= 1 or ('resourceexhausted' not in msg
-                               and 'oom' not in msg
-                               and 'out of memory' not in msg):
+        is_oom = isinstance(exc, MemoryError) or (
+            'oom' in msg or 'out of memory' in msg)
+        if batch_size <= 1 or not is_oom:
             raise
         reduced = max(1, batch_size // 2)
         print(f"Prediction batch too large; reducing micro-batch size from "
@@ -695,71 +703,6 @@ def predict_with_resampling_stream_to_raster(
     uav_path, output_stem_path, model, config
 ):
     return predict_stream_to_raster(uav_path, output_stem_path, model, config)
-
-
-"""Legacy"""
-
-
-def predict(img, model, config):
-    t = Timer()
-    t.start()
-    print("#######################################################")
-    print("Prediction of semantic stem map")
-
-    x_tiles = int(
-        np.ceil(img.shape[1] / (config.img_width - config.overlap_pred)))
-    y_tiles = int(
-        np.ceil(img.shape[0] / (config.img_width - config.overlap_pred)))
-
-    img_pad = np.full((
-        y_tiles * (
-            config.img_width - config.overlap_pred
-        ) + config.overlap_pred,
-        x_tiles * (
-            config.img_width - config.overlap_pred
-        ) + config.overlap_pred,
-        config.n_channels
-    ),
-        fill_value=0, dtype=np.float32
-    )
-    img_pad[0:img.shape[0], 0:img.shape[1], ] = img
-
-    img_width_ = config.img_width - config.overlap_pred
-    prediction = np.zeros((
-        img_pad.shape[0], img_pad.shape[1]), dtype=np.uint8)
-    mask = np.where(img[:, :, 0:3] == (0, 0, 0), False, True)[:, :, 0]
-
-    for i in range(y_tiles):
-        x = i * (config.img_width - config.overlap_pred)
-        for j in range(x_tiles):
-            y = j * (config.img_width - config.overlap_pred)
-            tile = img_pad[x:x + config.img_width, y:y + config.img_width, 0:3]
-            tile = tf.convert_to_tensor(tile, dtype=np.float32)
-            tile = tf.reshape(
-                tile,
-                shape=[1, config.img_width, config.img_width, 3]
-            )
-            pred = model.predict_on_batch(tile)
-            pred2 = pred[0, (config.overlap_pred // 2):
-                         (config.img_width - config.overlap_pred // 2),
-                         (config.overlap_pred // 2):
-                         (config.img_width - config.overlap_pred // 2), 0
-                         ]
-            prediction[(config.overlap_pred // 2 + (i) * img_width_):
-                       ((config.img_width - config.overlap_pred // 2)
-                       + i * img_width_),
-                       (config.overlap_pred // 2 + (j) * img_width_):
-                       ((config.img_width - config.overlap_pred // 2)
-                        + j * img_width_)
-                       ] = pred2
-
-    prediction = prediction[0:img.shape[0], 0:img.shape[1]]
-    prediction = np.ascontiguousarray((prediction > 0) & mask, dtype=np.uint8)
-    print(x_tiles * y_tiles, " tiles analyzed")
-    t.stop()
-    print("#######################################################")
-    print("")
-    return prediction
 
 
 def predict_with_resampling_per_tile(img, profile, model, config):
