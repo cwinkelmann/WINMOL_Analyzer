@@ -11,6 +11,7 @@ from rasterio.windows import Window
 
 from classes.Config import Config
 from utils import IO
+from utils.edge_fill import fill_invalid_with_nearest
 
 
 def _config_from_dict(config_dict: dict) -> Config:
@@ -159,7 +160,7 @@ def _group_jobs(jobs, batch_size):
         yield batch
 
 
-def _read_batch_jobs(src, indexes, batch_jobs):
+def _read_batch_jobs(src, indexes, batch_jobs, fill_invalid=True):
     raw_tiles = []
     raw_masks = []
     stats = {
@@ -196,6 +197,9 @@ def _read_batch_jobs(src, indexes, batch_jobs):
             pixel_mask if np.all(gdal_mask) else (gdal_mask & pixel_mask)
         stats['prep_s'] += time.perf_counter() - t0
 
+        if fill_invalid:
+            tile = fill_invalid_with_nearest(tile, valid_mask)
+
         raw_tiles.append(tile)
         raw_masks.append(valid_mask)
     stats['read_s'] = \
@@ -225,7 +229,10 @@ def prediction_worker(
         indexes = list(range(1, min(cfg.n_channels, src.count) + 1))
         for batch_jobs in _group_jobs(jobs, batch_size):
             raw_tiles, raw_masks, read_stats = \
-                _read_batch_jobs(src, indexes, batch_jobs)
+                _read_batch_jobs(
+                    src, indexes, batch_jobs,
+                    fill_invalid=bool(getattr(
+                        cfg, "fill_invalid_before_prediction", True)))
             infer0 = time.perf_counter()
             pred_cores = _predict_batch(raw_tiles, raw_masks, model, cfg)
             infer_s = time.perf_counter() - infer0
@@ -279,7 +286,10 @@ def prediction_service_worker(
 
             for batch_jobs in _group_jobs(jobs, batch_size):
                 raw_tiles, raw_masks, read_stats = \
-                    _read_batch_jobs(src, indexes, batch_jobs)
+                    _read_batch_jobs(
+                        src, indexes, batch_jobs,
+                        fill_invalid=bool(getattr(
+                            cfg, "fill_invalid_before_prediction", True)))
                 infer0 = time.perf_counter()
                 pred_cores = _predict_batch(raw_tiles, raw_masks, model, cfg)
                 stats['infer_s'] += time.perf_counter() - infer0
