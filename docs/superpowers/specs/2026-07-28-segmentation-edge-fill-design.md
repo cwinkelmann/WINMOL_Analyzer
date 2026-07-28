@@ -56,6 +56,14 @@ with plausible content **before** inference.
   `WINMOL_fig6_barnekow_boundary_diff.png` result: new+cubic recovers 50
   boundary stems legacy silently dropped. No prediction-side tile dropping
   exists.
+- **Out of scope (known limitation):** the fill is wired into the two
+  streaming predictors the QGIS plugin and batch CLI use (`winmol_run.py` ->
+  `predict_stream_to_raster` and `run_multi_gpu_prediction`). The standalone
+  `standalone/WINMOL_Analyzer.py::run_pipeline` uses a *different* legacy
+  predictor (`predict_with_resampling_per_tile`, `utils/Prediction.py`) that
+  is NOT wired, so a notebook/standalone user on an RGBA/nodata ortho still
+  gets boundary artifacts. Wiring it is a one-line reuse of the same helper
+  if that path ever matters.
 
 ## Approach
 
