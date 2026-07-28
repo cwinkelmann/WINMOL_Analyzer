@@ -2067,6 +2067,10 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         """
         self._status_prefix = ""
         self._setup_t0 = time.monotonic()
+        # Where the bar lands when this activity ends. _end_setup_activity runs
+        # last (on thread.finished) and would otherwise force 0, clobbering a
+        # completed setup back to "un-started". Success slots raise this to 100.
+        self._setup_final_pct = 0
         self.update_output_log(banner)
         self._append_setup_detail(banner)
         self._set_status(banner)
@@ -2093,7 +2097,10 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         if bar is not None:
             try:
                 bar.setRange(0, 100)
-                bar.setValue(0)
+                # Honour the terminal slot's verdict: 100 on success, 0 on
+                # failure/cancel. Forcing 0 here made a completed setup read
+                # as "stuck at 0%".
+                bar.setValue(getattr(self, "_setup_final_pct", 0))
             except Exception:                      # pragma: no cover - GUI
                 pass
         # A setup job finishing during a detection must not claim the
@@ -2147,6 +2154,11 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             if bar.maximum() == 0:
                 bar.setRange(0, 100)
             bar.setValue(int(percent))
+            # A download that reaches 100% should stay there when
+            # _end_setup_activity applies the final value on thread.finished;
+            # otherwise a completed download also snaps back to 0.
+            if int(percent) >= 100:
+                self._setup_final_pct = 100
         except Exception:                          # pragma: no cover - GUI
             pass
 
@@ -2169,18 +2181,11 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         if exe:
             self._set_python(exe)
             self.update_output_log("Environment ready.")
-            # pip has no clean percentage, so the bar is only driven during the
-            # model-download phase and otherwise sits at 0 — leaving a finished
-            # setup looking un-started. Snap it to 100 on success so completion
-            # is unambiguous.
-            bar = getattr(self, "setup_progress_bar", None)
-            if bar is not None:
-                try:
-                    if bar.maximum() == 0:
-                        bar.setRange(0, 100)
-                    bar.setValue(100)
-                except Exception:              # pragma: no cover - GUI
-                    pass
+            # Land the bar at 100% when _end_setup_activity applies the final
+            # value on thread.finished (pip emits no usable percentage, so the
+            # bar is a barber-pole during the build and this is the only place
+            # completion becomes unambiguous).
+            self._setup_final_pct = 100
         else:
             self.update_output_log(
                 "Environment setup finished but returned no interpreter.")
