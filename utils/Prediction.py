@@ -12,6 +12,7 @@ import sys
 import numpy as np
 import rasterio
 from rasterio import Affine
+from rasterio.enums import Resampling
 from rasterio.windows import Window
 from skimage.transform import resize
 
@@ -216,7 +217,7 @@ def _prediction_batch_candidates(config, initial_batch: int) -> list[int]:
 
 class TileBatchProducer(threading.Thread):
     def __init__(self, uav_path, chunk_size, jobs, n_channels,
-                 out_queue, producer_id=0):
+                 out_queue, producer_id=0, out_size=None):
         super().__init__(daemon=True)
         self.uav_path = uav_path
         self.chunk_size = max(1, int(chunk_size))
@@ -224,6 +225,10 @@ class TileBatchProducer(threading.Thread):
         self.n_channels = n_channels
         self.out_queue = out_queue
         self.producer_id = producer_id
+        # (H, W) to resample each tile to *during* the GDAL read (fast, in
+        # C, and able to use overviews). None keeps the native-resolution
+        # read, leaving resizing to the (slow) skimage path downstream.
+        self.out_size = tuple(out_size) if out_size else None
         self.error = None
 
     def run(self):
@@ -236,18 +241,44 @@ class TileBatchProducer(threading.Thread):
                     t0 = time.perf_counter()
                     window = Window(job['src_col'], job['src_row'],
                                     job['src_width'], job['src_height'])
-                    tile = src.read(
-                        indexes,
-                        window=window,
-                        boundless=True,
-                        fill_value=0,
-                    ).transpose(1, 2, 0)
-
-                    gdal_mask = src.read_masks(
-                        1,
-                        window=window,
-                        boundless=True,
-                    ) > 0
+                    # Resample onto the model grid during the read when
+                    # out_size is set: GDAL does it in C (cubic for
+                    # imagery -- bilinear measurably thins the predicted
+                    # mask at full-ortho scale -- nearest for the validity
+                    # mask), replacing the slow per-tile skimage resize in
+                    # the consumer (_resize_batch's identity fast path
+                    # then short-circuits). boundless+fill_value=0 keeps
+                    # the requested (oh, ow) shape even when the window
+                    # runs past the raster edge.
+                    if self.out_size is not None:
+                        oh, ow = self.out_size
+                        tile = src.read(
+                            indexes,
+                            window=window,
+                            out_shape=(len(indexes), oh, ow),
+                            resampling=Resampling.cubic,
+                            boundless=True,
+                            fill_value=0,
+                        ).transpose(1, 2, 0)
+                        gdal_mask = src.read_masks(
+                            1,
+                            window=window,
+                            out_shape=(oh, ow),
+                            resampling=Resampling.nearest,
+                            boundless=True,
+                        ) > 0
+                    else:
+                        tile = src.read(
+                            indexes,
+                            window=window,
+                            boundless=True,
+                            fill_value=0,
+                        ).transpose(1, 2, 0)
+                        gdal_mask = src.read_masks(
+                            1,
+                            window=window,
+                            boundless=True,
+                        ) > 0
 
                     pixel_mask = np.any(tile != 0, axis=2)
 
@@ -545,6 +576,10 @@ def predict_stream_to_raster(
             n_channels=config.n_channels,
             out_queue=q,
             producer_id=idx,
+            # Tiles arrive on the model grid already; _resize_batch's
+            # identity fast path then makes _prepare_inference_batch a
+            # no-op for the resize step.
+            out_size=(config.img_height, config.img_width),
         )
         for idx in range(len(producer_job_lists))
     ]

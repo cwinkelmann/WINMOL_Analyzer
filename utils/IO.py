@@ -241,7 +241,9 @@ def load_orthomosaic_with_resampling(path, config):
                 int(src.height * scale_factor_y),
                 int(src.width * scale_factor_x)
             ),
-            resampling=Resampling.bilinear
+            # cubic for the same reason as the streamed read in
+            # Prediction.py: bilinear thins the mask at scale.
+            resampling=Resampling.cubic
         )
         img = img[0:3, :, :].transpose(1, 2, 0)
         transform = src.transform * src.transform.scale(
