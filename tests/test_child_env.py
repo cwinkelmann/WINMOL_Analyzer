@@ -221,10 +221,13 @@ def test_child_env_sanitizes_path_on_windows(monkeypatch):
     assert r"C:\Windows\System32" in path.split(";")
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="off-Windows no-op; the win32 path is covered by "
+           "test_child_env_sanitizes_path_on_windows")
 def test_child_env_leaves_path_untouched_off_windows(monkeypatch):
     """No-op on macOS/Linux: the loader reads DYLD/LD paths, not PATH, and a
     POSIX PATH is never a Windows DLL search path."""
-    assert sys.platform != "win32"          # this test host
     monkeypatch.setenv("PATH", "/usr/bin:/bin:/opt/qgis/bin")
     assert child_env()["PATH"] == "/usr/bin:/bin:/opt/qgis/bin"
 
