@@ -1,9 +1,18 @@
-"""Is there an NVIDIA GPU worth installing a CUDA runtime for?
+"""Is there an NVIDIA GPU worth installing a CUDA runtime for — and,
+once installed, did it actually get one?
 
-Answers the INSTALLER's question — asked before any onnxruntime exists
-to ask instead — so it imports nothing but the stdlib (no onnxruntime,
-no Qt, no ``classes.*``). ``nvidia-smi`` always runs with a timeout: a
-wedged driver would otherwise hang for as long as the kernel takes.
+:func:`probe` answers the INSTALLER's PRE-install question, asked
+before any onnxruntime exists to ask instead — so it imports nothing
+but the stdlib (no onnxruntime, no Qt, no ``classes.*``). ``nvidia-smi``
+always runs with a timeout: a wedged driver would otherwise hang for as
+long as the kernel takes.
+
+:func:`verify_gpu_providers` answers the POST-install question, by
+running the CHILD venv's own ``python -c "import onnxruntime"`` — the
+only onnxruntime this module ever touches is that subprocess's, so the
+"no onnxruntime" import rule above still holds for this process. It
+imports :mod:`plugin_utils.childenv`, itself pure stdlib, to give that
+child the same sanitized environment the real run uses.
 """
 
 import platform
@@ -11,6 +20,8 @@ import re
 import subprocess
 from dataclasses import dataclass, field
 from typing import List, Optional
+
+from .childenv import child_env
 
 #: Seconds before a wedged ``nvidia-smi`` is given up on. A healthy
 #: driver answers in ~50 ms; a broken one costs a pause, not a hang.
@@ -160,3 +171,83 @@ def wants_gpu_runtime(probe_result=None) -> bool:
         return result.present
     except Exception:
         return False
+
+
+# --- post-install provider verdict ------------------------------------------
+#: NOT the definitive proof — that is the provider-demotion warning
+#: OnnxSegmenter._verify_providers prints on the first real detection run
+#: (utils/onnx_runtime.py). This is the visible, install-time signal a
+#: gpu-variant install got what it asked for, restored from rc11.
+
+CUDA_PROVIDER = "CUDAExecutionProvider"
+GPU_RUNTIME_DIST = "onnxruntime-gpu"
+
+#: Seconds before a wedged/downloading child interpreter is given up on.
+PROVIDER_PROBE_TIMEOUT = 60.0
+
+#: stdlib-only: printed lines are parsed back out, never eval'd.
+_PROVIDER_PROBE_CODE = (
+    "import onnxruntime as ort\n"
+    "print(ort.__version__)\n"
+    "print(','.join(ort.get_available_providers()))\n"
+)
+
+_DEFINITIVE_CHECK = (
+    "The definitive check happens at the first detection run (a "
+    "provider-demotion warning there means CPU after all).")
+
+
+def _probe_providers(venv_python, timeout=PROVIDER_PROBE_TIMEOUT) -> dict:
+    """``{'ok', 'version', 'providers', 'error'}`` from the CHILD venv's
+    own onnxruntime. ``ok`` is False on any failure — bad exit code,
+    unparseable output, a crash, or a timeout — with ``error`` set to a
+    short diagnosis. Never raises."""
+    empty = {"ok": False, "version": None, "providers": [], "error": None}
+    try:
+        out = subprocess.run(
+            [venv_python, "-I", "-c", _PROVIDER_PROBE_CODE],
+            capture_output=True, text=True, timeout=timeout,
+            env=child_env(python_exe=venv_python))
+    except subprocess.TimeoutExpired:
+        return {**empty, "error": f"timed out after {timeout:.0f}s"}
+    except Exception as exc:
+        return {**empty, "error": f"{type(exc).__name__}: {exc}"}
+    lines = [ln for ln in (out.stdout or "").splitlines() if ln.strip()]
+    if out.returncode != 0 or len(lines) < 2:
+        detail = (out.stderr or out.stdout or "no output").strip()
+        return {**empty, "error": detail[-400:] or "no output"}
+    providers = [p for p in lines[1].split(",") if p]
+    return {
+        "ok": True, "version": lines[0].strip(),
+        "providers": providers, "error": None,
+    }
+
+
+def _provider_verdict(report) -> str:
+    """The verdict TEXT for a :func:`_probe_providers` report. Pure."""
+    if not report.get("ok"):
+        detail = (report.get("error") or "").strip() or "no diagnosis"
+        return (
+            f"Could not verify the GPU runtime in the compute "
+            f"environment: {detail}. {_DEFINITIVE_CHECK}")
+
+    version = report.get("version") or "?"
+    providers = report.get("providers") or []
+    if CUDA_PROVIDER in providers:
+        return f"GPU runtime ready: onnxruntime {version} offers CUDA."
+    return (
+        f"{GPU_RUNTIME_DIST} is installed, but onnxruntime {version} does "
+        f"not offer CUDA (providers: {', '.join(providers) or 'none'}). "
+        f"This run will fall back to the CPU runtime. {_DEFINITIVE_CHECK}")
+
+
+def verify_gpu_providers(venv_python, timeout=PROVIDER_PROBE_TIMEOUT) -> str:
+    """Install-time verdict on a just-installed gpu-variant venv: does
+    the CHILD interpreter's onnxruntime actually offer CUDA?
+
+    Spawns ``venv_python`` — never the QGIS process, which has no
+    onnxruntime of its own — through the same :func:`child_env` the real
+    run uses, so a loader-path problem shows up here instead of at the
+    first detection. Never raises; a probe crash/timeout is reported as
+    an honest "could not verify", not an exception."""
+    return _provider_verdict(_probe_providers(venv_python, timeout=timeout))

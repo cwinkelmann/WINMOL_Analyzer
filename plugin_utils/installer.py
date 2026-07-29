@@ -23,6 +23,7 @@ import time
 from pathlib import Path
 
 from .childenv import child_env, safe_child_cwd
+from .gpu_probe import verify_gpu_providers
 
 WINMOL_VENV_NAME = "winmol_venv"
 MODELS_DIR_NAME = "models"
@@ -728,6 +729,12 @@ def setup_environment(venv_path, base_python=None, progress=None,
             create_venv(venv_path, base_python, progress=report)
         ensure_pip(venv_path, progress=report)
         install_requirements(venv_path, progress=report, gpu=gpu)
+        if gpu:
+            # Visible install-time verdict for the variant that can
+            # silently fail to be what it claims (a CUDA generation
+            # mismatch installs fine and only fails at runtime); the CPU
+            # variant has nothing GPU-shaped to verify.
+            report(verify_gpu_providers(get_venv_python_path(venv_path)))
         _write_marker(venv_path, gpu=gpu)
     report(f"Environment ready in {report.elapsed():.0f}s: "
            f"{get_venv_python_path(venv_path)}")
