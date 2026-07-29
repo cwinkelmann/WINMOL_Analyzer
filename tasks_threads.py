@@ -13,11 +13,15 @@ from PyQt5.QtCore import (
 
 from .plugin_utils.childenv import child_env, safe_child_cwd
 from .plugin_utils.installer import (
+    _run_streamed,
     gpu_requested,
+    plugin_requirements_path,
     remove_environment,
     remove_model_files,
     setup_environment,
+    uninstall_conflicting_runtime,
     venv_location,
+    verify_gpu_providers,
 )
 from .plugin_utils.model_registry import (
     ensure_model,
@@ -119,26 +123,65 @@ class EnvSetupWorker(QObject):
     ``gpu`` selects the runtime variant: ``None`` (default) honors the
     WINMOL_GPU env var (``installer.gpu_requested``), the pre-Setup-tab
     opt-in; ``True``/``False`` is the Setup tab's explicit choice
-    (Install GPU runtime / repair-preserving-variant)."""
+    (Install GPU runtime / repair-preserving-variant).
+
+    ``target_exe`` redirects the install into a bring-your-own
+    interpreter instead of the managed venv: no venv is created, no
+    sentinel written — just the requirements pip-installed into THAT
+    python, so the runtime lands in the same environment the detection
+    actually runs in. ``done`` then carries ``target_exe`` back."""
 
     log = pyqtSignal(str)
     done = pyqtSignal(str)      # interpreter path on success
     failed = pyqtSignal(str)    # error message
 
-    def __init__(self, plugin_dir, gpu=None):
+    def __init__(self, plugin_dir, gpu=None, target_exe=None):
         super().__init__()
         self.plugin_dir = plugin_dir
         self.gpu = gpu
+        self.target_exe = target_exe
 
     def run(self):
         gpu = gpu_requested() if self.gpu is None else bool(self.gpu)
         try:
+            if self.target_exe:
+                _install_into_interpreter(
+                    self.target_exe, progress=self.log.emit, gpu=gpu)
+                self.done.emit(self.target_exe)
+                return
             info = setup_environment(
                 venv_location(self.plugin_dir), progress=self.log.emit,
                 gpu=gpu)
             self.done.emit(info["python"])
         except Exception as exc:
             self.failed.emit(str(exc))
+
+
+def _install_into_interpreter(python_exe, progress, gpu=False):
+    """pip-install requirements/cpu.txt (or gpu.txt) into a
+    user-picked interpreter — ``installer.install_requirements``'s
+    exact flow with the interpreter given directly instead of derived
+    from the managed venv. Same flags for the same reasons:
+    ``--no-input`` prevents a hidden prompt, ``--progress-bar off``
+    stops the \\r spam a QPlainTextEdit cannot render, and the
+    conflicting onnxruntime distribution is removed FIRST — a swap,
+    never an addition (both distributions provide the ``onnxruntime``
+    module, pip will never resolve that itself)."""
+    uninstall_conflicting_runtime(python_exe, gpu, progress=progress)
+    req = str(plugin_requirements_path(gpu=gpu))
+    progress(f"Installing packages from {os.path.basename(req)} into "
+             f"{python_exe} — this downloads a few hundred MB and can "
+             "take several minutes …")
+    _run_streamed(
+        [python_exe, "-u", "-m", "pip", "install", "--upgrade",
+         "--no-input", "--progress-bar", "off", "-r", req],
+        progress=progress,
+        label=f"pip install -r {os.path.basename(req)}", timeout=3600)
+    if gpu:
+        # The install-time provider verdict, same as the managed GPU
+        # build: a CUDA-generation mismatch installs fine and only
+        # fails at runtime, so say what the interpreter actually got.
+        progress(verify_gpu_providers(python_exe))
 
 
 class ModelEnsureWorker(QObject):
@@ -222,8 +265,9 @@ class EnvRemoveWorker(QObject):
 class ModelMaintenanceWorker(QObject):
     """Bulk model maintenance off the GUI thread. ``action`` is one of
     ``download-all-recommended`` (ensure_model for the registry's
-    recommended list), ``verify-all`` (checksum every pinned file on
-    disk) or ``delete`` (remove ``entry_ids``' files under models_dir).
+    recommended list), ``verify-all`` (checksum pinned files on disk —
+    all of them, or only ``entry_ids`` when given) or ``delete``
+    (remove ``entry_ids``' files under models_dir).
     Emits ``done({'action', 'ok': [id], 'failed': [(id, msg)]})``."""
 
     log = pyqtSignal(str)
@@ -279,8 +323,13 @@ class ModelMaintenanceWorker(QObject):
         return self._summary(ok, failed)
 
     def _verify_all(self, registry):
+        """Checksum pinned files on disk — every entry, or only
+        ``entry_ids`` when given (the Verify button's per-selected-row
+        scope)."""
         ok, failed = [], []
-        for entry in registry.entries.values():
+        entries = ([registry.get(eid) for eid in self.entry_ids]
+                   if self.entry_ids else list(registry.entries.values()))
+        for entry in entries:
             path = local_path(entry, self.models_dir)
             if not os.path.exists(path) or not entry.sha256:
                 continue

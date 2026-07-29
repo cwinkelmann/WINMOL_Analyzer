@@ -281,7 +281,12 @@ def button_states(info, rows, selected_entry_id=None, busy=False) -> dict:
     states = {
         "env_create_button": not env_ready(info),
         "env_choose_button": True,
-        "env_delete_button": bool(info.managed or info.venv_bytes),
+        # A configured bring-your-own interpreter keeps this button
+        # live even with no managed venv on disk: it is the only way
+        # to reach the "Forget this interpreter" offer.
+        "env_delete_button": bool(
+            info.managed or info.venv_bytes
+            or (info.python and not info.managed)),
         "models_refresh_button": True,
         "models_download_button": bool(
             row is not None and not row.installed),

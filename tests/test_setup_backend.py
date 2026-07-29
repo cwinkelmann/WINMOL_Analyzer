@@ -259,6 +259,55 @@ def test_scan_flags_device_default_and_installed(tmp_path):
     assert by_id["spruce_fp32"].installed is False
 
 
+def test_scan_variant_follows_selection(tmp_path):
+    """The is_default flag follows the SELECTED family + variant, not
+    just the device rule: fp32 chosen on a CPU box highlights fp32."""
+    config_path, models_dir = _write_registry(tmp_path)
+    rows = model_status.scan(config_path, models_dir, device="cpu",
+                             family_id="spruce", variant="fp32")
+    by_id = {row.entry_id: row for row in rows}
+    assert by_id["spruce_fp32"].is_default is True
+    assert by_id["spruce_int8"].is_default is False
+    # An unresolvable variant flags nothing rather than guessing.
+    none_flagged = model_status.scan(config_path, models_dir,
+                                     device="cpu", family_id="spruce",
+                                     variant="fp16")
+    assert not any(row.is_default for row in none_flagged)
+
+
+def test_scan_read_fallback_detects_legacy_install(tmp_path):
+    """A file only in the legacy dir (rr6-era install next to the
+    plugin) shows installed with its REAL path; a missing file keeps
+    the managed dir as the write target."""
+    config_path, models_dir = _write_registry(tmp_path)
+    legacy = tmp_path / "legacy_models"
+    legacy.mkdir()
+    (legacy / "spruce_fp32.onnx").write_bytes(b"fp32-weights")
+    rows = model_status.scan(config_path, models_dir, device="cpu",
+                             fallback_dirs=(str(legacy),))
+    by_id = {row.entry_id: row for row in rows}
+    assert by_id["spruce_fp32"].installed is True
+    assert by_id["spruce_fp32"].path == str(legacy / "spruce_fp32.onnx")
+    assert by_id["spruce_fp32"].bytes_on_disk == len(b"fp32-weights")
+    # int8 lives in the managed dir: the fallback never wins over it.
+    assert by_id["spruce_int8"].path == os.path.join(
+        models_dir, "spruce_int8.onnx")
+
+
+def test_group_by_family_and_summary(tmp_path):
+    config_path, models_dir = _write_registry(tmp_path)
+    rows = model_status.scan(config_path, models_dir, device="cpu")
+    grouped = model_status.group_by_family(rows)
+    assert [(fam_id, label) for fam_id, label, _r in grouped] == \
+        [("spruce", "Spruce")]
+    fam_rows = grouped[0][2]
+    assert {row.entry_id for row in fam_rows} == \
+        {"spruce_fp32", "spruce_int8"}
+    assert model_status.family_summary(fam_rows) == \
+        "1 of 2 on disk, " + setup_state.human_bytes(
+            len(b"quantized-weights"))
+
+
 # --- env_info + texts -------------------------------------------------------
 
 def test_env_info_managed_ready(tmp_path):
@@ -312,6 +361,18 @@ def test_button_states_interlock(tmp_path):
     assert states["models_delete_button"] is False
     busy = setup_state.button_states(info, rows, busy=True)
     assert all(v is False for v in busy.values())
+
+
+def test_button_states_delete_reachable_for_byo(tmp_path):
+    """A bring-your-own interpreter with no managed venv on disk must
+    keep env_delete_button live — it is the only path to the 'Forget
+    this interpreter' offer."""
+    info = setup_state.EnvInfo(
+        status="byo", python=str(tmp_path / "conda" / "bin" / "python"),
+        venv_path=str(tmp_path / "plugin" / "winmol_venv"),
+        managed=False, variant=None, venv_bytes=0, message="")
+    states = setup_state.button_states(info, [])
+    assert states["env_delete_button"] is True
 
 
 def test_models_summary_text(tmp_path):
