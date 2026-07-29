@@ -4,6 +4,7 @@
 """Imports"""
 import os
 import queue
+import subprocess
 import threading
 import time
 import contextlib
@@ -215,6 +216,170 @@ def _prediction_batch_candidates(config, initial_batch: int) -> list[int]:
     return list(range(initial, max_batch + 1))
 
 
+#: How far above the initial batch the sweep may go when free memory could
+#: not be determined at all. Deliberately tiny: an unbounded sweep on an
+#: unknown machine is what can take a box down -- host RAM exhaustion
+#: raises nothing at all, it just swaps and dies.
+AUTOTUNE_BLIND_HEADROOM = 2
+
+_GB = float(1024 ** 3)
+
+
+def _batch_override(config):
+    """The user's manual pin as a positive int, or None.
+
+    ``Config.prediction_batch_size`` cannot serve this purpose: the
+    planner (classes/ExecutionPlan.py) overwrites it on every run.
+    """
+    raw = getattr(config, 'prediction_batch_override', None)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 1 else None
+
+
+def _available_ram_bytes():
+    """Free host RAM in bytes, or None when psutil is unavailable.
+
+    psutil ships in requirements/cpu.txt and requirements/gpu.txt, so this
+    must degrade rather than raise when it is missing (e.g. a minimal CI
+    image).
+    """
+    try:
+        import psutil
+        return float(psutil.virtual_memory().available)
+    except Exception:
+        return None
+
+
+def _free_gpu_memory_gb():
+    """Free VRAM per visible GPU in GiB via ``nvidia-smi``, or ``[]`` when
+    it is unavailable or fails. Never raises."""
+    try:
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=memory.free',
+             '--format=csv,noheader,nounits'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            return []
+        values = []
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                values.append(float(line) / 1024.0)
+            except ValueError:
+                continue
+        return values
+    except Exception:
+        return []
+
+
+def _free_memory_bytes(model, config):
+    """``(bytes, source)`` describing the memory the sweep may spend from.
+
+    Returns ``(None, reason)`` when it cannot be determined; the caller
+    then falls back to :data:`AUTOTUNE_BLIND_HEADROOM`.
+    """
+    accelerator = str(getattr(model, 'accelerator', '') or '').lower()
+
+    if accelerator == 'cuda':
+        try:
+            free = _free_gpu_memory_gb()
+        except Exception:                               # pragma: no cover
+            free = []
+        usable = [f for f in free if f and f > 0]
+        if usable:
+            # The smallest visible device bounds the run: the same batch
+            # size is used on all of them.
+            gpu_free = min(usable) * _GB
+            host = _available_ram_bytes()
+            if host is not None and 0 < host < gpu_free:
+                # Bound by BOTH. A run planned for CUDA whose session
+                # silently fell back to the CPU provider allocates on the
+                # host -- plenty of VRAM free, none in use, and the arena
+                # eating RAM instead.
+                return host, 'psutil available RAM (below free VRAM)'
+            return gpu_free, 'nvidia-smi memory.free'
+        return None, 'nvidia-smi did not report free GPU memory'
+
+    available = _available_ram_bytes()
+    if available is None or available <= 0:
+        return None, 'psutil unavailable'
+    return available, 'psutil available RAM'
+
+
+def _estimated_bytes_per_tile(config) -> float:
+    """Device memory one tile costs, activations included."""
+    height = int(getattr(config, 'img_height', 512) or 512)
+    width = int(getattr(config, 'img_width', 512) or 512)
+    channels = int(getattr(config, 'n_channels', 3) or 3)
+    classes = int(getattr(config, 'num_classes', 1) or 1)
+    raw = float(height * width * (channels + classes) * 4)
+    factor = float(getattr(
+        config, 'prediction_batch_autotune_activation_factor', 32) or 32)
+    return max(1.0, raw * max(1.0, factor))
+
+
+def _memory_batch_ceiling(model, config, initial_batch: int) -> dict:
+    """The largest batch the sweep may TRY, decided before anything is
+    timed.
+
+    This is the safety cap the whole feature hangs on: a GPU OOM is caught
+    and halved (``_predict_batch_adaptive``), but host RAM exhaustion
+    raises nothing at all -- the box swaps and dies. Only a pre-emptive
+    ceiling helps. Unlike the configured caps (``prediction_batch_max_gpu``
+    and friends), this one can also pull the ACTUAL batch used below
+    ``initial_batch``: the planner's batch is a considered floor under
+    normal conditions, but not something to trust blindly on a box that is
+    already nearly out of memory.
+    """
+    initial = max(1, int(initial_batch))
+    free, source = _free_memory_bytes(model, config)
+    per_tile = _estimated_bytes_per_tile(config)
+
+    if not free or free <= 0:
+        return {
+            'ceiling': initial + AUTOTUNE_BLIND_HEADROOM,
+            'free_bytes': None,
+            'source': source,
+            'fraction': None,
+            'bytes_per_tile': per_tile,
+            'blind': True,
+        }
+
+    fraction = float(getattr(
+        config, 'prediction_batch_autotune_memory_fraction', 0.6) or 0.6)
+    fraction = min(0.95, max(0.05, fraction))
+    ceiling = int((free * fraction) // per_tile)
+    return {
+        'ceiling': max(1, ceiling),
+        'free_bytes': free,
+        'source': source,
+        'fraction': fraction,
+        'bytes_per_tile': per_tile,
+        'blind': False,
+    }
+
+
+def _describe_memory_budget(budget: dict) -> str:
+    """Where the memory ceiling came from, without the label."""
+    if budget.get('blind'):
+        return (f"free memory unknown ({budget['source']}), "
+                f"blind headroom +{AUTOTUNE_BLIND_HEADROOM}")
+    return (
+        f"{budget['free_bytes'] / _GB:.1f} GB free per {budget['source']}, "
+        f"{budget['fraction'] * 100:.0f}% budget, "
+        f"~{budget['bytes_per_tile'] / (1024 ** 2):.0f} MB/tile"
+    )
+
+
 class TileBatchProducer(threading.Thread):
     def __init__(self, uav_path, chunk_size, jobs, n_channels,
                  out_queue, producer_id=0, out_size=None):
@@ -410,8 +575,21 @@ def _autotune_batch_size(
     initial_batch,
     label='Prediction micro-batch',
 ):
-    autotune = bool(getattr(config, 'prediction_batch_autotune', True))
     initial = max(1, int(initial_batch))
+
+    # A manual pin beats everything: no probing, no timing, no memory
+    # check.
+    override = _batch_override(config)
+    if override is not None:
+        print(
+            f"{label} autotune: bound by the user pin "
+            f"(Config.prediction_batch_override); skipped, batch pinned "
+            f"to b{override} by the user.",
+            flush=True,
+        )
+        return override
+
+    autotune = bool(getattr(config, 'prediction_batch_autotune', True))
     if not autotune:
         return initial
     if len(sample_tiles) < 2:
@@ -425,6 +603,11 @@ def _autotune_batch_size(
         0.0,
         float(getattr(config, 'prediction_batch_autotune_min_improve', 0.02)),
     )
+    min_improve_s = max(
+        0.0,
+        float(getattr(
+            config, 'prediction_batch_autotune_min_improve_s', 0.2)),
+    )
     stop_on_oom = bool(getattr(
         config, 'prediction_batch_autotune_stop_on_oom', True,
     ))
@@ -433,9 +616,24 @@ def _autotune_batch_size(
         int(getattr(config, 'prediction_batch_autotune_repeats', 2)),
     )
 
+    # Bound the sweep by FREE memory BEFORE timing anything: the candidate
+    # list below is derived from this ceiling, so a candidate past it is
+    # never even attempted.
+    budget = _memory_batch_ceiling(model, config, initial)
+    ceiling = max(1, int(budget['ceiling']))
+
+    if ceiling < initial:
+        print(
+            f"{label} autotune: memory ceiling b{ceiling} is below the "
+            f"planned batch b{initial} ({_describe_memory_budget(budget)}); "
+            f"skipping the sweep, using b{ceiling}.",
+            flush=True,
+        )
+        return ceiling
+
     candidates = [
         c for c in _prediction_batch_candidates(config, initial)
-        if c <= len(sample_tiles)
+        if c <= len(sample_tiles) and c <= ceiling
     ]
     if len(candidates) <= 1:
         return initial
@@ -445,8 +643,20 @@ def _autotune_batch_size(
     stale_steps = 0
     results = []
     stop_reason = None
+    # Working ceiling tightened by an OOM fallback during this sweep: once
+    # set, no later candidate at or above it is attempted, whatever
+    # stop_on_oom says -- the next candidate is by definition further past
+    # the memory cliff that was just hit.
+    oom_ceiling = None
 
     for cand in candidates:
+        if oom_ceiling is not None and cand >= oom_ceiling:
+            stop_reason = (
+                f"stopped after OOM fallback: working ceiling lowered to "
+                f"b{oom_ceiling}"
+            )
+            break
+
         used, per_tile, oomed = _time_batch_candidate(
             sample_tiles,
             sample_masks,
@@ -458,9 +668,14 @@ def _autotune_batch_size(
 
         results.append((cand, used, per_tile, oomed))
 
+        # A candidate only counts as progress if it clears BOTH bars: the
+        # existing relative one (min_improve) AND a new absolute floor
+        # (min_improve_s). 0.337 vs 0.340 s/tile is jitter, not a win, and
+        # treating it as one just chases noise to the top of the range.
         improved = (
             not np.isfinite(best_per_tile)
-            or per_tile < best_per_tile * (1.0 - min_improve)
+            or (per_tile < best_per_tile * (1.0 - min_improve)
+                and per_tile <= best_per_tile - min_improve_s)
         )
 
         if improved:
@@ -470,11 +685,13 @@ def _autotune_batch_size(
         else:
             stale_steps += 1
 
-        if oomed and stop_on_oom:
-            stop_reason = (
-                f"stopped after OOM fallback at candidate {cand}"
-            )
-            break
+        if oomed:
+            oom_ceiling = cand
+            if stop_on_oom:
+                stop_reason = (
+                    f"stopped after OOM fallback at candidate {cand}"
+                )
+                break
 
         if stale_steps >= patience and cand > best_batch:
             stop_reason = (
