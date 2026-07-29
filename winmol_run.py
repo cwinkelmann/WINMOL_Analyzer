@@ -29,6 +29,25 @@ from utils.Tiling import build_tile_grid, meters_to_pixels
 
 VALID_PROCESS_TYPES = {'Stems', 'Trees', 'Nodes'}
 
+#: Providers that mean "a GPU/accelerator is available" — CUDA on NVIDIA,
+#: CoreML on Apple Silicon (Metal/ANE).
+_ACCELERATOR_PROVIDERS = ("CUDAExecutionProvider", "CoreMLExecutionProvider")
+
+
+def _cpu_stream_forces_onnx_cpu(prediction_backend, selected_providers):
+    """In cpu_stream mode, should the ONNX runtime be pinned to the CPU
+    provider?
+
+    cpu_stream is the single-device streaming path the planner picks when
+    there is no CUDA GPU. On Apple Silicon it is chosen for lack of CUDA,
+    but CoreML is still a real accelerator (18x faster than CPU here) and
+    must NOT be disabled. So force the CPU provider only when the user
+    explicitly asked for the ``cpu`` backend, or the machine offers no
+    accelerator at all (CUDA or CoreML)."""
+    if str(prediction_backend).lower() == "cpu":
+        return True
+    return not any(p in _ACCELERATOR_PROVIDERS for p in selected_providers)
+
 
 class ImageProcessing:
     def __init__(self, model_path, uav_path, stem_path,
@@ -141,7 +160,11 @@ class ImageProcessing:
         from utils import Prediction as Pred
 
         if plan.prediction_mode == 'cpu_stream':
-            os.environ["WINMOL_ONNX_FORCE_CPU"] = "1"
+            from utils.onnx_runtime import selected_providers
+            if _cpu_stream_forces_onnx_cpu(
+                    getattr(self.config, 'prediction_backend', 'auto'),
+                    selected_providers()):
+                os.environ["WINMOL_ONNX_FORCE_CPU"] = "1"
 
         print("\nLoading Model...")
         model = IO.load_model_from_path(self.model_path)
