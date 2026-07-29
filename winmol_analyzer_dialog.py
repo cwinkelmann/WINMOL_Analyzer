@@ -63,6 +63,15 @@ from .tasks_threads import (
 
 current_path = os.path.dirname(__file__)
 
+# Keep-alive for background threads that outlive the dialog. A parentless
+# QThread whose only Python reference is a dialog attribute gets GC-deleted
+# when the dialog is torn down (QGIS quit, plugin unload/reload) — and
+# destroying a QThread while its OS thread still runs triggers Qt's
+# qFatal() -> abort(), taking down all of QGIS. If a thread can't be stopped
+# promptly at teardown we stash it here (module scope survives dialog GC) so
+# it is never collected while running; it self-evicts on finished().
+_ALIVE_BG = set()
+
 # This loads your .ui file so that PyQt can populate your plugin with the
 # elements from Qt Designer
 FORM_CLASS, _ = uic.loadUiType(
@@ -164,8 +173,6 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         # immediately before a run; never a hardcoded default.
         self.process_type = None
 
-        self.uav_layer_path = None
-        self.uav_layer_name = None
         self.crs = None
         self.worker = None
         self.thread = None
@@ -264,6 +271,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.ensure_thread = None
         self.ensure_worker = None
         self.populate_model_combo_box()
+        self._add_custom_controls()
 
         # The variant selector row is a placeholder in the .ui; nothing
         # populates it yet, so it must not show as an empty row.
@@ -634,6 +642,55 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         else:
             print("Invalid raster layer. Check the path and format.")
 
+    def _add_custom_controls(self):
+        """Add controls not present in the .ui: a QGIS layer selector for
+        the input raster. Defensive — if the widget can't be placed (e.g.
+        an older or newer QGIS gui API), everything else still works."""
+        # Input raster layer selector (pick a layer already loaded in QGIS).
+        try:
+            from qgis.gui import QgsMapLayerComboBox
+            from qgis.core import QgsMapLayerProxyModel
+            self.uav_layer_combo = QgsMapLayerComboBox(self)
+            self.uav_layer_combo.setFilters(QgsMapLayerProxyModel.RasterLayer)
+            self.uav_layer_combo.setAllowEmptyLayer(True)
+            self.uav_layer_combo.setToolTip(
+                "Or pick a raster layer already loaded in QGIS")
+            # Connect AFTER construction so the combo's initial auto-selection
+            # doesn't fire into our slot; then force 'empty' so we never
+            # clobber a typed path when the dialog opens.
+            self.uav_layer_combo.layerChanged.connect(
+                self._on_uav_layer_changed)
+            row = QtWidgets.QWidget(self)
+            hr = QtWidgets.QHBoxLayout(row)
+            hr.setContentsMargins(0, 0, 0, 0)
+            hr.addWidget(QtWidgets.QLabel("Loaded layer:", row))
+            hr.addWidget(self.uav_layer_combo, 1)
+            grid = getattr(self, "gridLayout", None)
+            if grid is not None and hasattr(grid, "addWidget"):
+                grid.addWidget(row, 3, 0, 1, 3)
+            elif getattr(self, "verticalLayout_4", None) is not None:
+                self.verticalLayout_4.insertWidget(1, row)
+            try:
+                self.uav_layer_combo.setLayer(None)
+            except Exception:
+                pass
+        except Exception as exc:                       # pragma: no cover - GUI
+            print("WINMOL: could not add layer selector:", exc)
+
+    def _on_uav_layer_changed(self, layer):
+        """A raster layer was chosen: use its source as the input path."""
+        try:
+            if layer is None or not layer.isValid():
+                return
+            # Strip GDAL subdataset/URI decorations (e.g. 'path|layername').
+            src = layer.source().split("|")[0]
+            if src:
+                self.uav_lineEdit.setText(src)
+                self.uav_path = src
+                self.check_input_file()
+        except Exception:                              # pragma: no cover - GUI
+            pass
+
     def file_dialog_uav(self):
         options = QFileDialog.Options()
         file_path, _ = QFileDialog.getOpenFileName(
@@ -979,6 +1036,68 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         print("Closing application")
         self.close()
 
+    def closeEvent(self, event):
+        # Never let a running background QThread be destroyed while its OS
+        # thread is alive — that qFatals QGIS. Stop/park threads first.
+        self._shutdown_threads()
+        super().closeEvent(event)
+
+    def _shutdown_threads(self):
+        """Stop background threads (inference + Setup-tab jobs) so the
+        dialog and its parentless QThreads can be torn down safely. Call
+        this from the plugin's unload() too, before QGIS drops the dialog
+        reference."""
+        # Inference: cancelling terminates the child process, so the thread's
+        # read loop returns quickly and the thread can be waited out.
+        if self._run_active and self.worker is not None:
+            try:
+                self.worker.cancel()
+            except (RuntimeError, AttributeError):
+                pass
+        self._reap_thread(self.thread, self.worker)
+        # Setup-tab jobs (env build, model download, deletion pricing and
+        # removal, maintenance): request cancel where the worker offers
+        # one. Network reads are timeout-bounded, but e.g. a pip install
+        # mid-flight can't be interrupted, so a thread may get parked.
+        for tname, wname in (
+            ("setup_thread", "setup_worker"),
+            ("ensure_thread", "ensure_worker"),
+            ("remove_thread", "remove_worker"),
+            ("maint_thread", "maint_worker"),
+            ("price_thread", "price_worker"),
+        ):
+            worker = getattr(self, wname, None)
+            cancel = getattr(worker, "cancel", None)
+            if cancel is not None:
+                try:
+                    cancel()
+                except (RuntimeError, AttributeError):
+                    pass
+            self._reap_thread(getattr(self, tname, None), worker)
+
+    def _reap_thread(self, thread, worker):
+        """Quit + wait a bounded time for a QThread. If it is still running
+        (e.g. pip mid-install), park it in _ALIVE_BG so it is never GC'd while
+        running (which would qFatal); it self-evicts when it finishes."""
+        if thread is None:
+            return
+        try:
+            if not thread.isRunning():
+                return
+            thread.quit()
+            if thread.wait(8000):
+                return
+            _ALIVE_BG.add(thread)
+            if worker is not None:
+                _ALIVE_BG.add(worker)
+
+            def _evict(t=thread, w=worker):
+                _ALIVE_BG.discard(t)
+                _ALIVE_BG.discard(w)
+            thread.finished.connect(_evict)
+        except RuntimeError:
+            pass
+
     def run_process(self):
         # A stale cancel from a previous env-setup/model-download phase
         # must not carry into this run.
@@ -1029,7 +1148,8 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         if not self.uav_path:
             QtWidgets.QMessageBox.warning(
                 self, "WINMOL Analyzer",
-                "No input GeoTiff selected. Pick a file or type a path.")
+                "No input GeoTiff selected. Pick a file, type a path, or "
+                "choose a loaded raster layer.")
             return
         if not os.path.exists(self.uav_path):
             QtWidgets.QMessageBox.warning(
