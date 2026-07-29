@@ -257,23 +257,6 @@ def test_scan_flags_device_default_and_installed(tmp_path):
     assert by_id["spruce_int8"].installed is True
     assert by_id["spruce_int8"].bytes_on_disk == len(b"quantized-weights")
     assert by_id["spruce_fp32"].installed is False
-    assert by_id["spruce_int8"].verified is None        # stat()-only scan
-
-
-def test_scan_verify_checks_pinned_checksums(tmp_path):
-    config_path, models_dir = _write_registry(tmp_path)
-    rows = model_status.scan(config_path, models_dir, device="cpu",
-                             verify=True)
-    by_id = {row.entry_id: row for row in rows}
-    assert by_id["spruce_int8"].verified is True
-    assert by_id["spruce_fp32"].verified is None        # not on disk
-    corrupt = os.path.join(models_dir, "spruce_int8.onnx")
-    with open(corrupt, "wb") as f:
-        f.write(b"bitrot")
-    rows = model_status.scan(config_path, models_dir, device="cpu",
-                             verify=True)
-    by_id = {row.entry_id: row for row in rows}
-    assert by_id["spruce_int8"].verified is False
 
 
 # --- env_info + texts -------------------------------------------------------

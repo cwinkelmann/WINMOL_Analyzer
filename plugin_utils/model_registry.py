@@ -21,9 +21,10 @@ import hashlib
 import json
 import os
 import platform
-import subprocess
 from dataclasses import dataclass
 from typing import Dict, List, Optional
+
+from .gpu_probe import run_nvidia_smi_query
 
 _CHUNK_BYTES = 1024 * 1024
 #: device -> the precision its family variant must carry.
@@ -115,9 +116,8 @@ class Registry:
         fam = self.families.get(name_s)
         if fam is None:
             key = name_s.lower()
-            canonical = self._entry_lookup.get(key)
-            if canonical is not None:
-                return self.entries[canonical]
+            if key in self._entry_lookup:
+                return self.get(name_s)
             fam_id = self._family_lookup.get(key)
             if fam_id is None:
                 return self.get(name)   # raises the descriptive KeyError
@@ -260,16 +260,7 @@ def detect_device() -> str:
 
 def _probe_nvidia() -> str:
     """"gpu" if ``nvidia-smi`` lists at least one GPU, else "cpu"."""
-    try:
-        out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=20)
-        if out.returncode == 0 and any(
-                ln.strip() for ln in out.stdout.splitlines()):
-            return "gpu"
-    except Exception:
-        pass
-    return "cpu"
+    return "gpu" if run_nvidia_smi_query("index", timeout=20) else "cpu"
 
 
 # --- integrity verification -----------------------------------------------

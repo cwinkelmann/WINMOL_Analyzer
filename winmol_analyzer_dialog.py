@@ -23,6 +23,7 @@ Dialog
  ***************************************************************************/
 """
 
+import functools
 import os
 import glob
 import platform
@@ -67,6 +68,20 @@ current_path = os.path.dirname(__file__)
 FORM_CLASS, _ = uic.loadUiType(
     os.path.join(current_path, "winmol_analyzer_dialog_base.ui")
 )
+
+
+def _refuse_if_busy(method):
+    """Slot decorator: the busy-guard every Setup-tab slot opens with.
+    While any setup job runs (``_busy_kind``), refuse with the standard
+    status line instead of entering the slot — one job at a time is a
+    guarantee, not a hope."""
+    @functools.wraps(method)
+    def guarded(self, *args, **kwargs):
+        if self._busy_kind():
+            self._refuse_busy()
+            return None
+        return method(self, *args, **kwargs)
+    return guarded
 
 
 class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
@@ -469,7 +484,12 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         default_id = None
         if self.registry is not None and ordered_ids:
             try:
-                default_id = self.registry.default_entry().id
+                # The dialog's cached 2 s-bounded probe (_model_device),
+                # NOT default_entry's own detect_device fallback — that
+                # one runs a 20 s nvidia-smi on the GUI thread at
+                # dialog open.
+                default_id = self.registry.default_entry(
+                    self._model_device()).id
             except Exception:
                 default_id = ordered_ids[0]
         if default_id is not None:
@@ -1088,6 +1108,18 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         first-run path; the caller set _setup_running and busy UI)."""
         self._start_env_setup_worker(gpu=None, then_run=True)
 
+    def _new_worker_thread(self, worker):
+        """The QThread scaffolding every worker launch shares: park
+        ``worker`` on a fresh thread, start its ``run`` with the
+        thread, and let the thread delete itself once stopped. Which
+        signals QUIT the thread and DELETE the worker genuinely
+        differs per site, so that wiring stays with each caller."""
+        thread = QThread()
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        thread.finished.connect(thread.deleteLater)
+        return thread
+
     def _start_env_setup_worker(self, gpu, then_run):
         """The single EnvSetupWorker launch site (first-run build,
         create, repair, GPU install). ``gpu`` None honors WINMOL_GPU;
@@ -1096,11 +1128,9 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         _setup_running before this is reached, so a live setup_thread
         is never reassigned."""
         self._setup_then_run = bool(then_run)
-        self.setup_thread = QThread()
         self.setup_worker = EnvSetupWorker(
             os.path.dirname(__file__), gpu=gpu)
-        self.setup_worker.moveToThread(self.setup_thread)
-        self.setup_thread.started.connect(self.setup_worker.run)
+        self.setup_thread = self._new_worker_thread(self.setup_worker)
         self.setup_worker.log.connect(self._on_setup_log)
         self.setup_worker.done.connect(self._on_env_setup_done)
         self.setup_worker.failed.connect(self._on_env_setup_failed)
@@ -1108,7 +1138,6 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.setup_worker.failed.connect(self.setup_thread.quit)
         self.setup_worker.done.connect(self.setup_worker.deleteLater)
         self.setup_worker.failed.connect(self.setup_worker.deleteLater)
-        self.setup_thread.finished.connect(self.setup_thread.deleteLater)
         self.setup_thread.start()
 
     def _on_env_setup_done(self, python_exe):
@@ -1163,12 +1192,10 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.update_output_log(
             f"Preparing model '{self._selected_model_entry.label}'..."
         )
-        self.ensure_thread = QThread()
         self.ensure_worker = ModelEnsureWorker(
             self._selected_model_entry, self.models_dir
         )
-        self.ensure_worker.moveToThread(self.ensure_thread)
-        self.ensure_thread.started.connect(self.ensure_worker.run)
+        self.ensure_thread = self._new_worker_thread(self.ensure_worker)
         self.ensure_worker.log.connect(self.update_output_log)
         self.ensure_worker.done.connect(self._on_model_ensured)
         self.ensure_worker.failed.connect(self._on_model_ensure_failed)
@@ -1176,7 +1203,6 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.ensure_worker.failed.connect(self.ensure_thread.quit)
         self.ensure_worker.done.connect(self.ensure_worker.deleteLater)
         self.ensure_worker.failed.connect(self.ensure_worker.deleteLater)
-        self.ensure_thread.finished.connect(self.ensure_thread.deleteLater)
         self.ensure_thread.start()
 
     def _on_model_ensured(self, model_path):
@@ -1460,12 +1486,11 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         )
 
     def _reresolve_env(self):
-        """Synchronously re-run resolve_environment(build=False) into
-        the cache. Sub-second without a configured interpreter; a few
-        seconds worst case with one (two subprocess probes) — accepted
-        on a click / worker completion, same rule as choose."""
-        self.env = installer.resolve_environment(
-            self._plugin_dir(), build=False)
+        """Synchronously re-run resolve_environment into the cache.
+        Sub-second without a configured interpreter; a few seconds
+        worst case with one (two subprocess probes) — accepted on a
+        click / worker completion, same rule as choose."""
+        self.env = installer.resolve_environment(self._plugin_dir())
         self.venv_path = self.env.get("venv_path") or self.venv_path
         self.python_exe = self.env.get("python")
         self.models_dir = os.path.join(
@@ -1598,18 +1623,15 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self._venv_bytes = 0
             return
         self._pricing = True
-        self.price_thread = QThread()
         self.price_worker = EnvRemoveWorker(
             self._plugin_dir(), dry_run=True)
-        self.price_worker.moveToThread(self.price_thread)
-        self.price_thread.started.connect(self.price_worker.run)
+        self.price_thread = self._new_worker_thread(self.price_worker)
         self.price_worker.priced.connect(self._on_size_priced)
         self.price_worker.failed.connect(self._on_size_price_failed)
         self.price_worker.priced.connect(self.price_thread.quit)
         self.price_worker.failed.connect(self.price_thread.quit)
         self.price_worker.priced.connect(self.price_worker.deleteLater)
         self.price_worker.failed.connect(self.price_worker.deleteLater)
-        self.price_thread.finished.connect(self.price_thread.deleteLater)
         self.price_thread.start()
 
     def _on_size_priced(self, plan):
@@ -1774,10 +1796,8 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
 
     # --- Step 1 slots: environment --------------------------------------
 
+    @_refuse_if_busy
     def _setup_create_env(self):
-        if self._busy_kind():
-            self._refuse_busy()
-            return
         self._setup_running = True
         self._set_busy_ui(True)
         self._set_setup_status("Creating the WINMOL environment …")
@@ -1787,6 +1807,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             "usable.")
         self._start_env_setup_worker(gpu=None, then_run=False)
 
+    @_refuse_if_busy
     def _setup_repair_env(self):
         """Reinstall the dependencies. The variant is read BEFORE the
         sentinel is dropped: a repair must reinstall what the user
@@ -1794,9 +1815,6 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         invalidating the marker first is mandatory — setup_environment
         short-circuits on a valid sentinel, so the repair would
         otherwise be a no-op."""
-        if self._busy_kind():
-            self._refuse_busy()
-            return
         venv = self.venv_path or installer.venv_location(self._plugin_dir())
         gpu = installer.installed_variant(venv) == "gpu"
         installer.invalidate_marker(venv)
@@ -1811,6 +1829,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             "safe to leave running and QGIS stays usable.")
         self._start_env_setup_worker(gpu=gpu, then_run=False)
 
+    @_refuse_if_busy
     def _setup_install_gpu(self):
         """Swap the CPU inference runtime for the CUDA one, explicitly
         confirmed — a 2 GB download is not started on the user's
@@ -1819,9 +1838,6 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         install_requirements removes the conflicting CPU runtime first
         (installer.uninstall_conflicting_runtime — both distributions
         provide the 'onnxruntime' module, so exactly one may exist)."""
-        if self._busy_kind():
-            self._refuse_busy()
-            return
         probe = self._gpu_probe_cached()
         if not probe.present:
             self._set_setup_status(
@@ -1846,15 +1862,13 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             f"Installing the GPU runtime for {probe.label} …")
         self._start_env_setup_worker(gpu=True, then_run=False)
 
+    @_refuse_if_busy
     def _setup_choose_interpreter(self):
         """Point WINMOL at an existing interpreter. Validated HERE,
         synchronously (~1-2 s of subprocess probes on an explicit
         click), so a wrong pick fails with a dialog now instead of a
         broken run later; only a valid pick is written to
         QgsSettings."""
-        if self._busy_kind():
-            self._refuse_busy()
-            return
         file_path, _ = QFileDialog.getOpenFileName(
             self, "Choose a Python 3.11 interpreter with WINMOL's "
             "dependencies installed", "", "All files (*)")
@@ -1908,6 +1922,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         says so in words, this button shows it)."""
         self._open_folder(installer.managed_root(self._plugin_dir()))
 
+    @_refuse_if_busy
     def _setup_clear_autotune(self):
         """Forget the persisted prediction batch-size measurement.
 
@@ -1918,9 +1933,6 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         thread — but it still refuses while a run is live, because the
         child holds the same file.
         """
-        if self._busy_kind():
-            self._refuse_busy()
-            return
         from .plugin_utils import autotune_cache
         path = installer.autotune_cache_location(self._plugin_dir())
         removed = autotune_cache.clear(path)
@@ -1952,10 +1964,8 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
     # _env_removing guards the whole cycle, both workers and the modal
     # between them.
 
+    @_refuse_if_busy
     def _setup_delete_env(self):
-        if self._busy_kind():
-            self._refuse_busy()
-            return
         plan = setup_state.deletion_plan(
             self._plugin_dir(), configured_exe=self.python_exe)
         if plan["kind"] == "byo":
@@ -2019,12 +2029,10 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         thread.finished then fires the confirmation — see
         _on_deletion_priced for why not earlier); a real removal ends
         on ``done``. ``failed`` ends both."""
-        self.remove_thread = QThread()
         self.remove_worker = EnvRemoveWorker(
             self._plugin_dir(), configured_exe=self.python_exe,
             dry_run=dry_run, **flags)
-        self.remove_worker.moveToThread(self.remove_thread)
-        self.remove_thread.started.connect(self.remove_worker.run)
+        self.remove_thread = self._new_worker_thread(self.remove_worker)
         self.remove_worker.log.connect(self._on_setup_log)
         self.remove_worker.failed.connect(self._on_env_remove_failed)
         self.remove_worker.failed.connect(self.remove_thread.quit)
@@ -2040,7 +2048,6 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self.remove_worker.done.connect(self._on_env_removed)
             self.remove_worker.done.connect(self.remove_thread.quit)
             self.remove_worker.done.connect(self.remove_worker.deleteLater)
-        self.remove_thread.finished.connect(self.remove_thread.deleteLater)
         self.remove_thread.start()
 
     def _on_deletion_priced(self, plan):
@@ -2148,21 +2155,17 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
 
     # --- Step 2 slots: models -------------------------------------------
 
+    @_refuse_if_busy
     def _setup_rescan(self):
-        if self._busy_kind():
-            self._refuse_busy()
-            return
         self._venv_bytes = None     # an honest rescan re-prices too
         self._set_setup_status("Rescanned.")
         self._refresh_setup_tab()
 
+    @_refuse_if_busy
     def _setup_download_selected(self, *_args):
         # itemDoubleClicked lands here too (item, column absorbed by
         # *_args) — same guard as the button, so no signal path gets
         # around the interlock.
-        if self._busy_kind():
-            self._refuse_busy()
-            return
         row = self._selected_model_row()
         entry = (self.registry.entries.get(row.entry_id)
                  if row is not None and self.registry is not None
@@ -2172,10 +2175,8 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             return
         self._start_model_download(entry)
 
+    @_refuse_if_busy
     def _setup_download_default(self):
-        if self._busy_kind():
-            self._refuse_busy()
-            return
         try:
             entry = self.registry.default_entry(self._model_device())
         except Exception:
@@ -2198,12 +2199,10 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self._set_busy_ui(False)
         self._refresh_setup_tab()
 
+    @_refuse_if_busy
     def _setup_verify_all(self):
         """Checksum every pinned model file on disk (worker-thread
         territory — hashing a 100 MB file is not a click-time cost)."""
-        if self._busy_kind():
-            self._refuse_busy()
-            return
         self._models_busy = True
         self._start_model_job(
             ModelMaintenanceWorker(
@@ -2212,10 +2211,8 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             "Verifying model checksums …",
             self._on_model_maintenance_done)
 
+    @_refuse_if_busy
     def _setup_delete_model(self):
-        if self._busy_kind():
-            self._refuse_busy()
-            return
         row = self._selected_model_row()
         if row is None or not row.installed:
             self._set_setup_status("Select an installed model first.")
@@ -2251,10 +2248,8 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self._set_busy_ui(True)
         self._set_setup_status(status)
         self._append_setup_detail(status)
-        self.maint_thread = QThread()
         self.maint_worker = worker
-        worker.moveToThread(self.maint_thread)
-        self.maint_thread.started.connect(worker.run)
+        self.maint_thread = self._new_worker_thread(worker)
         worker.log.connect(self._on_setup_log)
         worker.done.connect(done_slot)
         worker.failed.connect(self._on_model_job_failed)
@@ -2262,7 +2257,6 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         worker.failed.connect(self.maint_thread.quit)
         worker.done.connect(worker.deleteLater)
         worker.failed.connect(worker.deleteLater)
-        self.maint_thread.finished.connect(self.maint_thread.deleteLater)
         self.maint_thread.start()
 
     def _on_model_maintenance_done(self, result):

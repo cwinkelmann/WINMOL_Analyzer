@@ -21,7 +21,7 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from .childenv import child_env
+from .childenv import run_isolated
 
 #: Seconds before a wedged ``nvidia-smi`` is given up on. A healthy
 #: driver answers in ~50 ms; a broken one costs a pause, not a hang.
@@ -96,13 +96,17 @@ def driver_new_enough(driver_version, system=None) -> bool:
     return parsed >= minimum
 
 
-def _run_nvidia_smi(timeout):
-    """``(None, stdout)`` on success, ``(status, stdout)`` on failure."""
+def _run_nvidia_smi(timeout, fields="name,driver_version", nounits=False):
+    """``(None, stdout)`` on success, ``(status, stdout)`` on failure.
+    The one place that builds and runs an ``nvidia-smi --query-gpu``
+    argv; :func:`run_nvidia_smi_query` is the front door for callers
+    that do not need the timeout/no-driver distinction."""
+    fmt = "csv,noheader" + (",nounits" if nounits else "")
     try:
         result = subprocess.run(
             ["nvidia-smi",
-             "--query-gpu=name,driver_version",
-             "--format=csv,noheader"],
+             "--query-gpu=" + fields,
+             "--format=" + fmt],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, check=False, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -114,6 +118,23 @@ def _run_nvidia_smi(timeout):
     if result.returncode != 0:
         return STATUS_NO_DRIVER, result.stdout or ""
     return None, result.stdout or ""
+
+
+def run_nvidia_smi_query(fields, timeout=NVIDIA_SMI_TIMEOUT, nounits=False):
+    """Stripped, non-empty output lines of ``nvidia-smi
+    --query-gpu=<fields> --format=csv,noheader[,nounits]``, or ``None``
+    on ANY failure (absent, erroring, or wedged driver). Never raises —
+    the shared query for every caller that only needs the lines
+    (model_registry's device probe, winmol_batch's GPU count,
+    Prediction's free-VRAM read)."""
+    try:
+        failure, stdout = _run_nvidia_smi(timeout, fields=fields,
+                                          nounits=nounits)
+    except Exception:
+        return None
+    if failure is not None:
+        return None
+    return [ln.strip() for ln in stdout.splitlines() if ln.strip()]
 
 
 def probe(system=None, machine=None, timeout=NVIDIA_SMI_TIMEOUT,
@@ -208,10 +229,7 @@ def _probe_providers(venv_python, timeout=PROVIDER_PROBE_TIMEOUT) -> dict:
     short diagnosis. Never raises."""
     empty = {"ok": False, "version": None, "providers": [], "error": None}
     try:
-        out = subprocess.run(
-            [venv_python, "-I", "-c", _PROVIDER_PROBE_CODE],
-            capture_output=True, text=True, timeout=timeout,
-            env=child_env(python_exe=venv_python))
+        out = run_isolated(venv_python, _PROVIDER_PROBE_CODE, timeout)
     except subprocess.TimeoutExpired:
         return {**empty, "error": f"timed out after {timeout:.0f}s"}
     except Exception as exc:

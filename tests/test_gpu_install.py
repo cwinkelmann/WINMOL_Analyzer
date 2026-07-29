@@ -417,7 +417,7 @@ def test_resolve_environment_rebuilds_cpu_venv_when_gpu_requested(
                         lambda venv, gpu=None: gpu is None)
     monkeypatch.delenv("WINMOL_GPU", raising=False)
     assert installer.resolve_environment(
-        str(tmp_path), build=False)["status"] == "ready"
+        str(tmp_path))["status"] == "ready"
     monkeypatch.setenv("WINMOL_GPU", "1")
     assert installer.resolve_environment(
-        str(tmp_path), build=False)["status"] == "needs_setup"
+        str(tmp_path))["status"] == "needs_setup"

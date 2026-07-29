@@ -17,13 +17,12 @@ Reference: https://github.com/astral-sh/python-build-standalone
 import hashlib
 import os
 import platform
-import subprocess
 import sys
 import tarfile
 import time
 import urllib.request
 
-from .childenv import child_env
+from .childenv import PY_VERSION_PROBE, run_isolated
 
 # Pinned PBS release (see the release assets' `digest` field on GitHub).
 PBS_TAG = "20260623"
@@ -152,10 +151,7 @@ def _safe_extract(tar, path):
 def _verify_runs(exe):
     """True if exe runs and reports Python 3.11."""
     try:
-        out = subprocess.run(
-            [exe, "-I", "-c",
-             "import sys;print('%d.%d' % sys.version_info[:2])"],
-            capture_output=True, text=True, timeout=60, env=child_env())
+        out = run_isolated(exe, PY_VERSION_PROBE, timeout=60)
         return out.returncode == 0 and out.stdout.strip() == "3.11"
     except Exception:
         return False

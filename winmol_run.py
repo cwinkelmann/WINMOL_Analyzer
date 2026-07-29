@@ -105,12 +105,11 @@ class ImageProcessing:
         self._apply_plan_to_config(plan, hardware)
         return plan
 
-    def _apply_plan_to_config(self, plan, hardware=None):
+    def _apply_plan_to_config(self, plan, hardware):
         # Carry the detected hardware onto the config so the prediction
         # phase can key its autotune cache on it without re-probing
         # nvidia-smi.
-        if hardware is not None:
-            self.config.hardware = hardware
+        self.config.hardware = hardware
         self.config.cpu_workers = (
             plan.vector_inner_workers
             if plan.vector_mode == 'tiled'

@@ -44,7 +44,7 @@ def classFactory(iface):  # pylint: disable=invalid-name
     # Run (see tasks_threads.EnvSetupWorker). The compute env runs as a
     # separate child process (see plugin_utils/childenv.py), so nothing
     # from it is ever imported into QGIS' own interpreter.
-    env = resolve_environment(plugin_dir, prompt=False, build=False)
+    env = resolve_environment(plugin_dir)
 
     from .winmol_analyzer import WINMOLAnalyzer
     return WINMOLAnalyzer(iface, env)

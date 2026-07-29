@@ -21,7 +21,6 @@ def process_type_for(stem: bool, trees: bool, nodes: bool) -> str:
         return "Nodes"
     if trees:
         return "Trees"
-    _ = stem
     return "Stems"
 
 

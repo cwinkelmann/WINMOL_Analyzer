@@ -260,8 +260,10 @@ def test_verify_runs_false_when_reported_version_does_not_match(
     class _Result:
         returncode = 0
         stdout = "3.9"
+    # _verify_runs probes through childenv.run_isolated.
+    childenv = importlib.import_module("plugin_utils.childenv")
     monkeypatch.setattr(
-        py311.subprocess, "run", lambda *a, **k: _Result())
+        childenv.subprocess, "run", lambda *a, **k: _Result())
     assert py311._verify_runs("whatever") is False
 
 

@@ -4,7 +4,6 @@
 """Imports"""
 import os
 import queue
-import subprocess
 import threading
 import time
 import contextlib
@@ -19,6 +18,7 @@ from skimage.transform import resize
 
 from classes.Timer import Timer
 from plugin_utils import autotune_cache
+from plugin_utils.gpu_probe import run_nvidia_smi_query
 from utils import IO
 
 
@@ -256,34 +256,18 @@ def _available_ram_bytes():
 
 def _free_gpu_memory_gb():
     """Free VRAM per visible GPU in GiB via ``nvidia-smi``, or ``[]`` when
-    it is unavailable or fails. Never raises."""
-    try:
-        result = subprocess.run(
-            ['nvidia-smi', '--query-gpu=memory.free',
-             '--format=csv,noheader,nounits'],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False,
-            # A driver stuck in an uninterruptible ioctl used to hang this
-            # call forever (rr NVIDIA_SMI_TIMEOUT); the except catches
-            # TimeoutExpired and falls back to the host-RAM bound.
-            timeout=8.0,
-        )
-        if result.returncode != 0:
-            return []
-        values = []
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                values.append(float(line) / 1024.0)
-            except ValueError:
-                continue
-        return values
-    except Exception:
-        return []
+    it is unavailable or fails. Never raises. The query is bounded: a
+    driver stuck in an uninterruptible ioctl used to hang this call
+    forever (rr NVIDIA_SMI_TIMEOUT); on timeout the caller falls back
+    to the host-RAM bound."""
+    lines = run_nvidia_smi_query("memory.free", timeout=8.0, nounits=True)
+    values = []
+    for line in lines or []:
+        try:
+            values.append(float(line) / 1024.0)
+        except ValueError:
+            continue
+    return values
 
 
 def _free_memory_bytes(model, config):
@@ -1032,30 +1016,6 @@ def predict_stream_to_raster(
     print("#######################################################")
     print("")
     return out_profile
-
-
-def predict_stream_single_gpu(
-    uav_path: str,
-    output_stem_map: str,
-    model,
-    config,
-):
-    return predict_stream_to_raster(uav_path, output_stem_map, model, config)
-
-
-def predict_stream_cpu(
-    uav_path: str,
-    output_stem_map: str,
-    model,
-    config,
-):
-    return predict_stream_to_raster(uav_path, output_stem_map, model, config)
-
-
-def predict_with_resampling_stream_to_raster(
-    uav_path, output_stem_path, model, config
-):
-    return predict_stream_to_raster(uav_path, output_stem_path, model, config)
 
 
 def predict_with_resampling_per_tile(img, profile, model, config):
