@@ -1698,7 +1698,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             # The run does not start — the environment it would use is
             # about to be rebuilt (press Run again afterwards).
             self._go_to_setup()
-            self._setup_install_gpu()
+            self._setup_install_gpu(confirmed=True)
             return False
         self._remember_gpu_prompt(token)
         self.update_output_log(
@@ -2293,9 +2293,13 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
                     "finish, or press Cancel.")
         if kind is not None:
             return setup_state.TXT_BLOCK_BUSY
-        reason = setup_state.blocking_reason(self._env_info(), busy=False)
-        if reason is not None:
-            return reason
+        # needs_setup does NOT block Run: clicking Run builds the env
+        # then runs (the zero-prerequisite "install QGIS + plugin, ready
+        # to go" flow). Only a genuinely broken BYO interpreter is a
+        # dead end the click cannot recover from.
+        info = self._env_info()
+        if info.status == "error" and info.python is None:
+            return info.message or setup_state.TXT_ENV_ERROR
         try:
             has_input = bool(self.uav_lineEdit.text().strip())
         except Exception:                          # pragma: no cover - GUI
@@ -2590,20 +2594,24 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self._start_env_setup_worker(gpu=gpu, then_run=False)
 
     @_refuse_if_busy
-    def _setup_install_gpu(self):
+    def _setup_install_gpu(self, confirmed=False):
         """Swap the CPU inference runtime for the CUDA one, explicitly
         confirmed — a 2 GB download is not started on the user's
         behalf. No marker games needed: setup_environment(gpu=True)
         sees the CPU-variant sentinel as not-ready and rebuilds, and
         install_requirements removes the conflicting CPU runtime first
         (installer.uninstall_conflicting_runtime — both distributions
-        provide the 'onnxruntime' module, so exactly one may exist)."""
+        provide the 'onnxruntime' module, so exactly one may exist).
+
+        ``confirmed=True`` skips the confirm box — the pre-run GPU offer
+        already asked, so the click-through would double-prompt."""
         probe = self._gpu_probe_cached()
         if not probe.present:
             self._set_setup_status(
                 probe.detail or "No usable NVIDIA GPU was found.")
             return
-        reply = QtWidgets.QMessageBox.question(
+        reply = (QtWidgets.QMessageBox.Yes if confirmed
+                 else QtWidgets.QMessageBox.question(
             self, "Install GPU runtime",
             f"Replace the CPU inference runtime with the CUDA one for "
             f"{probe.label}?\n\n"
@@ -2612,7 +2620,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             "runtime — the two cannot coexist.\n\n"
             "'No' keeps the working CPU environment.",
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-            QtWidgets.QMessageBox.No)
+            QtWidgets.QMessageBox.No))
         if reply != QtWidgets.QMessageBox.Yes:
             return
         self._venv_bytes = None
