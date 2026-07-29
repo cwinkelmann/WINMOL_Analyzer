@@ -15,6 +15,7 @@ import json
 import os
 import queue
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -24,6 +25,7 @@ from pathlib import Path
 from .childenv import child_env, safe_child_cwd
 
 WINMOL_VENV_NAME = "winmol_venv"
+MODELS_DIR_NAME = "models"
 READY_MARKER = ".winmol_ready"
 QSETTINGS_PYTHON_KEY = "winmol/python_executable"
 #: Any value here silences the dialog's one-line GPU offer.
@@ -93,6 +95,12 @@ def managed_root(plugin_dir) -> str:
 def venv_location(plugin_dir) -> str:
     """Absolute path of the managed venv (under managed_root)."""
     return os.path.join(managed_root(plugin_dir), WINMOL_VENV_NAME)
+
+
+def models_location(plugin_dir) -> str:
+    """The downloaded-models directory (a sibling of the venv, so it
+    also survives a QGIS plugin uninstall)."""
+    return os.path.join(managed_root(plugin_dir), MODELS_DIR_NAME)
 
 
 def get_venv_python_path(venv_path) -> str:
@@ -242,6 +250,185 @@ def _write_marker(venv_path, gpu=False) -> None:
         json.dump({"req_hash": _file_hash(req),
                    "variant": "gpu" if gpu else "cpu",
                    "requirements": str(req)}, f)
+
+
+def invalidate_marker(venv_path) -> bool:
+    """Drop the ``.winmol_ready`` sentinel so :func:`is_ready` reports
+    the environment as needing a rebuild. First step of both "Reinstall
+    dependencies" and "Delete environment" — ``setup_environment``
+    short-circuits on a valid marker, and a half-deleted venv must
+    never keep being blessed as ready. True when one was removed."""
+    try:
+        os.remove(_marker_path(venv_path))
+        return True
+    except OSError:
+        return False
+
+
+# --- disk usage / removal ---------------------------------------------------
+
+def directory_size(path) -> int:
+    """Total size in bytes of the files under ``path`` (0 when absent).
+    Symlinks are not followed and unreadable entries are skipped: this
+    feeds a human-readable "frees N GB" figure, so it must never
+    raise."""
+    total = 0
+    for root, _dirs, files in os.walk(path, onerror=lambda _e: None):
+        for name in files:
+            full = os.path.join(root, name)
+            try:
+                if not os.path.islink(full):
+                    total += os.path.getsize(full)
+            except OSError:
+                pass
+    return total
+
+
+def _managed_roots(plugin_dir) -> tuple:
+    return (managed_root(plugin_dir), plugin_dir)
+
+
+def _is_managed_path(path, plugin_dir) -> bool:
+    """A path may only be deleted when it is a STRICT descendant of the
+    managed root or of the plugin directory."""
+    for root in _managed_roots(plugin_dir):
+        if not root:
+            continue
+        if path_is_inside(path, root) and not path_is_inside(root, path):
+            return True
+    return False
+
+
+def _chmod_retry(func, path):
+    """rmtree error handler: clear the read-only bit (Windows venvs
+    ship read-only files) and retry once; re-raise if it still fails."""
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+
+def _rmtree(path) -> None:
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=lambda f, p, _e: _chmod_retry(f, p))
+    else:
+        shutil.rmtree(path, onerror=lambda f, p, _i: _chmod_retry(f, p))
+
+
+def remove_environment(plugin_dir, remove_venv=True, remove_runtime=False,
+                       remove_models=False, configured_exe=None,
+                       dry_run=False, progress=None) -> dict:
+    """Delete WINMOL's managed artifacts. Never raises. REFUSES any
+    path outside the managed tree (:func:`_is_managed_path`).
+
+    Returns ``{'planned': [(path, bytes)], 'removed': [path],
+    'failed': [(path, message)], 'freed_bytes': int,
+    'clear_setting': bool}``. With ``dry_run=True`` the SAME dict shape
+    comes back without anything being deleted — the confirmation text
+    and its "frees N GB" figure are therefore produced by the exact
+    code path that performs the deletion, so the two can never drift.
+
+    ``clear_setting`` is True only when ``configured_exe`` resolves
+    INSIDE a tree that is actually being removed; a bring-your-own
+    conda interpreter is never touched and never un-configured. The
+    caller (the dialog) performs the QgsSettings write — this module
+    stays importable without QGIS.
+    """
+    report = _as_progress(progress)
+    venv = venv_location(plugin_dir)
+    runtime = os.path.join(managed_root(plugin_dir), "py311")
+    models_dir = models_location(plugin_dir)
+    result = {"planned": [], "removed": [], "failed": [],
+              "freed_bytes": 0, "clear_setting": False}
+
+    result["clear_setting"] = bool(
+        remove_venv and configured_exe
+        and path_is_inside(configured_exe, venv))
+
+    trees = []
+    if remove_venv:
+        trees.append(venv)
+    if remove_runtime:
+        trees.append(runtime)
+    for path in trees:
+        if not _is_managed_path(path, plugin_dir):
+            result["failed"].append(
+                (path, "refused: outside the managed tree"))
+            continue
+        if os.path.isdir(path):
+            result["planned"].append((path, directory_size(path)))
+
+    model_plan = None
+    if remove_models:
+        if not _is_managed_path(models_dir, plugin_dir):
+            result["failed"].append(
+                (models_dir, "refused: outside the managed tree"))
+        else:
+            model_plan = _plan_models(plugin_dir, models_dir, dry_run=True)
+            if model_plan["freed_bytes"] or model_plan["planned"]:
+                result["planned"].append(
+                    (models_dir, model_plan["freed_bytes"]))
+
+    if dry_run:
+        result["freed_bytes"] = sum(size for _p, size in result["planned"])
+        return result
+
+    # A half-deleted venv must degrade to "needs rebuild", never stay
+    # blessed by is_ready(); do this BEFORE the first rmtree. Gated on
+    # the same managed-tree check as the rmtree itself.
+    if remove_venv and _is_managed_path(venv, plugin_dir):
+        invalidate_marker(venv)
+
+    for path, size in list(result["planned"]):
+        if path == models_dir:
+            continue
+        report(f"Removing {path} …")
+        try:
+            _rmtree(path)
+            result["removed"].append(path)
+            result["freed_bytes"] += size
+        except Exception as exc:
+            result["failed"].append((path, str(exc)))
+    if model_plan is not None:
+        done = _plan_models(plugin_dir, models_dir, dry_run=False,
+                            progress=report)
+        result["removed"].extend(done["removed"])
+        result["failed"].extend(done["failed"])
+        result["freed_bytes"] += done["freed_bytes"]
+    return result
+
+
+def _plan_models(plugin_dir, models_dir, dry_run, progress=None):
+    """Price/remove registry-known model files (and their ``.part``
+    leftovers) under ``models_dir`` — the registry owns the on-disk
+    naming rule, so unknown files are never touched."""
+    result = {"planned": [], "removed": [], "failed": [], "freed_bytes": 0}
+    try:
+        from . import model_registry
+        registry = model_registry.load_registry(
+            os.path.join(plugin_dir, "config.json"))
+    except Exception as exc:
+        if not dry_run and progress is not None:
+            progress(f"Could not read the model registry: {exc}")
+        return result
+    victims = []
+    for entry in registry.entries.values():
+        base = model_registry.local_path(entry, models_dir)
+        victims.extend((base, base + ".part"))
+    for path in victims:
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        result["planned"].append((path, size))
+        if dry_run:
+            result["freed_bytes"] += size
+            continue
+        try:
+            os.remove(path)
+            result["removed"].append(path)
+            result["freed_bytes"] += size
+        except OSError as exc:
+            result["failed"].append((path, str(exc)))
+    return result
 
 
 # --- streamed child processes -----------------------------------------------
