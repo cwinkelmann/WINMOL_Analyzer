@@ -24,26 +24,30 @@ Dialog
 """
 
 import os
-import psutil
 import glob
 from pathlib import Path
 
-from PyQt5.QtWidgets import QFileDialog
+try:
+    import psutil          # optional: used only to report available RAM
+except Exception:
+    psutil = None
 
-
-from PyQt5.QtCore import QThread
-
+# qgis.PyQt shims to the active Qt binding (PyQt5 on QGIS 3).
+from qgis.PyQt.QtWidgets import QFileDialog
+from qgis.PyQt.QtCore import Qt, QThread
 
 from qgis.core import QgsProject, QgsVectorLayer, QgsRasterLayer
 from qgis.PyQt import QtWidgets, uic
 
 from .classes.Config import Config
-from .plugin_utils import gpu_probe
+from .plugin_utils import config_overrides, gpu_probe
 from .plugin_utils.installer import (
     QSETTINGS_GPU_PROMPT_KEY,
     installed_variant,
 )
 from .plugin_utils.model_registry import load_registry
+from .plugin_utils.output_selection import gpkg_layers_for, process_type_for
+from .plugin_utils.run_progress import RunProgress
 from .tasks_threads import EnvSetupWorker, ModelEnsureWorker, Worker
 
 current_path = os.path.dirname(__file__)
@@ -61,8 +65,42 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
     #: opposed to a registry entry id.
     CUSTOM_MODEL_ID = "__custom__"
 
+    #: Setup-tab controls that only become functional once the Setup tab
+    #: is wired to the setup backend (the next task). Each is connected
+    #: to the same stub slot so no click can crash the dialog; the stub
+    #: says exactly why nothing happened.
+    SETUP_STUB_CONNECTIONS = (
+        ("env_create_button", "clicked"),
+        ("env_choose_button", "clicked"),
+        ("env_repair_button", "clicked"),
+        ("env_delete_button", "clicked"),
+        ("env_gpu_button", "clicked"),
+        ("autotune_clear_button", "clicked"),
+        ("env_open_folder_button", "clicked"),
+        ("models_refresh_button", "clicked"),
+        ("models_download_button", "clicked"),
+        ("models_download_default_button", "clicked"),
+        ("models_verify_button", "clicked"),
+        ("models_delete_button", "clicked"),
+        ("models_open_folder_button", "clicked"),
+        # Double-click on a model row triggers a download once wired —
+        # stub it too, so no signal path bypasses the stubs.
+        ("models_treeWidget", "itemDoubleClicked"),
+    )
+
+    #: (widget, signal, slot) for the tab-navigation buttons that are
+    #: already fully functional: they only switch tabs.
+    NAVIGATION_CONNECTIONS = (
+        ("setup_go_detect_button", "clicked", "_go_to_detection"),
+        ("setup_open_log_button", "clicked", "_go_to_log"),
+        ("setup_banner_button", "clicked", "_go_to_setup"),
+        ("accel_banner_button", "clicked", "_go_to_setup"),
+    )
+
     def __init__(self, parent=None, env=None):
-        """Constructor."""
+        """Constructor. `env` is the dict from
+        installer.resolve_environment ({'status', 'python', 'venv_path',
+        'message'})."""
         super(WINMOLAnalyzerDialog, self).__init__(parent)
         self.setupUi(self)
         # Derived outputs are auto-generated from the stem map output path.
@@ -72,6 +110,9 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self.output_lineEdit_nodes.setReadOnly(True)
             self.output_toolButton_trees.setEnabled(False)
             self.output_toolButton_nodes.setEnabled(False)
+            # Output is optional now: empty -> temp folder, then Export.
+            self.output_lineEdit_stem.setPlaceholderText(
+                "optional — leave empty to use a temp folder, then Export…")
         except Exception:
             pass
         self._updating_output_fields = False
@@ -84,19 +125,41 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.model_path = ""
         self.stem_path = ""
         self.trees_path = ""
-        self.process_type = "Stems"
+        # Resolved from the output checkboxes in set_selected_process_type()
+        # immediately before a run; never a hardcoded default.
+        self.process_type = None
 
         self.uav_layer_path = None
         self.uav_layer_name = None
         self.crs = None
         self.worker = None
         self.thread = None
+        # Re-entrancy guard: reassigning self.thread while its OS thread
+        # is still running destroys a live QThread -> Qt qFatal() -> the
+        # whole QGIS process aborts. Never start a second run over a live
+        # one.
+        self._run_active = False
+        # Incremental stdout parser driving the detection progress bar.
+        # Created per run in _start_analysis, fed in _on_worker_line.
+        self._run_progress = None
+        # Outputs of the last successful run, for the Export action. Each
+        # entry is an absolute path (stem map + optional gpkg).
+        self._last_outputs = []
+        # If True, the stem map went to a temp dir and should be offered
+        # for export (the user didn't choose a permanent output path).
+        self._last_output_is_temp = False
 
         # Create a Config instance
         self.config = Config()
 
         self.set_connections()
         self.output_log.setReadOnly(True)
+        # A verbose run streams thousands of lines through here; cap the
+        # scrollback so the widget can't grow without bound.
+        try:
+            self.output_log.setMaximumBlockCount(5000)
+        except Exception:
+            pass
         # env comes from plugin_utils.installer.resolve_environment():
         # {'status', 'python', 'venv_path', 'message'}. status is one of
         # byo/ready (python_exe usable now) or needs_setup/error (Run
@@ -107,7 +170,8 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.setup_thread = None
         self.setup_worker = None
         self._setup_running = False
-        self.models_dir = os.path.join(os.path.dirname(self.venv_path), "models")
+        self.models_dir = os.path.join(
+            os.path.dirname(self.venv_path), "models")
 
         # Model registry (config.json, schema-2): resolved entry for the
         # current combo selection, and the on-demand-download worker.
@@ -118,7 +182,25 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.ensure_thread = None
         self.ensure_worker = None
         self.populate_model_combo_box()
-        self.process_type = None
+
+        # The variant selector row is a placeholder in the .ui; nothing
+        # populates it yet, so it must not show as an empty row.
+        _variant = getattr(self, "model_variant_widget", None)
+        if _variant is not None:
+            _variant.hide()
+
+        # The Setup/accelerator banners on the Detection tab are driven
+        # by the Setup-tab state machine, which is not wired yet — hidden
+        # until then, never half-functional.
+        for _wname in ("setup_banner_widget", "accel_banner_widget"):
+            _w = getattr(self, _wname, None)
+            if _w is not None:
+                _w.hide()
+
+        # The detection bar is hidden until a detection actually runs, so
+        # it never doubles up with the Setup tab's own progress bar.
+        self._show_run_progress(False)
+        self._set_export_enabled(False)
 
         # Nodes output uses the Trees output path (no separate file/path field).
         # Hide/disable the old nodes output widgets if they exist in the .ui.
@@ -130,6 +212,57 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
 
         # hide warning label
         self.uav_warning_label.hide()
+
+        # The Setup tab is stubbed until its wiring lands; open on the
+        # Detection tab regardless of what the .ui declares current.
+        self._go_to_detection()
+
+        # Last, once construction has placed every widget: the .ui's
+        # declared default size is only a wish, and on a short screen it
+        # used to push the Run button off the desktop.
+        self._fit_to_available_screen()
+
+    def _fit_to_available_screen(self):
+        """Clamp the just-built dialog to the screen it will open on.
+
+        Called exactly once, from the constructor, before the dialog is
+        ever shown — so it shrinks the .ui's declared default but never
+        fights a resize the user made afterwards. The tab pages live in
+        QScrollAreas, so shrinking hides nothing: Run, the button row and
+        the progress bar sit outside them and stay reachable.
+
+        Every Qt lookup here is optional. Under a headless test, an
+        offscreen platform plugin or a Qt build without QScreen this must
+        do nothing rather than raise.
+        """
+        try:
+            screen = None
+            handle = self.windowHandle()
+            if handle is not None:
+                screen = handle.screen()
+            if screen is None:
+                parent = self.parentWidget()
+                if parent is not None and parent.window() is not None:
+                    screen = getattr(parent.window(), "screen", lambda: None)()
+            if screen is None:
+                screen = QtWidgets.QApplication.primaryScreen()
+            if screen is None:
+                return
+            available = screen.availableGeometry()
+            # availableGeometry already excludes the macOS menu bar and the
+            # dock / Windows taskbar; this is the window frame on top of it.
+            chrome = 60
+            floor_w, floor_h = 480, 320
+            width = min(self.width(),
+                        max(available.width() - chrome, floor_w))
+            height = min(self.height(),
+                         max(available.height() - chrome, floor_h))
+            if (width, height) != (self.width(), self.height()):
+                self.resize(width, height)
+        except Exception:
+            # A dialog that opens slightly too tall is a nuisance; one that
+            # refuses to construct is a broken plugin.
+            pass
 
     def set_connections(self):
         self.run_button.clicked.connect(self.run_process)
@@ -146,16 +279,89 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.output_checkBox_stem.stateChanged.connect(self.checkbox_changed_stem)
         self.output_checkBox_trees.stateChanged.connect(self.checkbox_changed_trees)
         self.output_checkBox_nodes.stateChanged.connect(self.checkbox_changed_nodes)
-        self.checkbox_changed_stem(2)
-        self.checkbox_changed_trees(1)
-        self.checkbox_changed_nodes(1)
+        # Prime the handlers from the widgets themselves, so the .ui stays
+        # the single source of truth for the default selection (all three
+        # products on). Order is load-bearing: stem gates trees, trees gates
+        # nodes -- priming out of order would cascade a box back off.
+        for _cb, _handler in (
+            (self.output_checkBox_stem, self.checkbox_changed_stem),
+            (self.output_checkBox_trees, self.checkbox_changed_trees),
+            (self.output_checkBox_nodes, self.checkbox_changed_nodes),
+        ):
+            _handler(Qt.Checked if _cb.isChecked() else Qt.Unchecked)
         self.close_button.clicked.connect(self.close_application)
         self.cancel_button.clicked.connect(self.cancel_process)
+        # Export lives in the bottom button row (declared in the .ui) and
+        # stays dead until a run has actually written something.
+        self.export_button.clicked.connect(self.export_results)
+        self._connect_setup_tab()
+
+    def _connect_setup_tab(self):
+        """Wire the Setup tab: navigation for real, everything else to
+        the stub slot. Guarded so a uic binding failure degrades to a
+        dead button instead of raising during construction."""
+        for widget_name, signal_name, slot_name in \
+                self.NAVIGATION_CONNECTIONS:
+            self._connect_or_report(
+                widget_name, signal_name, getattr(self, slot_name, None))
+        for widget_name, signal_name in self.SETUP_STUB_CONNECTIONS:
+            self._connect_or_report(
+                widget_name, signal_name, self._setup_stub)
+
+    def _connect_or_report(self, widget_name, signal_name, slot):
+        widget = getattr(self, widget_name, None)
+        signal = getattr(widget, signal_name, None)
+        if signal is None or slot is None:
+            print(f"WINMOL: could not wire {widget_name}.{signal_name}")
+            return
+        try:
+            signal.connect(slot)
+        except Exception as exc:                   # pragma: no cover - GUI
+            print(f"WINMOL: could not wire {widget_name}: {exc}")
+
+    def _setup_stub(self, *_args):
+        """Placeholder slot for every not-yet-wired Setup-tab control."""
+        message = ("This action becomes available after the setup-tab "
+                   "wiring lands (next update).")
+        label = getattr(self, "setup_status_label", None)
+        if label is not None:
+            try:
+                label.setText(message)
+            except Exception:                      # pragma: no cover - GUI
+                pass
+        self.update_output_log(message)
+
+    # --- tab navigation ------------------------------------------------
+
+    def _show_tab(self, page):
+        """Select a tab BY WIDGET, never by index.
+
+        Tab positions have moved across layouts (the order is now Setup,
+        Detection, Log) — a ``setCurrentIndex(1)`` literal written for
+        one order silently opens the wrong tab under the next.
+        """
+        if page is None:
+            return
+        try:
+            index = self.log_widget.indexOf(page)
+            if index >= 0:
+                self.log_widget.setCurrentIndex(index)
+        except Exception:                          # pragma: no cover - GUI
+            pass
+
+    def _go_to_detection(self):
+        self._show_tab(getattr(self, "tab", None))
+
+    def _go_to_log(self):
+        self._show_tab(getattr(self, "tab_2", None))
+
+    def _go_to_setup(self):
+        self._show_tab(getattr(self, "tab_setup", None))
 
     def _log(self, msg: str) -> None:
         """Write a message to the plugin log widget (and stdout as fallback)."""
         try:
-            self.output_log.append(str(msg))
+            self.output_log.appendPlainText(str(msg))
         except Exception:
             print(msg)
 
@@ -245,6 +451,10 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
 
     def set_default_config_parameters(self):
         # set default values
+        # 0 == "Auto" (the spin box' specialValueText): let the planner
+        # size the batch and let the one-time autotune refine it.
+        self.batchsize_spinBox.setValue(
+            int(getattr(self.config, "prediction_batch_override", 0) or 0))
         self.minlength_doubleSpinBox.setValue(self.config.min_length)
         self.maxdistance_doubleSpinBox.setValue(self.config.max_distance)
         self.tolerance_doubleSpinBox.setValue(self.config.tolerance_angle)
@@ -257,6 +467,27 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.config.max_distance = self.maxdistance_doubleSpinBox.value()
         self.config.tolerance_angle = self.tolerance_doubleSpinBox.value()
         self.config.max_tree_height = self.maxtree_doubleSpinBox.value()
+
+    def _batch_override_env(self):
+        """Child environment pinning the prediction batch size, or ``{}``.
+
+        0 is "Auto" and injects nothing. Read here, on the GUI thread and
+        before the worker starts — no widget is ever touched from the
+        worker. Any WINMOL_CONFIG_OVERRIDES_JSON the user set themselves
+        is merged, not replaced.
+        """
+        try:
+            value = int(self.batchsize_spinBox.value())
+        except Exception:
+            return {}
+        env = config_overrides.batch_override_env(
+            value, os.environ.get(config_overrides.ENV_VAR))
+        if env:
+            self.update_output_log(
+                f"Prediction batch size pinned to {value} tiles "
+                "(batch-size autotune skipped)."
+            )
+        return env
 
     def set_crs(self, layer):
         # get crs from uav image
@@ -349,8 +580,22 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self.output_lineEdit_stem.setText(file_path)
 
     def set_path_from_line_edit(self):
-        # Single user-controlled output path: stem map output.
-        stem_out = self._normalize_stem_map_output(self.output_lineEdit_stem.text().strip())
+        # Input path: always re-read from the visible field (the source of
+        # truth) — the cached self.uav_path from the file dialog is not
+        # authoritative when the user typed a path. Empty here == the
+        # "No such file" crash in rasterio, so capture it now and validate
+        # in run_process.
+        self.uav_path = self.uav_lineEdit.text().strip()
+
+        # Output stem map path is OPTIONAL. If the user left it empty we
+        # write to a temp dir and offer an Export afterwards, so a run
+        # "just works" without forcing a path up front. (An empty path
+        # otherwise crashes deep in the prediction phase.)
+        stem_field = self.output_lineEdit_stem.text().strip()
+        self._last_output_is_temp = not bool(stem_field)
+        if not stem_field:
+            stem_field = self._temp_stem_map_base()
+        stem_out = self._normalize_stem_map_output(stem_field)
         self.stem_path = stem_out
 
         # Derived vector output: '<base>_detected_stems.gpkg'
@@ -363,11 +608,40 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         else:
             self.trees_path = ""
 
+        # Remember what this run will produce, for the Export action.
+        self._last_outputs = [
+            p for p in (self.stem_path, self.trees_path) if p]
+
         # Keep UI in sync (read-only display)
         try:
             self.output_lineEdit_trees.setText(gpkg_path if self.output_checkBox_trees.isChecked() or self.output_checkBox_nodes.isChecked() else "")
         except Exception:
             pass
+
+    def _winmol_tmp_dir(self) -> str:
+        """A temp area for outputs when no output path is given. Under the
+        QGIS profile so it's discoverable, falling back to the system temp
+        dir."""
+        base = None
+        try:
+            from qgis.core import QgsApplication
+            base = QgsApplication.qgisSettingsDirPath()
+        except Exception:
+            base = None
+        root = os.path.join(base, "winmol", "tmp") if base else None
+        if not root:
+            import tempfile
+            root = os.path.join(tempfile.gettempdir(), "winmol")
+        os.makedirs(root, exist_ok=True)
+        return root
+
+    def _temp_stem_map_base(self) -> str:
+        """Unique base path for a temp stem map: '<tmp>/<input>_<id>'.
+        _normalize_stem_map_output appends '_stem_map.tiff'."""
+        import uuid
+        stem = Path(self.uav_path).stem if self.uav_path else "winmol"
+        return os.path.join(self._winmol_tmp_dir(),
+                            f"{stem}_{uuid.uuid4().hex[:8]}")
 
     def _suggest_stem_map_output(self, uav_path: str) -> str:
         """Derive default stem map output path from input image path."""
@@ -466,7 +740,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self.trees_path = self.output_lineEdit_trees.text()
 
     def checkbox_changed_stem(self, state):
-        is_checked = state == 2
+        is_checked = state == Qt.Checked
         self.output_lineEdit_stem.setEnabled(is_checked)
         self.output_toolButton_stem.setEnabled(is_checked)
         self.apply_style_to_line_edit(self.output_lineEdit_stem, is_checked)
@@ -481,7 +755,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self._update_derived_output_fields()
 
     def checkbox_changed_trees(self, state):
-        is_checked = state == 2
+        is_checked = state == Qt.Checked
 
         # Trees/Nodes outputs are derived; prevent manual path editing.
         self.output_checkBox_nodes.setEnabled(is_checked)
@@ -511,18 +785,14 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self.model_path = ""
 
     def set_selected_process_type(self):
-        stem_checked = self.output_checkBox_stem.isChecked()
-        trees_checked = self.output_checkBox_trees.isChecked()
-        nodes_checked = self.output_checkBox_nodes.isChecked()
-
-        if nodes_checked:
-            self.process_type = "Nodes"
-        elif trees_checked:
-            self.process_type = "Trees"
-        elif stem_checked:
-            self.process_type = "Stems"
-        else:
-            self.process_type = "Stems"
+        # One run covers every selected product: "Nodes" writes the
+        # stem-map raster *and* a GeoPackage with the stems, vectors and
+        # nodes layers.
+        self.process_type = process_type_for(
+            self.output_checkBox_stem.isChecked(),
+            self.output_checkBox_trees.isChecked(),
+            self.output_checkBox_nodes.isChecked(),
+        )
 
     def save_temp_layer(self, layer, layer_name: str, add_to_legend: bool = True):
         """
@@ -593,14 +863,32 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         # If the process is running, cancel it. cancel() terminates (then
         # kills) the child; the worker's own finished signal, already
         # wired to thread.quit(), tears the thread down once it exits.
+        # The bar resets immediately so a cancelled run never keeps a
+        # stale percentage on screen.
         if self.worker:
             self.worker.cancel()
+        bar = getattr(self, "progress_bar", None)
+        if bar is not None:
+            try:
+                bar.setValue(0)
+            except Exception:                      # pragma: no cover - GUI
+                pass
 
     def close_application(self):
         print("Closing application")
         self.close()
 
     def run_process(self):
+        # Guard against re-entry: a second Run while one is live would
+        # reassign self.thread and destroy a still-running QThread -> Qt
+        # qFatal aborts the whole QGIS process.
+        if self._run_active:
+            QtWidgets.QMessageBox.information(
+                self, "WINMOL Analyzer",
+                "A run is already in progress. Wait for it to finish, or "
+                "press Cancel, before starting another.")
+            return
+
         # set chosen parameters
         self.set_selected_model()
 
@@ -620,6 +908,30 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.set_selected_process_type()
         self.set_path_from_line_edit()
 
+        # Validate the input BEFORE launching the subprocess: an empty or
+        # missing path otherwise surfaces as an opaque rasterio
+        # "No such file or directory" deep in winmol_run.py.
+        if not self.uav_path:
+            QtWidgets.QMessageBox.warning(
+                self, "WINMOL Analyzer",
+                "No input GeoTiff selected. Pick a file or type a path.")
+            return
+        if not os.path.exists(self.uav_path):
+            QtWidgets.QMessageBox.warning(
+                self, "WINMOL Analyzer",
+                f"Input GeoTiff was not found:\n{self.uav_path}")
+            return
+        # The stem map raster is always written; an empty output path
+        # crashes the prediction phase. set_path_from_line_edit derives a
+        # temp path for an empty field, so this only trips if that
+        # derivation somehow failed.
+        if not self.stem_path or Path(self.stem_path).name == "":
+            QtWidgets.QMessageBox.warning(
+                self, "WINMOL Analyzer",
+                "No output path is set and none could be derived from the "
+                "input. Set an output stem map path.")
+            return
+
         # check if uav image is loaded in qgis
         self.check_uav_input_exists(self.stem_path)
 
@@ -632,8 +944,9 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             alt = str(p.with_name(p.stem + "_new.gpkg"))
             self.check_uav_input_exists(alt)
 
-        # Switch to the log tab in the QTabWidget
-        self.log_widget.setCurrentIndex(1)
+        # Switch to the log tab in the QTabWidget (by widget, never by
+        # index — the Setup page sits before Detection and Log now)
+        self._go_to_log()
 
         # clear the output log
         self.output_log.clear()
@@ -660,9 +973,9 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
 
     def _maybe_offer_gpu(self):
         """One log line when an NVIDIA GPU is present but the venv
-        runs the CPU runtime. No Setup tab exists yet, so the offer
-        names the opt-in switch (WINMOL_GPU=1); setting any value on
-        QSETTINGS_GPU_PROMPT_KEY silences it."""
+        runs the CPU runtime. The Setup tab is not wired yet, so the
+        offer names the opt-in switch (WINMOL_GPU=1); setting any value
+        on QSETTINGS_GPU_PROMPT_KEY silences it."""
         try:
             from qgis.core import QgsSettings
             if QgsSettings().value(QSETTINGS_GPU_PROMPT_KEY, ""):
@@ -771,20 +1084,36 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         # Run this part for responsive GUI
         try:
             self.thread = QThread()
-            self.worker = Worker(command)
+            # The run command is five positional arguments; the
+            # environment is the only channel that carries a config value
+            # to the child.
+            self.worker = Worker(command, env_extra=self._batch_override_env())
             self.worker.moveToThread(self.thread)
-            self.worker.progress_signal.connect(self.update_progress)
             self.thread.started.connect(self.worker.run_process)
+            # The progress bar is driven by the pipeline's own printed
+            # counters, parsed per line in _on_worker_line.
+            self._run_progress = RunProgress(self.process_type)
+            self.worker.update_signal.connect(self._on_worker_line)
+            # layers load ONLY on success; failures surface in the log
+            # and a dialog instead of loading empty/absent layers.
+            self.worker.succeeded.connect(self._on_run_succeeded)
+            self.worker.error.connect(self.handle_process_error)
             self.worker.finished.connect(self.thread.quit)
             self.worker.finished.connect(self.worker.deleteLater)
             self.thread.finished.connect(self.thread.deleteLater)
-            self.thread.finished.connect(self.load_layers_to_session)
-            self.worker.update_signal.connect(self.update_output_log)
-            self.worker.error.connect(self.update_output_log)
+            self.thread.finished.connect(self._on_run_finished)
+            # Mark active + lock Run BEFORE starting, so a second click
+            # can't reassign self.thread (abort).
+            self._run_active = True
+            self._show_run_progress(True)
+            self._set_busy_ui(True)
             self.thread.start()
         # catch out of memory error
         except MemoryError:
-            self.worker.update_signal.disconnect(self.update_output_log)
+            self._run_active = False
+            self._show_run_progress(False)
+            self._set_busy_ui(False)
+            self.worker.update_signal.disconnect(self._on_worker_line)
             self.update_output_log(
                 "The operation ran out of memory. "
                 "Please free up some memory and "
@@ -796,17 +1125,124 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         # Update your QPlainTextEdit with the output
         self.output_log.appendPlainText(text)
 
-    def load_layers_to_session(self):
-        """Load outputs after processing finishes.
+    def _on_worker_line(self, text):
+        """One stdout line from the running child: log it, and advance
+        the progress bar when it carries one of the pipeline's done/total
+        counters (plugin_utils.run_progress)."""
+        self.update_output_log(text)
+        if self._run_progress is None:
+            return
+        percent = self._run_progress.feed(text)
+        if percent is not None:
+            self.update_progress(percent)
 
-        Legacy output was GeoJSON:
-            (*_stems.geojson, *_nodes.geojson, *_vectors.geojson).
-        Newer versions write GeoPackage:
-            (*.gpkg) with layers: stems, nodes, vectors.
+    def handle_process_error(self, message):
+        """Show a failure instead of silently loading empty/absent layers."""
+        self.update_output_log(message)
+        try:
+            QtWidgets.QMessageBox.warning(self, "WINMOL Analyzer", message)
+        except Exception:
+            pass
 
-        This method supports both.
+    def _on_run_succeeded(self):
+        """Exit code 0: complete the bar, then load the outputs."""
+        if self._run_progress is not None:
+            self.update_progress(self._run_progress.finish(ok=True))
+        self.load_layers_to_session()
+
+    def _on_run_finished(self):
+        """Runs on thread.finished (success OR failure): clear the active
+        flag so the next run can safely build a fresh thread, and
+        re-enable the UI. Offers Export if the run produced outputs on
+        disk."""
+        self._run_active = False
+        self._run_progress = None
+        self._show_run_progress(False)
+        self._set_busy_ui(False)
+        produced = any(os.path.exists(p) for p in self._last_outputs)
+        self._set_export_enabled(produced)
+        if produced and self._last_output_is_temp:
+            self.update_output_log(
+                "Outputs were written to a temp folder. Use 'Export…' to "
+                "save them to a permanent location.")
+
+    def _show_run_progress(self, on):
+        """Show the detection progress bar ONLY while a detection runs.
+
+        It lives in the persistent row below the tabs, so it is visible
+        on the Setup tab too — a confusing SECOND bar next to the Setup
+        tab's own bar during an environment build. Tied to the detection
+        run so setup jobs never show it.
         """
+        bar = getattr(self, "progress_bar", None)
+        if bar is None:
+            return
+        try:
+            if on:
+                bar.setValue(0)
+            bar.setVisible(bool(on))
+        except Exception:                          # pragma: no cover - GUI
+            pass
 
+    def _set_busy_ui(self, busy):
+        """Disable Run while a detection owns the dialog. Applied eagerly
+        (before thread.start) so a second click cannot land between the
+        decision and the repaint. The Setup-tab interlock joins here once
+        that tab is wired."""
+        try:
+            self.run_button.setEnabled(not busy)
+        except Exception:                          # pragma: no cover - GUI
+            pass
+
+    def _set_export_enabled(self, on):
+        btn = getattr(self, "export_button", None)
+        if btn is not None:
+            try:
+                btn.setEnabled(bool(on))
+            except Exception:
+                pass
+
+    def export_results(self):
+        """Copy the last run's outputs (stem map + any gpkg) to a folder
+        the user chooses. Lets runs default to a temp dir yet still be
+        saved."""
+        import shutil
+        outputs = [p for p in self._last_outputs if os.path.exists(p)]
+        if not outputs:
+            QtWidgets.QMessageBox.information(
+                self, "WINMOL Analyzer",
+                "No results to export yet. Run an analysis first.")
+            return
+        target_dir = QFileDialog.getExistingDirectory(
+            self, "Export results to folder", "")
+        if not target_dir:
+            return
+        copied = []
+        for src in outputs:
+            try:
+                dst = os.path.join(target_dir, os.path.basename(src))
+                shutil.copy2(src, dst)
+                copied.append(dst)
+                # bring along a sidecar stats file if the raster has one
+                sidecar = src + ".aux.xml"
+                if os.path.exists(sidecar):
+                    shutil.copy2(sidecar, dst + ".aux.xml")
+            except Exception as exc:
+                self.update_output_log(f"Export failed for {src}: {exc}")
+        if copied:
+            self.update_output_log("Exported:\n" + "\n".join(copied))
+            QtWidgets.QMessageBox.information(
+                self, "WINMOL Analyzer",
+                f"Exported {len(copied)} file(s) to:\n{target_dir}")
+
+    def load_layers_to_session(self):
+        """Load outputs after a successful run.
+
+        The stem map raster always; the GeoPackage layers per the output
+        checkboxes (Trees: stems; Nodes: stems + vectors + nodes,
+        computed as one list so a layer is never added twice when both
+        products are selected).
+        """
         print("Loading output layers into QGIS session...")
         self.load_raster(self.stem_path)
         gpkg = self._resolve_output_gpkg(self.trees_path)
@@ -815,13 +1251,12 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             print("No output GeoPackage found; skipping vector layer loading.")
             return
 
-        # Trees output: stems only
-        if self.output_checkBox_trees.isChecked():
-            self.load_gpkg_layers(gpkg, ["stems"])
-
-        # Nodes output: stems + nodes + vectors
-        if self.output_checkBox_nodes.isChecked():
-            self.load_gpkg_layers(gpkg, ["stems", "vectors", "nodes"])
+        layers = gpkg_layers_for(
+            self.output_checkBox_trees.isChecked(),
+            self.output_checkBox_nodes.isChecked(),
+        )
+        if layers:
+            self.load_gpkg_layers(gpkg, layers)
 
     def _resolve_output_gpkg(self, path_prefix: str):
         """Return an existing output GeoPackage path for a given prefix.
@@ -880,21 +1315,15 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         QgsProject.instance().addMapLayer(raster_layer)
         print(f"Raster layer loaded successfully from {path}")
 
-    def load_geojson(self, path):
-        # Extract the base name of the input image file
-        name = os.path.splitext(os.path.basename(path))[0]
-        # Load vector layer
-        vector_layer = QgsVectorLayer(path, name, "ogr")
-        if not vector_layer.isValid():
-            print(f"Error loading vector layer from {path}")
-        else:
-            # Add the vector layer to the map
-            QgsProject.instance().addMapLayer(vector_layer)
-
     def update_progress(self, value):
         self.progress_bar.setValue(value)
 
     def check_swap_memory(self):
+        # psutil is optional in QGIS's Python (see the guarded import at
+        # the top); without it, just skip the advisory rather than raising
+        # AttributeError on top of the MemoryError that got us here.
+        if psutil is None:
+            return
         swap = psutil.swap_memory()
         ram = psutil.virtual_memory()
 
