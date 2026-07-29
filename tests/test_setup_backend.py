@@ -7,6 +7,7 @@ must classify a bring-your-own interpreter as untouchable.
 import hashlib
 import json
 import os
+import stat
 import sys
 from pathlib import Path
 
@@ -120,6 +121,87 @@ def test_remove_clear_setting_only_for_managed_exe(tmp_path):
         str(tmp_path), configured_exe=byo, dry_run=True)
     assert inside["clear_setting"] is True
     assert outside["clear_setting"] is False
+
+
+def _evil_registry(plugin_dir, file_value):
+    """A schema-2 registry with one entry whose ``file`` is hostile."""
+    config = {"schema": 2, "models": {"evil": {
+        "label": "evil", "url": "https://example.org/x.onnx",
+        "file": file_value}}}
+    (plugin_dir / "config.json").write_text(json.dumps(config))
+
+
+def test_remove_models_refuses_traversal_entry(tmp_path):
+    """A registry ``file`` of "../../x" must be refused per victim —
+    the outside file survives and shows up under failed, not removed."""
+    victim = tmp_path / "escape.txt"
+    victim.write_bytes(b"precious")
+    plugin_dir = tmp_path / "plugin"
+    plugin_dir.mkdir()
+    models_dir = Path(installer.models_location(str(plugin_dir)))
+    models_dir.mkdir(parents=True)
+    _evil_registry(plugin_dir, os.path.relpath(victim, models_dir))
+    result = installer.remove_environment(
+        str(plugin_dir), remove_venv=False, remove_models=True)
+    assert victim.exists()
+    assert result["removed"] == []
+    assert result["freed_bytes"] == 0
+    assert result["failed"]
+    assert all(msg == "refused: outside the models directory"
+               for _p, msg in result["failed"])
+
+
+def test_remove_models_refuses_absolute_entry(tmp_path):
+    """An absolute registry ``file`` escapes os.path.join entirely;
+    it must be refused, never deleted."""
+    victim = tmp_path / "abs_victim.onnx"
+    victim.write_bytes(b"precious")
+    plugin_dir = tmp_path / "plugin"
+    plugin_dir.mkdir()
+    Path(installer.models_location(str(plugin_dir))).mkdir(parents=True)
+    _evil_registry(plugin_dir, str(victim))
+    result = installer.remove_environment(
+        str(plugin_dir), remove_venv=False, remove_models=True)
+    assert victim.exists()
+    assert result["removed"] == []
+    assert (str(victim), "refused: outside the models directory") \
+        in result["failed"]
+
+
+def test_remove_refuses_symlinked_venv_root(tmp_path):
+    """When the venv path IS a symlink, removal is refused upfront:
+    the link survives, the target (contents AND permissions) is
+    untouched, and nothing is falsely reported as removed."""
+    target = tmp_path / "target"
+    target.mkdir()
+    keep = target / "important.txt"
+    keep.write_bytes(b"precious")
+    mode_before = stat.S_IMODE(os.stat(target).st_mode)
+    plugin_dir = tmp_path / "plugin"
+    plugin_dir.mkdir()
+    venv = installer.venv_location(str(plugin_dir))
+    os.symlink(str(target), venv)
+    result = installer.remove_environment(str(plugin_dir))
+    assert os.path.islink(venv)                     # link survives
+    assert keep.exists()                            # target intact
+    assert stat.S_IMODE(os.stat(target).st_mode) == mode_before
+    assert result["removed"] == []
+    assert result["freed_bytes"] == 0
+    assert result["failed"] == [
+        (venv, "refused: the path is a symlink")]
+
+
+def test_remove_environment_none_refuses_without_raising():
+    """The never-raises contract holds for None/'' plugin_dir: a
+    refused-empty result, no TypeError."""
+    for bogus in (None, ""):
+        result = installer.remove_environment(bogus)
+        assert result["planned"] == []
+        assert result["removed"] == []
+        assert result["freed_bytes"] == 0
+        assert result["clear_setting"] is False
+        assert result["failed"] == [
+            ("", "refused: no plugin directory")]
 
 
 # --- invalidate_marker ------------------------------------------------------

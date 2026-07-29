@@ -228,6 +228,8 @@ class ModelMaintenanceWorker(QObject):
 
     def run(self):
         try:
+            if self.action not in self.ACTIONS:
+                raise ValueError(f"unknown action: {self.action}")
             registry = load_registry(self.config_path)
             handler = {"download-all-recommended": self._download_all,
                        "verify-all": self._verify_all,

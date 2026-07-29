@@ -301,7 +301,13 @@ def _is_managed_path(path, plugin_dir) -> bool:
 
 def _chmod_retry(func, path):
     """rmtree error handler: clear the read-only bit (Windows venvs
-    ship read-only files) and retry once; re-raise if it still fails."""
+    ship read-only files) and retry once; re-raise if it still fails.
+    When the failing func is ``os.path.islink`` — rmtree refusing to
+    operate on a symlink — re-raise immediately: chmod would follow
+    the link and mutate the TARGET, and retrying islink() returns a
+    bool instead of raising, silently masking the failure."""
+    if func is os.path.islink:
+        raise OSError(f"refusing to rmtree the symlink {path}")
     os.chmod(path, stat.S_IWRITE)
     func(path)
 
@@ -333,6 +339,12 @@ def remove_environment(plugin_dir, remove_venv=True, remove_runtime=False,
     stays importable without QGIS.
     """
     report = _as_progress(progress)
+    if not plugin_dir:
+        # Never raises: a None/"" plugin_dir cannot resolve to a
+        # managed tree, so there is nothing that may be deleted.
+        return {"planned": [], "removed": [],
+                "failed": [("", "refused: no plugin directory")],
+                "freed_bytes": 0, "clear_setting": False}
     venv = venv_location(plugin_dir)
     runtime = os.path.join(managed_root(plugin_dir), "py311")
     models_dir = models_location(plugin_dir)
@@ -349,6 +361,13 @@ def remove_environment(plugin_dir, remove_venv=True, remove_runtime=False,
     if remove_runtime:
         trees.append(runtime)
     for path in trees:
+        if os.path.islink(path):
+            # rmtree on a symlink would at best fail and at worst (via
+            # the chmod-retry handler) mutate the TARGET; refuse it the
+            # same way as an outside path. The link itself survives.
+            result["failed"].append(
+                (path, "refused: the path is a symlink"))
+            continue
         if not _is_managed_path(path, plugin_dir):
             result["failed"].append(
                 (path, "refused: outside the managed tree"))
@@ -358,7 +377,12 @@ def remove_environment(plugin_dir, remove_venv=True, remove_runtime=False,
 
     model_plan = None
     if remove_models:
-        if not _is_managed_path(models_dir, plugin_dir):
+        if os.path.islink(models_dir):
+            # Same rule as the trees above: deleting THROUGH a
+            # symlinked models dir reaches whatever it points at.
+            result["failed"].append(
+                (models_dir, "refused: the path is a symlink"))
+        elif not _is_managed_path(models_dir, plugin_dir):
             result["failed"].append(
                 (models_dir, "refused: outside the managed tree"))
         else:
@@ -368,13 +392,17 @@ def remove_environment(plugin_dir, remove_venv=True, remove_runtime=False,
                     (models_dir, model_plan["freed_bytes"]))
 
     if dry_run:
+        if model_plan is not None:
+            result["failed"].extend(model_plan["failed"])
         result["freed_bytes"] = sum(size for _p, size in result["planned"])
         return result
 
     # A half-deleted venv must degrade to "needs rebuild", never stay
     # blessed by is_ready(); do this BEFORE the first rmtree. Gated on
-    # the same managed-tree check as the rmtree itself.
-    if remove_venv and _is_managed_path(venv, plugin_dir):
+    # the same managed-tree and not-a-symlink checks as the rmtree
+    # itself (through a symlinked venv it would reach the TARGET).
+    if (remove_venv and not os.path.islink(venv)
+            and _is_managed_path(venv, plugin_dir)):
         invalidate_marker(venv)
 
     for path, size in list(result["planned"]):
@@ -414,6 +442,13 @@ def _plan_models(plugin_dir, models_dir, dry_run, progress=None):
         base = model_registry.local_path(entry, models_dir)
         victims.extend((base, base + ".part"))
     for path in victims:
+        if not path_is_inside(path, models_dir):
+            # A registry entry whose ``file`` traverses out of the
+            # models dir ("../x", absolute) must never delete outside
+            # the managed tree; mirror ModelMaintenanceWorker._delete.
+            result["failed"].append(
+                (path, "refused: outside the models directory"))
+            continue
         try:
             size = os.path.getsize(path)
         except OSError:
