@@ -323,12 +323,15 @@ def test_models_summary_text(tmp_path):
             len(b"quantized-weights")))
 
 
-def test_busy_guarded_slots_declare_no_signal_parameters():
-    """_refuse_if_busy's wrapper absorbs Qt signal args and calls the
-    slot with none (PyQt's own truncation does this for undecorated
-    bound methods, but a forwarding wrapper broke it in the field:
-    clicked(bool) -> TypeError). Pin the contract: decorated slots
-    take only self."""
+def test_busy_guarded_slots_take_no_required_signal_parameters():
+    """_refuse_if_busy's wrapper drops Qt's POSITIONAL signal args and
+    calls ``method(self, **kwargs)`` (PyQt's own truncation does this
+    for undecorated bound methods; a naive forwarding wrapper once broke
+    it: clicked(bool) -> TypeError). Pin the contract: a decorated slot
+    must have no REQUIRED extra positional parameter and no ``*args``/
+    ``**kwargs`` (Qt could not satisfy them). Optional params WITH
+    defaults are allowed — Qt's positional args never reach them, and an
+    internal caller may pass them by keyword (e.g. confirmed=True)."""
     import ast as _ast
     src = (REPO / "winmol_analyzer_dialog.py").read_text()
     tree = _ast.parse(src)
@@ -340,12 +343,19 @@ def test_busy_guarded_slots_declare_no_signal_parameters():
                    for d in node.decorator_list):
             continue
         a = node.args
-        extra = [p.arg for p in a.args[1:]] + [p.arg for p in a.kwonlyargs]
-        if extra or a.vararg or a.kwarg:
+        # positional params after self, minus those with defaults
+        positional = a.args[1:]
+        n_required = len(positional) - len(a.defaults)
+        required = [p.arg for p in positional[:max(0, n_required)]]
+        kwonly_required = [p.arg for p, d in
+                           zip(a.kwonlyargs, a.kw_defaults) if d is None]
+        bad = required + kwonly_required
+        if bad or a.vararg or a.kwarg:
             offenders.append("%s(%s)" % (node.name, ", ".join(
-                ["self"] + extra
+                ["self"] + bad
                 + (["*" + a.vararg.arg] if a.vararg else [])
                 + (["**" + a.kwarg.arg] if a.kwarg else []))))
     assert not offenders, (
-        "busy-guarded slots must take only self (the guard wrapper "
-        "calls method(self)): " + ", ".join(offenders))
+        "busy-guarded slots must not require a positional signal "
+        "parameter (the wrapper calls method(self, **kwargs)): "
+        + ", ".join(offenders))

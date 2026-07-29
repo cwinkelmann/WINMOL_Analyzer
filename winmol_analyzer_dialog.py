@@ -129,18 +129,21 @@ def _refuse_if_busy(method):
     status line instead of entering the slot — one job at a time is a
     guarantee, not a hope.
 
-    The wrapper absorbs Qt signal arguments (``clicked`` emits a bool,
-    ``itemDoubleClicked`` an item+column) and calls the slot with none:
-    an undecorated bound method gets that truncation from PyQt for
-    free, but a ``*args`` wrapper forwards them and TypeErrors a bare
-    ``(self)`` slot. Decorated slots therefore must not declare signal
-    parameters — connect through a lambda if one ever needs them."""
+    The wrapper drops Qt's POSITIONAL signal arguments (``clicked``
+    emits a bool, ``itemDoubleClicked`` an item+column) — an undecorated
+    bound method gets that truncation from PyQt for free, but a
+    ``*args``-forwarding wrapper TypeErrors a bare ``(self)`` slot. It
+    still forwards KEYWORD arguments, so an internal caller can invoke a
+    decorated slot with kwargs (e.g. ``_setup_install_gpu(confirmed=True)``
+    from the pre-run offer). Decorated slots therefore must not declare
+    REQUIRED positional signal parameters; optional keyword params with
+    defaults are fine."""
     @functools.wraps(method)
-    def guarded(self, *_args, **_kwargs):
+    def guarded(self, *_args, **kwargs):
         if self._busy_kind():
             self._refuse_busy()
             return None
-        return method(self)
+        return method(self, **kwargs)
     return guarded
 
 
@@ -2610,19 +2613,19 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self._set_setup_status(
                 probe.detail or "No usable NVIDIA GPU was found.")
             return
-        reply = (QtWidgets.QMessageBox.Yes if confirmed
-                 else QtWidgets.QMessageBox.question(
-            self, "Install GPU runtime",
-            f"Replace the CPU inference runtime with the CUDA one for "
-            f"{probe.label}?\n\n"
-            "This downloads onnxruntime-gpu (roughly 2 GB with its CUDA "
-            "libraries) into WINMOL's environment and removes the CPU "
-            "runtime — the two cannot coexist.\n\n"
-            "'No' keeps the working CPU environment.",
-            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-            QtWidgets.QMessageBox.No))
-        if reply != QtWidgets.QMessageBox.Yes:
-            return
+        if not confirmed:
+            reply = QtWidgets.QMessageBox.question(
+                self, "Install GPU runtime",
+                f"Replace the CPU inference runtime with the CUDA one for "
+                f"{probe.label}?\n\n"
+                "This downloads onnxruntime-gpu (roughly 2 GB with its "
+                "CUDA libraries) into WINMOL's environment and removes "
+                "the CPU runtime — the two cannot coexist.\n\n"
+                "'No' keeps the working CPU environment.",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No)
+            if reply != QtWidgets.QMessageBox.Yes:
+                return
         self._venv_bytes = None
         self._setup_running = True
         self._set_busy_ui(True)
