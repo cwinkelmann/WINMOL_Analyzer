@@ -264,6 +264,10 @@ def _free_gpu_memory_gb():
             stderr=subprocess.PIPE,
             text=True,
             check=False,
+            # A driver stuck in an uninterruptible ioctl used to hang this
+            # call forever (rr NVIDIA_SMI_TIMEOUT); the except catches
+            # TimeoutExpired and falls back to the host-RAM bound.
+            timeout=8.0,
         )
         if result.returncode != 0:
             return []
