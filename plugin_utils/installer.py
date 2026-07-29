@@ -114,6 +114,24 @@ def get_venv_python_path(venv_path) -> str:
 
 # --- base interpreter selection ---------------------------------------------
 
+def managed_base_python(plugin_dir, progress=None) -> str:
+    """A Python 3.11 interpreter to build the venv from.
+
+    Prefer a 3.11 already on PATH (no download); otherwise download a
+    relocatable python-build-standalone 3.11 into ``managed_root/py311`` —
+    so a bare machine with only QGIS (fresh Windows, macOS system 3.9, no
+    conda) still gets a working 3.11. Raises RuntimeError only if no 3.11
+    is on PATH AND the download/extract fails.
+    """
+    for name in ("python3.11", "python3.11.exe", "python3", "python"):
+        exe = shutil.which(name)
+        if exe and _python_version(exe) == (3, 11):
+            return exe
+    from . import py311
+    dest = os.path.join(managed_root(plugin_dir), "py311")
+    return py311.ensure_python311(dest, progress=progress)
+
+
 def _python_version(executable) -> tuple:
     """(major, minor) of ``executable``, or (0, 0) when unusable.
     ``-I`` + ``child_env()``: QGIS's PYTHONHOME/PYTHONPATH would point
@@ -131,9 +149,18 @@ def _python_version(executable) -> tuple:
     return (0, 0)
 
 
-def choose_base_python() -> str:
-    """A system python (3.11) to build the venv from, or RuntimeError
-    with an actionable message."""
+def choose_base_python(progress=None) -> str:
+    """A system python (3.11) to build the venv from.
+
+    Prefers PATH, but never dead-ends there: with none found it falls back
+    to :func:`managed_base_python`, which downloads a relocatable Python
+    3.11 (see plugin_utils/py311.py) — so a bare machine with only QGIS
+    (fresh Windows, macOS system 3.9, no terminal) still gets a working
+    venv. ``progress`` is forwarded to that download so its "Downloading
+    Python 3.11 …" lines reach the caller's log. Only raises RuntimeError
+    when even the download fails (unsupported platform or network error);
+    that error names the manual fallback.
+    """
     candidates = []
     for name in ("python3.11", "python3", "python"):
         exe = shutil.which(name)
@@ -142,11 +169,7 @@ def choose_base_python() -> str:
     for exe in candidates:
         if MIN_PY <= _python_version(exe) <= MAX_PY:
             return exe
-    raise RuntimeError(
-        "No suitable Python found to build the WINMOL environment "
-        f"(need {MIN_PY[0]}.{MIN_PY[1]}). Install one, or set an "
-        "existing interpreter in the plugin settings "
-        f"({QSETTINGS_PYTHON_KEY}).")
+    return managed_base_python(_PLUGIN_DIR, progress=progress)
 
 
 def _has_compute_deps(executable) -> bool:
@@ -588,8 +611,8 @@ def create_venv(venv_path, base_python=None, progress=None) -> None:
     """Build the venv. No ``--copies`` (macOS CLT python can't); the
     ``child_env()`` inside _run_streamed is load-bearing — with QGIS's
     PYTHONHOME inherited this exact call died on Windows."""
-    base_python = base_python or choose_base_python()
     progress = _as_progress(progress)
+    base_python = base_python or choose_base_python(progress=progress)
     progress(f"Creating the virtual environment with {base_python} …")
     try:
         _run_streamed([base_python, "-m", "venv", venv_path],

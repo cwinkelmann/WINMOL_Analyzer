@@ -1954,8 +1954,12 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
     def _ask_deletion_scope(self):
         """A small purpose-built dialog: venv on, models off. Returns
         the flag dict for deletion_plan/EnvRemoveWorker, or None when
-        cancelled. (No runtime checkbox: this backend builds from a
-        system Python and never downloads one.)"""
+        cancelled. (No runtime checkbox: a machine with no Python 3.11
+        on PATH gets one auto-downloaded under managed_root/py311 —
+        see plugin_utils/py311.py — but it is a small, reusable build
+        artifact left in place across venv rebuilds/deletions; deleting
+        it too is a manual step via installer.remove_environment(...,
+        remove_runtime=True), not this quick dialog.)"""
         box = QtWidgets.QDialog(self)
         box.setWindowTitle("Delete WINMOL environment")
         layout = QtWidgets.QVBoxLayout(box)
