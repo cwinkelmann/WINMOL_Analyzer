@@ -85,6 +85,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         ("env_delete_button", "clicked", "_setup_delete_env"),
         ("env_gpu_button", "clicked", "_setup_install_gpu"),
         ("env_open_folder_button", "clicked", "_setup_open_env_folder"),
+        ("autotune_clear_button", "clicked", "_setup_clear_autotune"),
         ("models_refresh_button", "clicked", "_setup_rescan"),
         ("models_download_button", "clicked", "_setup_download_selected"),
         ("models_download_default_button", "clicked",
@@ -255,12 +256,6 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             _w = getattr(self, _wname, None)
             if _w is not None:
                 _w.hide()
-
-        # Deliberate cut: this lineage has no batch-size autotune cache,
-        # so the button would only ever say "nothing to clear".
-        _autotune = getattr(self, "autotune_clear_button", None)
-        if _autotune is not None:
-            _autotune.hide()
 
         # The detection bar is hidden until a detection actually runs, so
         # it never doubles up with the Setup tab's own progress bar.
@@ -1228,10 +1223,19 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         # Run this part for responsive GUI
         try:
             self.thread = QThread()
+            # Point the child's batch-size autotune cache at WINMOL's
+            # managed state, so it is created, found and deleted with the
+            # environment rather than in a HOME the QGIS/Docker user may
+            # not own.
+            env_extra = {
+                "WINMOL_AUTOTUNE_CACHE":
+                    installer.autotune_cache_location(self._plugin_dir()),
+            }
             # The run command is five positional arguments; the
-            # environment is the only channel that carries a config value
-            # to the child.
-            self.worker = Worker(command, env_extra=self._batch_override_env())
+            # environment is the only other channel that carries a config
+            # value to the child.
+            env_extra.update(self._batch_override_env())
+            self.worker = Worker(command, env_extra=env_extra)
             self.worker.moveToThread(self.thread)
             self.thread.started.connect(self.worker.run_process)
             # The progress bar is driven by the pipeline's own printed
@@ -1903,6 +1907,28 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         leaves behind (no uninstall hook exists; env_location_label
         says so in words, this button shows it)."""
         self._open_folder(installer.managed_root(self._plugin_dir()))
+
+    def _setup_clear_autotune(self):
+        """Forget the persisted prediction batch-size measurement.
+
+        The autotune runs ONCE per (hardware, model, execution provider,
+        tile geometry) and is then reused; the cache invalidates itself
+        when any of those change, so this is an escape hatch, not routine
+        maintenance. Deleting a small JSON is instant and needs no worker
+        thread — but it still refuses while a run is live, because the
+        child holds the same file.
+        """
+        if self._busy_kind():
+            self._refuse_busy()
+            return
+        from .plugin_utils import autotune_cache
+        path = installer.autotune_cache_location(self._plugin_dir())
+        removed = autotune_cache.clear(path)
+        self._append_setup_detail(
+            f"Autotune cache cleared ({path}). The batch size is "
+            "re-measured once on the next run."
+            if removed else
+            f"No autotune cache to clear ({path}).")
 
     def _setup_open_models_folder(self):
         self._open_folder(self.models_dir, create=True)

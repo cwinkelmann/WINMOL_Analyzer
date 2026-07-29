@@ -103,6 +103,17 @@ def models_location(plugin_dir) -> str:
     return os.path.join(managed_root(plugin_dir), MODELS_DIR_NAME)
 
 
+def autotune_cache_location(plugin_dir) -> str:
+    """Absolute path of the prediction batch-size autotune cache.
+
+    Lives beside the venv under ``managed_root`` so it is part of WINMOL's
+    managed state: the dialog hands it to the compute child through
+    ``$WINMOL_AUTOTUNE_CACHE``. See plugin_utils/autotune_cache.py.
+    """
+    from .autotune_cache import CACHE_FILENAME
+    return os.path.join(managed_root(plugin_dir), CACHE_FILENAME)
+
+
 def get_venv_python_path(venv_path) -> str:
     if sys.platform == "win32":
         return os.path.join(venv_path, "Scripts", "python.exe")

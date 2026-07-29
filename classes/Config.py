@@ -21,7 +21,15 @@ class Config(object):
     prediction_batch_gpu = 4
     prediction_batch_max_gpu = 16
     prediction_batch_multi_gpu = 12     # local per-worker batch
-    prediction_batch_autotune = True
+    # Tri-state, resolved by plugin_utils.autotune_cache.resolve_mode():
+    # "auto" tunes ONCE per (hardware, model, execution provider, tile
+    # geometry) and reuses the persisted answer from then on; True/"force"
+    # always re-sweeps and refreshes the cache entry; False/"off" never
+    # sweeps. $WINMOL_BATCH_AUTOTUNE overrides this attribute.
+    # Precedence in utils.Prediction._autotune_batch_size:
+    # prediction_batch_override > $WINMOL_BATCH_AUTOTUNE (or this attribute)
+    # == "off" > a cache hit in range > sweep (then persist to the cache).
+    prediction_batch_autotune = "auto"
     prediction_batch_autotune_patience = 4
     prediction_batch_autotune_repeats = 5
     prediction_batch_autotune_min_improve = 0.005
@@ -51,6 +59,9 @@ class Config(object):
     multi_gpu_cpu_workers = 48
 
     # runtime state populated by planner
+    # The detected HardwareInfo, so downstream code (e.g. the autotune
+    # cache) can key on it without re-probing nvidia-smi.
+    hardware = None
     cpu_workers = None
     gpu_workers = None
     vector_mode = 'none'

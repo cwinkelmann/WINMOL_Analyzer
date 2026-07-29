@@ -18,6 +18,7 @@ from rasterio.windows import Window
 from skimage.transform import resize
 
 from classes.Timer import Timer
+from plugin_utils import autotune_cache
 from utils import IO
 
 
@@ -577,6 +578,79 @@ def _time_batch_candidate(
     return warm_used, per_tile, oomed
 
 
+def _autotune_cache_key(model, config, label):
+    """``(key, cache_file)`` for the sweep's persistent cache, or
+    ``(None, None)`` when the key cannot be derived -- never fatal, a miss
+    just means the sweep below runs. See plugin_utils/autotune_cache.py.
+    """
+    try:
+        key = autotune_cache.cache_key(
+            model, config, getattr(config, 'hardware', None))
+        return key, autotune_cache.cache_path()
+    except Exception as exc:                                # pragma: no cover
+        print(f"{label} autotune: cache key unavailable ({exc}); tuning.",
+              flush=True)
+        return None, None
+
+
+def _autotune_cache_lookup(
+    mode, key, cache_file, initial, max_reachable, label,
+):
+    """The cached batch to reuse, or ``None`` to fall through to the sweep.
+
+    "auto" tunes ONCE per (hardware, model, execution provider, tile
+    geometry) and reuses the persisted answer forever after; "force" never
+    looks here, it always re-sweeps and refreshes the entry (see the
+    caller). A cached value outside ``[initial, max_reachable]`` -- what
+    THIS run can actually try, given the sample and the memory ceiling --
+    is re-tuned rather than clamped: it was never measured under the
+    current constraint.
+    """
+    if mode != 'auto' or key is None:
+        return None
+    cached = autotune_cache.load(key, path=cache_file)
+    if cached is None:
+        return None
+    if initial <= cached <= max_reachable:
+        print(
+            f"{label} autotune: using cached batch {cached} "
+            f"(key {key[:8]}, {cache_file})",
+            flush=True,
+        )
+        return cached
+    print(
+        f"{label} autotune: ignoring out-of-range cached batch "
+        f"{cached} (valid {initial}-{max_reachable}); re-tuning.",
+        flush=True,
+    )
+    return None
+
+
+def _autotune_cache_persist(
+    key, cache_file, best_batch, best_per_tile, candidates, label,
+):
+    if key is None:
+        return
+    meta = {
+        'per_tile_s': (None if not np.isfinite(best_per_tile)
+                       else round(float(best_per_tile), 6)),
+        'candidates': [int(c) for c in candidates],
+        'label': str(label),
+    }
+    if autotune_cache.store(key, best_batch, meta=meta, path=cache_file):
+        print(
+            f"{label} autotune: cached batch {best_batch} "
+            f"(key {key[:8]}, {cache_file})",
+            flush=True,
+        )
+    else:
+        print(
+            f"{label} autotune: could not write {cache_file}; "
+            "the result will be re-measured next run.",
+            flush=True,
+        )
+
+
 def _autotune_batch_size(
     sample_tiles,
     sample_masks,
@@ -599,8 +673,11 @@ def _autotune_batch_size(
         )
         return override
 
-    autotune = bool(getattr(config, 'prediction_batch_autotune', True))
-    if not autotune:
+    # "off": never sweep, never touch the cache (no read, no write) -- the
+    # $WINMOL_BATCH_AUTOTUNE env var wins over Config.prediction_batch_autotune,
+    # see plugin_utils.autotune_cache.resolve_mode.
+    mode = autotune_cache.resolve_mode(config)
+    if mode == 'off':
         return initial
     if len(sample_tiles) < 2:
         return initial
@@ -645,6 +722,17 @@ def _autotune_batch_size(
         c for c in _prediction_batch_candidates(config, initial)
         if c <= len(sample_tiles) and c <= ceiling
     ]
+
+    # Tune once, reuse forever (mode 'auto'); mode 'force' skips straight
+    # to the sweep and refreshes the entry afterwards. See
+    # _autotune_cache_key / _autotune_cache_lookup above.
+    key, cache_file = _autotune_cache_key(model, config, label)
+    max_reachable = candidates[-1] if candidates else initial
+    cached = _autotune_cache_lookup(
+        mode, key, cache_file, initial, max_reachable, label)
+    if cached is not None:
+        return cached
+
     if len(candidates) <= 1:
         return initial
 
@@ -725,6 +813,9 @@ def _autotune_batch_size(
         if stop_reason is not None:
             msg = f"{msg} ({stop_reason})"
         print(msg, flush=True)
+
+    _autotune_cache_persist(
+        key, cache_file, best_batch, best_per_tile, candidates, label)
 
     return best_batch
 
