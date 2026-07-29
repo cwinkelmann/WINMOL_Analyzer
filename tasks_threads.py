@@ -148,6 +148,7 @@ class ModelEnsureWorker(QObject):
     short-circuits, so calling this on every run is cheap)."""
 
     log = pyqtSignal(str)
+    progress = pyqtSignal(int)  # 0-100 download percent (only with a total)
     done = pyqtSignal(str)      # local model file path on success
     failed = pyqtSignal(str)    # error message
 
@@ -159,16 +160,23 @@ class ModelEnsureWorker(QObject):
     def run(self):
         last_pct = [-1]
 
-        def progress(done, total, entry):
+        def report(done, total, entry):
+            # ensure_model -> download_model's callback contract:
+            # (bytes_done, bytes_total, entry); total is 0/None when the
+            # server sent no Content-Length — then there is no percent
+            # and the bar stays indeterminate.
             if not total:
                 return
-            pct = done * 100 // total
-            if pct != last_pct[0] and pct % 10 == 0:
-                last_pct[0] = pct
+            pct = min(100, done * 100 // total)
+            if pct == last_pct[0]:
+                return
+            last_pct[0] = pct
+            self.progress.emit(int(pct))
+            if pct % 10 == 0:
                 self.log.emit(f"Downloading {entry.label}: {pct}%")
 
         try:
-            path = ensure_model(self.entry, self.model_dir, progress=progress)
+            path = ensure_model(self.entry, self.model_dir, progress=report)
             self.done.emit(path)
         except Exception as exc:
             self.failed.emit(str(exc))

@@ -27,6 +27,7 @@ import functools
 import os
 import glob
 import platform
+import time
 from pathlib import Path
 
 try:
@@ -36,7 +37,7 @@ except Exception:
 
 # qgis.PyQt shims to the active Qt binding (PyQt5 on QGIS 3).
 from qgis.PyQt.QtWidgets import QFileDialog
-from qgis.PyQt.QtCore import Qt, QThread, QUrl
+from qgis.PyQt.QtCore import Qt, QThread, QTimer, QUrl
 from qgis.PyQt.QtGui import QDesktopServices
 
 from qgis.core import QgsProject, QgsVectorLayer, QgsRasterLayer
@@ -106,6 +107,14 @@ VARIANT_TOOLTIP = (
     "'Reference (fp32)' if you need results identical to the published "
     "reference model."
 )
+
+#: Idle text for setup_status_label. It is NEVER empty: an empty status
+#: line during a multi-minute pip install is what read as "frozen".
+IDLE_STATUS = "Idle."
+
+#: What the status line says while a detection owns the dialog, so it
+#: never lies about a live child process.
+RUN_STATUS = "Detection running — setup paused."
 
 # This loads your .ui file so that PyQt can populate your plugin with the
 # elements from Qt Designer
@@ -297,6 +306,24 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self._gpu_probe = None
         self._device = None
 
+        # --- status narration (never-empty status + 1 Hz ticker) -------
+        # _last_status backs the elapsed-seconds ticker: while any job
+        # runs the label shows "<status> … (Ns)", so pip's and the
+        # child's silent stretches visibly move.
+        self._last_status = IDLE_STATUS
+        self._busy_t0 = None
+        # Where the Setup bar lands when the busy state ends: 100 after
+        # a completed download, 0 otherwise (failed/cancelled/no total).
+        self._setup_final_pct = 0
+        # Blocked->ready announcement latch (_apply_blocking_reason
+        # announces the transition once, never the initial state).
+        self._last_blocking_reason = None
+        # Parented to the dialog so Qt tears it down with it; a live
+        # QTimer is safe to just stop() (_shutdown_threads does).
+        self._status_timer = QTimer(self)
+        self._status_timer.setInterval(1000)
+        self._status_timer.timeout.connect(self._tick_status)
+
         # Model registry (config.json, schema-2): resolved entry for the
         # current combo selection, and the on-demand-download worker.
         self.registry = None
@@ -336,13 +363,12 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.uav_warning_label.hide()
 
         # Open where the user can act: Detection when a run could start
-        # now, Setup when the environment still needs work. From here on
-        # refreshes are live.
+        # now, Setup when the environment still needs work. Deferred a
+        # tick (rr6's _enter_first_run) so the first-open guidance can
+        # never block construction. From here on refreshes are live.
         self._setup_live = True
-        if setup_state.env_ready(self._env_info()):
-            self._go_to_detection()
-        else:
-            self._go_to_setup()
+        self._set_setup_status(IDLE_STATUS)
+        QTimer.singleShot(0, self._enter_first_run)
         self._refresh_setup_tab()
 
         # Last, once construction has placed every widget: the .ui's
@@ -400,6 +426,9 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.set_default_config_parameters()
         self.get_config_parameters_from_gui()
         self.uav_toolButton.clicked.connect(self.file_dialog_uav)
+        # Run's gate follows the input live: picking, typing or clearing
+        # the raster path re-evaluates the reason and the tooltip.
+        self.uav_lineEdit.textChanged.connect(self._update_run_gate)
         self.model_toolButton.clicked.connect(self.model_file_dialog)
         self.output_toolButton_stem.clicked.connect(self.file_dialog_stem)
         self.output_lineEdit_stem.textChanged.connect(self._update_derived_output_fields)
@@ -487,6 +516,27 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
 
     def _go_to_setup(self):
         self._show_tab(getattr(self, "tab_setup", None))
+
+    def _enter_first_run(self):
+        """Open on the tab that matches this machine: Detection when a
+        run could start now, Setup — with the first step narrated on
+        the status line and the primary button focused — when the
+        environment still needs work. Runs one tick after __init__
+        (QTimer.singleShot), so it can never block construction."""
+        if setup_state.env_ready(self._env_info()):
+            self._go_to_detection()
+            return
+        self._go_to_setup()
+        self._set_setup_status(
+            "Nothing is set up yet. Start with Step 1 — this takes a "
+            "few minutes and downloads a few hundred MB. QGIS stays "
+            "usable throughout.")
+        button = getattr(self, "env_create_button", None)
+        if button is not None:
+            try:
+                button.setFocus()
+            except Exception:                      # pragma: no cover - GUI
+                pass
 
     def _log(self, msg: str) -> None:
         """Write a message to the plugin log widget (and stdout as fallback)."""
@@ -1378,6 +1428,10 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         # to completion idle is fine, but the run they were about to
         # start must not resurrect afterwards. _on_env_setup_done and
         # _on_model_ensured check this flag and bail out instead.
+        if self._busy_kind() is not None:
+            # Immediate feedback on the click; the worker's own
+            # "Analysis cancelled." arrives seconds later.
+            self.update_output_log("Cancelling…")
         self._cancel_requested = True
         if self.worker:
             self.worker.cancel()
@@ -1403,6 +1457,12 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         dialog and its parentless QThreads can be torn down safely. Call
         this from the plugin's unload() too, before QGIS drops the dialog
         reference."""
+        # The status ticker first: a live QTimer is safe to just stop(),
+        # and a stopped one never fires into a half-torn-down dialog.
+        try:
+            self._status_timer.stop()
+        except (RuntimeError, AttributeError):
+            pass
         # Inference: cancelling terminates the child process, so the thread's
         # read loop returns quickly and the thread can be waited out.
         if self._run_active and self.worker is not None:
@@ -1555,35 +1615,96 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self._set_busy_ui(True)
             self._run_env_setup()
         elif self.env.get("status") == "error" or self.python_exe is None:
-            self.update_output_log(
-                self.env.get("message") or "WINMOL environment is not available."
-            )
+            message = (self.env.get("message")
+                       or "WINMOL environment is not available.")
+            self.update_output_log(message)
+            # Route to where the fix lives, with the reason already on
+            # the status line — a log line alone left the user on a tab
+            # with nothing actionable on it.
+            self._go_to_setup()
+            self._set_setup_status(
+                self.env.get("message") or setup_state.TXT_BLOCK_NO_ENV)
+            self._refresh_setup_tab()
             return
         else:
-            self._maybe_offer_gpu()
+            # The environment is usable — but is it using the right
+            # processor? Asked HERE, once, because this is the last
+            # moment before the user spends hours on something that
+            # takes minutes.
+            if not self._gpu_offer_pre_flight():
+                return
             self._resolve_model_and_start(self.python_exe)
 
-    def _maybe_offer_gpu(self):
-        """One log line when an NVIDIA GPU is present but the venv runs
-        the CPU runtime; it points at the Setup tab's install button.
-        Setting any value on QSETTINGS_GPU_PROMPT_KEY silences it."""
+    # --- the proactive pre-run offer ------------------------------------
+
+    def _gpu_prompt_dismissed(self):
+        """The token stored the last time the user said "run on the
+        CPU". A missing or unreadable key simply means "never
+        answered", so the worst a broken settings store can do is ask
+        once more."""
         try:
             from qgis.core import QgsSettings
-            if QgsSettings().value(
-                    installer.QSETTINGS_GPU_PROMPT_KEY, ""):
-                return
-        except Exception:
-            pass
-        if installer.installed_variant(self.venv_path) != "cpu":
+            return QgsSettings().value(
+                installer.QSETTINGS_GPU_PROMPT_KEY, "") or ""
+        except Exception:                          # pragma: no cover - GUI
+            return ""
+
+    def _remember_gpu_prompt(self, token):
+        """Persist "do not ask again on this machine/config" — the
+        writer for the key _gpu_prompt_dismissed reads."""
+        if not token:
             return
-        if not gpu_probe.wants_gpu_runtime(self._gpu_probe_cached()):
-            return
+        try:
+            from qgis.core import QgsSettings
+            QgsSettings().setValue(
+                installer.QSETTINGS_GPU_PROMPT_KEY, token)
+        except Exception as exc:                   # pragma: no cover - GUI
+            self.update_output_log(
+                f"Could not remember the GPU runtime choice: {exc}")
+
+    def _gpu_offer_pre_flight(self):
+        """Interrupt Run once when an NVIDIA GPU sits idle beside the
+        CPU runtime. True to go ahead with the run.
+
+        The Setup tab's install button is otherwise the only entry
+        point, and a user whose environment already works has no reason
+        to open that tab — the question arrives at the one moment it is
+        actionable, after the inputs validate and before a run that
+        would take hours starts. Decided from what the dialog already
+        holds (the sentinel's variant + the cached GPU probe handed to
+        a pure setup_state function); nothing is measured here."""
+        probe = self._gpu_probe_cached()
+        token = setup_state.accelerator_token(probe.label)
+        decision = setup_state.pre_run_decision(
+            installer.installed_variant(self.venv_path),
+            probe.present, self._gpu_prompt_dismissed(), token)
+        if decision != setup_state.PRERUN_OFFER:
+            return True
+        gpu = probe.label or "An NVIDIA GPU"
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Warning)
+        box.setWindowTitle(setup_state.TXT_PRERUN_TITLE)
+        box.setText(setup_state.TXT_PRERUN_GPU_IDLE.format(gpu=gpu))
+        install = box.addButton(setup_state.TXT_PRERUN_INSTALL,
+                                QtWidgets.QMessageBox.AcceptRole)
+        # RejectRole, so Esc and the window's close button both mean
+        # "run on the CPU" — the choice that costs the user nothing.
+        run_anyway = box.addButton(setup_state.TXT_PRERUN_RUN_ANYWAY,
+                                   QtWidgets.QMessageBox.RejectRole)
+        box.setDefaultButton(run_anyway)
+        box.exec_()
+        if box.clickedButton() is install:
+            # Nothing is persisted: an aborted run is not an answer.
+            # The run does not start — the environment it would use is
+            # about to be rebuilt (press Run again afterwards).
+            self._go_to_setup()
+            self._setup_install_gpu()
+            return False
+        self._remember_gpu_prompt(token)
         self.update_output_log(
-            "NVIDIA GPU detected — the environment uses the CPU "
-            "runtime. Open the Setup tab and press 'Install GPU "
-            "runtime…' to switch (a one-time onnxruntime-gpu "
-            "download)."
-        )
+            f"Running on the CPU with {gpu} idle, as chosen. The "
+            "Setup tab can install the GPU runtime later.")
+        return True
 
     def _run_env_setup(self):
         """Build the compute venv off the GUI thread, then run the
@@ -1697,7 +1818,10 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self._selected_model_entry, self.models_dir
         )
         self.ensure_thread = self._new_worker_thread(self.ensure_worker)
-        self.ensure_worker.log.connect(self.update_output_log)
+        # _on_setup_log echoes each line to the status too, and the
+        # percent signal turns the Setup bar determinate.
+        self.ensure_worker.log.connect(self._on_setup_log)
+        self.ensure_worker.progress.connect(self._on_setup_progress)
         self.ensure_worker.done.connect(self._on_model_ensured)
         self.ensure_worker.failed.connect(self._on_model_ensure_failed)
         self.ensure_worker.done.connect(self.ensure_thread.quit)
@@ -1801,6 +1925,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self._run_active = True
             self._show_run_progress(True)
             self._set_busy_ui(True)
+            self._set_setup_status(RUN_STATUS)
             self.thread.start()
         # catch out of memory error
         except MemoryError:
@@ -1853,6 +1978,9 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self._run_progress = None
         self._show_run_progress(False)
         self._set_busy_ui(False)
+        # The run no longer owns the dialog; RUN_STATUS would now be a
+        # lie (this also covers cancel — the thread finishes either way).
+        self._set_setup_status(IDLE_STATUS)
         self._refresh_setup_tab()
         produced = any(os.path.exists(p) for p in self._last_outputs)
         self._set_export_enabled(produced)
@@ -1886,11 +2014,23 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         land between the decision and the repaint. The Setup buttons
         (and the model tree — its double-click is a download path
         around the buttons) ride _refresh_setup_buttons, which reads
-        the same _busy_kind the guards do."""
-        try:
-            self.run_button.setEnabled(not busy)
-        except Exception:                          # pragma: no cover - GUI
-            pass
+        the same _busy_kind the guards do; run_button rides
+        _update_run_gate, which reads it too.
+
+        Also owns the 1 Hz status ticker: one continuous busy period
+        per Run click (env build -> model download -> run share one
+        t0), so the elapsed counter never restarts mid-flow."""
+        self._update_run_gate()
+        if busy:
+            if self._busy_t0 is None:
+                self._busy_t0 = time.monotonic()
+            self._status_timer.start()
+        else:
+            self._status_timer.stop()
+            self._busy_t0 = None
+            # Strip the ticker's elapsed suffix; whatever terminal
+            # status the slot set (before or after this call) stays.
+            self._set_label("setup_status_label", self._last_status)
         self._refresh_setup_buttons()
         self._show_setup_progress(
             busy and self._busy_kind() in ("env", "delete", "models"))
@@ -1949,7 +2089,20 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             pass
 
     def _set_setup_status(self, text):
-        self._set_label("setup_status_label", text)
+        # Never empty: an empty status line during a multi-minute job
+        # is what read as "frozen". _last_status backs the ticker.
+        self._last_status = str(text) if text else IDLE_STATUS
+        self._set_label("setup_status_label", self._last_status)
+
+    def _tick_status(self):
+        """1 Hz while any job runs: append the elapsed seconds so the
+        UI visibly moves through pip's and the child's silent
+        stretches."""
+        if self._busy_t0 is None:
+            return
+        elapsed = time.monotonic() - self._busy_t0
+        self._set_label("setup_status_label",
+                        f"{self._last_status} … ({elapsed:.0f}s)")
 
     def _append_setup_detail(self, text):
         widget = getattr(self, "setup_detail_log", None)
@@ -1961,27 +2114,54 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             pass
 
     def _on_setup_log(self, text):
-        """Worker log lines go to both logs: the Setup tab's detail box
+        """Worker log lines go to both logs — the Setup tab's detail box
         (where the job was started) and the main log (where a first-run
-        build directs the user). Both widgets cap their scrollback."""
+        build directs the user) — and the latest line becomes the
+        status, trimmed, so the narration follows the work. Both log
+        widgets cap their scrollback."""
         self._append_setup_detail(text)
         self.update_output_log(text)
+        self._set_setup_status(str(text)[:120])
 
     def _show_setup_progress(self, on):
         """The Setup tab's own bar: indeterminate while a setup job
-        runs (real progress is in the detail log), reset when idle.
-        The detection bar below the tabs is _show_run_progress's."""
+        runs — until a worker reports a real percent and
+        _on_setup_progress flips it determinate — then holds the
+        terminal value when idle: 100 after a completed download, 0
+        otherwise (failed/cancelled/no total). The detection bar below
+        the tabs is _show_run_progress's."""
         bar = getattr(self, "setup_progress_bar", None)
         if bar is None:
             return
         try:
             if on:
+                self._setup_final_pct = 0
                 bar.setRange(0, 0)
             else:
                 bar.setRange(0, 100)
-                bar.setValue(0)
+                bar.setValue(self._setup_final_pct)
         except Exception:                          # pragma: no cover - GUI
             pass
+
+    def _on_setup_progress(self, percent):
+        """A worker reported a real download percent: flip the Setup
+        bar from indeterminate to determinate and track the terminal
+        value. Only ever the Setup tab's own bar — the run's
+        progress_bar stays wired to the inference Worker alone."""
+        bar = getattr(self, "setup_progress_bar", None)
+        if bar is None:
+            return
+        try:
+            if bar.maximum() == 0:
+                bar.setRange(0, 100)
+            bar.setValue(int(percent))
+        except Exception:                          # pragma: no cover - GUI
+            return
+        if int(percent) >= 100:
+            # A download that reaches 100% stays there when
+            # _show_setup_progress(False) applies the terminal value;
+            # otherwise a completed download snaps back to 0.
+            self._setup_final_pct = 100
 
     # --- environment snapshot ------------------------------------------
 
@@ -2065,13 +2245,15 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self._maybe_start_size_pricing()
 
     def _apply_blocking_reason(self, info):
-        """The Detection-tab banner, the idle-GPU nudge and the Step-3
-        line all derive from one string so they cannot disagree.
-        Deliberately NOT wired to run_button.setEnabled: the Detection
-        tab's own validation (CRS check, _run_active) owns that, and
-        two owners fighting over one button is an rr-era bug class."""
+        """The Run gate, the Detection-tab banner, the idle-GPU nudge
+        and the Step-3 line all derive from one reason string so they
+        cannot disagree. run_button has exactly ONE owner —
+        _update_run_gate sets both its enabled state and its tooltip
+        from the same reason (the rr-era bug class was two owners
+        fighting over that button)."""
         busy = self._busy_kind() in ("env", "delete", "models")
         reason = setup_state.blocking_reason(info, busy=busy)
+        self._update_run_gate()
         banner = getattr(self, "setup_banner_widget", None)
         if banner is not None:
             try:
@@ -2081,26 +2263,84 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self._set_label("setup_banner_label", reason or "")
         self._apply_accel_nudge(info, reason)
         self._set_label("setup_ready_label", reason or self._ready_text())
+        # The blocked -> ready transition announces itself, once: focus
+        # lands on "Go to detection" and the status says what to do
+        # next — only when the user is looking at the Setup tab, so a
+        # first-run build that continues straight into a run never
+        # writes "press Run" over a live run's status.
+        previous = self._last_blocking_reason
+        self._last_blocking_reason = reason
+        if (previous is not None and reason is None
+                and self._is_setup_current()):
+            self._set_setup_status(
+                "Setup complete — switch to the Detection tab and "
+                "press Run.")
+            button = getattr(self, "setup_go_detect_button", None)
+            if button is not None:
+                try:
+                    button.setFocus()
+                except Exception:                  # pragma: no cover - GUI
+                    pass
+
+    def _run_blocking_reason(self):
+        """Why Run cannot start right now, or None. One string feeds
+        the button's enabled state AND its tooltip, computed from the
+        same predicates the guards use (_busy_kind, the cached env,
+        the input field), so they can never disagree."""
+        kind = self._busy_kind()
+        if kind == "run":
+            return ("A run is already in progress — wait for it to "
+                    "finish, or press Cancel.")
+        if kind is not None:
+            return setup_state.TXT_BLOCK_BUSY
+        reason = setup_state.blocking_reason(self._env_info(), busy=False)
+        if reason is not None:
+            return reason
+        try:
+            has_input = bool(self.uav_lineEdit.text().strip())
+        except Exception:                          # pragma: no cover - GUI
+            has_input = True
+        if not has_input:
+            return ("Select an input raster (GeoTiff) first — pick a "
+                    "file, type a path, or choose a loaded layer.")
+        return None
+
+    def _update_run_gate(self):
+        """The ONLY setEnabled/setToolTip owner for run_button. A
+        disabled Run explains itself in the tooltip; when the reason
+        clears (setup completed, input picked) the button re-enables
+        through the same single path."""
+        if not getattr(self, "_setup_live", False):
+            return
+        reason = self._run_blocking_reason()
+        button = getattr(self, "run_button", None)
+        if button is None:
+            return
+        try:
+            button.setEnabled(reason is None)
+            button.setToolTip(reason or "Run the detection")
+        except Exception:                          # pragma: no cover - GUI
+            pass
 
     def _apply_accel_nudge(self, info, reason):
         """The idle-GPU hint on the Detection tab: shown only when
-        nothing more urgent is on screen, the managed venv is CPU-only,
-        and a usable NVIDIA GPU is present. Everyone else sees
-        nothing."""
+        nothing more urgent is on screen, the managed venv records a
+        CPU-only install, and an NVIDIA GPU answered the probe — the
+        same setup_state.should_nudge the pre-run offer decides by, so
+        the banner and the question can never disagree. Everyone else
+        sees nothing."""
+        probe = self._gpu_probe_cached()
         show = (reason is None and info.managed
-                and (info.variant or "cpu") != "gpu"
-                and self._gpu_probe_cached().present)
+                and setup_state.should_nudge(info.variant, probe.present))
         widget = getattr(self, "accel_banner_widget", None)
         if widget is not None:
             try:
                 widget.setVisible(bool(show))
             except Exception:                      # pragma: no cover - GUI
                 pass
-        text = ""
-        if show:
-            text = (f"{self._gpu_probe_cached().label} is idle — the "
-                    "detection runs on the CPU runtime.")
-        self._set_label("accel_banner_label", text)
+        self._set_label(
+            "accel_banner_label",
+            setup_state.accel_nudge_text(probe.label) if show else "")
 
     def _ready_text(self):
         row = next((r for r in self._model_rows if r.is_default), None)
@@ -2780,6 +3020,11 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.maint_worker = worker
         self.maint_thread = self._new_worker_thread(worker)
         worker.log.connect(self._on_setup_log)
+        # ModelEnsureWorker reports a download percent; the maintenance
+        # worker has no signal of that name and stays indeterminate.
+        progress = getattr(worker, "progress", None)
+        if progress is not None:
+            progress.connect(self._on_setup_progress)
         worker.done.connect(done_slot)
         worker.failed.connect(self._on_model_job_failed)
         worker.done.connect(self.maint_thread.quit)

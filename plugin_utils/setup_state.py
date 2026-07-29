@@ -169,6 +169,86 @@ def blocking_reason(info, busy=False):
     return None
 
 
+# --- the proactive pre-run offer (lite) -------------------------------------
+#
+# rr6 decided this from a probed AcceleratorStatus (EnvProbeWorker — a
+# documented cut here). The lite decision uses what the dialog already
+# holds: the sentinel's installed variant and the cached nvidia-smi
+# probe. Pure functions of plain data, so the whole decision surface is
+# testable off QGIS; nothing here ever measures anything.
+
+#: The short idle-GPU line the DETECTION tab carries, so the offer is
+#: not hidden on a tab the user never opens.
+TXT_NUDGE_GPU_IDLE = (
+    "{gpu} is sitting idle — the installed runtime is CPU-only, so "
+    "detection takes roughly 5 s per image tile instead of 12 ms.")
+
+#: The pre-run interruption. This is the one that matters: a user who
+#: never opens the Setup tab otherwise learns about the idle GPU only
+#: after waiting out a run that took hours instead of minutes.
+TXT_PRERUN_TITLE = "This run will use the CPU, not your GPU"
+TXT_PRERUN_GPU_IDLE = (
+    "{gpu} is in this machine, but WINMOL's environment has the CPU-only "
+    "inference runtime, so this detection will run on the CPU.\n\n"
+    "Measured on this hardware: about 12 ms per image tile on the GPU "
+    "against roughly 5 s on the CPU. That is the difference between a run "
+    "of minutes and a run of hours.\n\n"
+    "Installing the GPU runtime downloads about 2.4 GB once. Nothing else "
+    "about the environment changes, and this detection is not started "
+    "until the install finishes — press Run again afterwards.\n\n"
+    "Running on the CPU is a fine answer, and it is remembered: this "
+    "question is not asked again. The Setup tab keeps an “Install GPU "
+    "runtime” button for whenever you change your mind.")
+TXT_PRERUN_INSTALL = "Install the GPU runtime (2.4 GB)"
+TXT_PRERUN_RUN_ANYWAY = "Run on the CPU anyway"
+
+#: pre_run_decision results.
+PRERUN_RUN_CPU = "run_cpu"
+PRERUN_OFFER = "offer"
+
+
+def accelerator_token(gpu_label) -> str:
+    """The value persisted when the user chooses "run on the CPU
+    anyway". State plus GPU name rather than a bare "yes, dismissed":
+    a dismissal is an answer about THIS machine in THIS configuration —
+    drop a different card in and the question is worth asking once
+    more."""
+    return f"gpu_idle|{gpu_label or 'An NVIDIA GPU'}"
+
+
+def should_nudge(installed_variant, gpu_present) -> bool:
+    """True when a surface outside the Setup tab should say something:
+    the sentinel records a CPU-only install AND an NVIDIA GPU answered
+    the probe. Anything else — no GPU, the GPU runtime already
+    installed, no managed sentinel at all (variant None) — stays
+    silent: there is either nothing to offer or nothing to install
+    into."""
+    return bool(gpu_present) and installed_variant == "cpu"
+
+
+def accel_nudge_text(gpu_label) -> str:
+    """The Detection tab's one-line idle-GPU warning."""
+    return TXT_NUDGE_GPU_IDLE.format(gpu=gpu_label or "An NVIDIA GPU")
+
+
+def pre_run_decision(installed_variant, gpu_present, dismissed_token,
+                     machine_token) -> str:
+    """What pressing Run should do about an idle GPU.
+
+    Returns :data:`PRERUN_OFFER` (put the install-vs-CPU question on
+    screen) or :data:`PRERUN_RUN_CPU` (just run). Offers only when the
+    installed runtime is CPU-only, a GPU is present, and
+    ``machine_token`` (:func:`accelerator_token` for this machine) has
+    not already been dismissed — an answer is an answer, once per
+    machine/configuration; a DIFFERENT stored token means the hardware
+    changed and the question is worth asking once more."""
+    if not should_nudge(installed_variant, gpu_present):
+        return PRERUN_RUN_CPU
+    if dismissed_token and str(dismissed_token) == str(machine_token):
+        return PRERUN_RUN_CPU
+    return PRERUN_OFFER
+
+
 # --- models -----------------------------------------------------------------
 
 def models_summary_text(rows) -> str:
