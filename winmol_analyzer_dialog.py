@@ -139,6 +139,12 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         # whole QGIS process aborts. Never start a second run over a live
         # one.
         self._run_active = False
+        # Set by cancel_process while env setup / model download is in
+        # flight (neither worker has a hard-kill). Checked by
+        # _on_env_setup_done / _on_model_ensured so a cancelled run
+        # cannot resurrect once the phase finishes idle; cleared at the
+        # top of run_process.
+        self._cancel_requested = False
         # Incremental stdout parser driving the detection progress bar.
         # Created per run in _start_analysis, fed in _on_worker_line.
         self._run_progress = None
@@ -509,7 +515,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
 
             if not self.crs.isGeographic():  # isGeographic() returns True for unprojected systems like EPSG:4326
                 # Enable processing button
-                self.run_button.setEnabled(True)
+                self.run_button.setEnabled(not self._run_active)
                 self.uav_warning_label.hide()  # Hide CRS error if shown before
 
                 # Get the raster's pixel size in map units
@@ -865,6 +871,12 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         # wired to thread.quit(), tears the thread down once it exits.
         # The bar resets immediately so a cancelled run never keeps a
         # stale percentage on screen.
+        #
+        # env setup / model download have no hard-kill: letting them run
+        # to completion idle is fine, but the run they were about to
+        # start must not resurrect afterwards. _on_env_setup_done and
+        # _on_model_ensured check this flag and bail out instead.
+        self._cancel_requested = True
         if self.worker:
             self.worker.cancel()
         bar = getattr(self, "progress_bar", None)
@@ -879,6 +891,10 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.close()
 
     def run_process(self):
+        # A stale cancel from a previous env-setup/model-download phase
+        # must not carry into this run.
+        self._cancel_requested = False
+
         # Guard against re-entry: a second Run while one is live would
         # reassign self.thread and destroy a still-running QThread -> Qt
         # qFatal aborts the whole QGIS process.
@@ -961,6 +977,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
                 "Setting up the WINMOL environment (first run only)..."
             )
             self._setup_running = True
+            self._set_busy_ui(True)
             self._run_env_setup()
         elif self.env.get("status") == "error" or self.python_exe is None:
             self.update_output_log(
@@ -1015,11 +1032,17 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self._setup_running = False
         self.python_exe = python_exe
         self.env["status"] = "ready"
+        if self._cancel_requested:
+            self._cancel_requested = False
+            self._set_busy_ui(False)
+            self.update_output_log("Run cancelled.")
+            return
         self.update_output_log("WINMOL environment ready.")
         self._resolve_model_and_start(python_exe)
 
     def _on_env_setup_failed(self, message):
         self._setup_running = False
+        self._set_busy_ui(False)
         self.update_output_log(f"WINMOL environment setup failed: {message}")
 
     def _resolve_model_and_start(self, python_exe):
@@ -1036,6 +1059,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
 
         self._model_ensuring = True
         self._pending_python_exe = python_exe
+        self._set_busy_ui(True)
         self.update_output_log(
             f"Preparing model '{self._selected_model_entry.label}'..."
         )
@@ -1058,13 +1082,26 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
     def _on_model_ensured(self, model_path):
         self._model_ensuring = False
         self.model_path = model_path
+        if self._cancel_requested:
+            self._cancel_requested = False
+            self._set_busy_ui(False)
+            self.update_output_log("Run cancelled.")
+            return
         self._start_analysis(self._pending_python_exe)
 
     def _on_model_ensure_failed(self, message):
         self._model_ensuring = False
+        self._set_busy_ui(False)
         self.update_output_log(f"Model download failed: {message}")
 
     def _start_analysis(self, python_exe):
+        # A model download (or a previous env-setup) completing while a
+        # run is already active must not reassign self.thread over a
+        # LIVE QThread -> Qt qFatal() aborts the whole QGIS process.
+        if self._run_active:
+            self.update_output_log(
+                "A run is already active — skipping.")
+            return
         path_dirname = os.path.dirname(__file__)
         script_path = os.path.join(path_dirname, "winmol_run.py")
 
