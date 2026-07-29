@@ -34,6 +34,12 @@ REQUIRED = [
     "WINMOL_Analyzer/plugin_utils/model_registry.py",
     "WINMOL_Analyzer/plugin_utils/childenv.py",
     "WINMOL_Analyzer/plugin_utils/gpu_probe.py",
+    # the plugin-gui feature's helper modules — the dialog imports them
+    "WINMOL_Analyzer/plugin_utils/run_progress.py",
+    "WINMOL_Analyzer/plugin_utils/setup_state.py",
+    "WINMOL_Analyzer/plugin_utils/model_status.py",
+    "WINMOL_Analyzer/plugin_utils/output_selection.py",
+    "WINMOL_Analyzer/plugin_utils/config_overrides.py",
 ]
 
 EXCLUDED_DIR_PREFIXES = [

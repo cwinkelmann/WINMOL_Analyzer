@@ -114,6 +114,14 @@ _CLOSURE_FILES = (
     "utils/Prediction.py",
     "utils/PredictWorkers.py",
     "utils/onnx_runtime.py",
+    # plugin-gui helper modules run inside the CHILD venv's python too
+    # (progress parsing happens in the QGIS process, but keep them
+    # runtime-clean anyway — they must never grow heavy imports)
+    "plugin_utils/run_progress.py",
+    "plugin_utils/setup_state.py",
+    "plugin_utils/model_status.py",
+    "plugin_utils/output_selection.py",
+    "plugin_utils/config_overrides.py",
 )
 _LOCAL_PACKAGES = {"utils", "classes", "plugin_utils"}
 # Import roots not literally named in requirements/*.txt because they
