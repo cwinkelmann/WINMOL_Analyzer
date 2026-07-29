@@ -333,7 +333,9 @@ def test_verdict_timeout_is_also_an_honest_could_not_verify():
 def test_probe_providers_parses_version_and_providers(monkeypatch):
     class Result:
         returncode = 0
-        stdout = "1.20.1\nCUDAExecutionProvider,CPUExecutionProvider\n"
+        stdout = ("[W] nvidia diagnostic noise\n"
+                  "WINMOL_PROBE:1.20.1\n"
+                  "WINMOL_PROBE:CUDAExecutionProvider,CPUExecutionProvider\n")
         stderr = ""
     _run(monkeypatch, lambda *a, **k: Result())
     report = gpu_probe._probe_providers("py")
@@ -383,7 +385,8 @@ def test_probe_providers_runs_the_child_venv_through_child_env(monkeypatch):
 
         class Result:
             returncode = 0
-            stdout = "1.20.1\nCPUExecutionProvider\n"
+            stdout = ("WINMOL_PROBE:1.20.1\n"
+                      "WINMOL_PROBE:CPUExecutionProvider\n")
             stderr = ""
         return Result()
     _run(monkeypatch, fake_run)
@@ -396,7 +399,9 @@ def test_probe_providers_runs_the_child_venv_through_child_env(monkeypatch):
 def test_verify_gpu_providers_end_to_end(monkeypatch):
     class Result:
         returncode = 0
-        stdout = "1.20.1\nCUDAExecutionProvider,CPUExecutionProvider\n"
+        stdout = ("[W] nvidia diagnostic noise\n"
+                  "WINMOL_PROBE:1.20.1\n"
+                  "WINMOL_PROBE:CUDAExecutionProvider,CPUExecutionProvider\n")
         stderr = ""
     _run(monkeypatch, lambda *a, **k: Result())
     assert gpu_probe.verify_gpu_providers("/venv/bin/python") == (

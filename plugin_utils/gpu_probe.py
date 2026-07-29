@@ -185,11 +185,15 @@ GPU_RUNTIME_DIST = "onnxruntime-gpu"
 #: Seconds before a wedged/downloading child interpreter is given up on.
 PROVIDER_PROBE_TIMEOUT = 60.0
 
-#: stdlib-only: printed lines are parsed back out, never eval'd.
+#: stdlib-only: printed lines are parsed back out, never eval'd. The
+#: WINMOL_PROBE: sentinel anchors parsing — nvidia wheels can emit
+#: registration diagnostics on import, which would otherwise shift the
+#: positional lines and silently corrupt the verdict.
+_PROBE_SENTINEL = "WINMOL_PROBE:"
 _PROVIDER_PROBE_CODE = (
     "import onnxruntime as ort\n"
-    "print(ort.__version__)\n"
-    "print(','.join(ort.get_available_providers()))\n"
+    "print('WINMOL_PROBE:' + ort.__version__)\n"
+    "print('WINMOL_PROBE:' + ','.join(ort.get_available_providers()))\n"
 )
 
 _DEFINITIVE_CHECK = (
@@ -212,13 +216,15 @@ def _probe_providers(venv_python, timeout=PROVIDER_PROBE_TIMEOUT) -> dict:
         return {**empty, "error": f"timed out after {timeout:.0f}s"}
     except Exception as exc:
         return {**empty, "error": f"{type(exc).__name__}: {exc}"}
-    lines = [ln for ln in (out.stdout or "").splitlines() if ln.strip()]
+    lines = [ln[len(_PROBE_SENTINEL):].strip()
+             for ln in (out.stdout or "").splitlines()
+             if ln.startswith(_PROBE_SENTINEL)]
     if out.returncode != 0 or len(lines) < 2:
         detail = (out.stderr or out.stdout or "no output").strip()
         return {**empty, "error": detail[-400:] or "no output"}
     providers = [p for p in lines[1].split(",") if p]
     return {
-        "ok": True, "version": lines[0].strip(),
+        "ok": True, "version": lines[0],
         "providers": providers, "error": None,
     }
 
