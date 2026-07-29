@@ -321,3 +321,31 @@ def test_models_summary_text(tmp_path):
     assert text == setup_state.TXT_MODELS_SUMMARY.format(
         have=1, total=2, size=setup_state.human_bytes(
             len(b"quantized-weights")))
+
+
+def test_busy_guarded_slots_declare_no_signal_parameters():
+    """_refuse_if_busy's wrapper absorbs Qt signal args and calls the
+    slot with none (PyQt's own truncation does this for undecorated
+    bound methods, but a forwarding wrapper broke it in the field:
+    clicked(bool) -> TypeError). Pin the contract: decorated slots
+    take only self."""
+    import ast as _ast
+    src = (REPO / "winmol_analyzer_dialog.py").read_text()
+    tree = _ast.parse(src)
+    offenders = []
+    for node in _ast.walk(tree):
+        if not isinstance(node, _ast.FunctionDef):
+            continue
+        if not any(isinstance(d, _ast.Name) and d.id == "_refuse_if_busy"
+                   for d in node.decorator_list):
+            continue
+        a = node.args
+        extra = [p.arg for p in a.args[1:]] + [p.arg for p in a.kwonlyargs]
+        if extra or a.vararg or a.kwarg:
+            offenders.append("%s(%s)" % (node.name, ", ".join(
+                ["self"] + extra
+                + (["*" + a.vararg.arg] if a.vararg else [])
+                + (["**" + a.kwarg.arg] if a.kwarg else []))))
+    assert not offenders, (
+        "busy-guarded slots must take only self (the guard wrapper "
+        "calls method(self)): " + ", ".join(offenders))

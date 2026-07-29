@@ -74,13 +74,20 @@ def _refuse_if_busy(method):
     """Slot decorator: the busy-guard every Setup-tab slot opens with.
     While any setup job runs (``_busy_kind``), refuse with the standard
     status line instead of entering the slot — one job at a time is a
-    guarantee, not a hope."""
+    guarantee, not a hope.
+
+    The wrapper absorbs Qt signal arguments (``clicked`` emits a bool,
+    ``itemDoubleClicked`` an item+column) and calls the slot with none:
+    an undecorated bound method gets that truncation from PyQt for
+    free, but a ``*args`` wrapper forwards them and TypeErrors a bare
+    ``(self)`` slot. Decorated slots therefore must not declare signal
+    parameters — connect through a lambda if one ever needs them."""
     @functools.wraps(method)
-    def guarded(self, *args, **kwargs):
+    def guarded(self, *_args, **_kwargs):
         if self._busy_kind():
             self._refuse_busy()
             return None
-        return method(self, *args, **kwargs)
+        return method(self)
     return guarded
 
 
@@ -2162,7 +2169,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self._refresh_setup_tab()
 
     @_refuse_if_busy
-    def _setup_download_selected(self, *_args):
+    def _setup_download_selected(self):
         # itemDoubleClicked lands here too (item, column absorbed by
         # *_args) — same guard as the button, so no signal path gets
         # around the interlock.
