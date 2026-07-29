@@ -112,23 +112,30 @@ class Worker(QObject):
 class EnvSetupWorker(QObject):
     """Builds the WINMOL compute environment off the GUI thread:
     creates the managed venv and pip-installs requirements/cpu.txt —
-    or gpu.txt when WINMOL_GPU=1 opts into the CUDA runtime
-    (idempotent via the sentinel, see plugin_utils/installer.py).
-    Keeps QGIS responsive during a multi-minute first-run install."""
+    or gpu.txt for the CUDA runtime (idempotent via the sentinel, see
+    plugin_utils/installer.py). Keeps QGIS responsive during a
+    multi-minute first-run install.
+
+    ``gpu`` selects the runtime variant: ``None`` (default) honors the
+    WINMOL_GPU env var (``installer.gpu_requested``), the pre-Setup-tab
+    opt-in; ``True``/``False`` is the Setup tab's explicit choice
+    (Install GPU runtime / repair-preserving-variant)."""
 
     log = pyqtSignal(str)
     done = pyqtSignal(str)      # interpreter path on success
     failed = pyqtSignal(str)    # error message
 
-    def __init__(self, plugin_dir):
+    def __init__(self, plugin_dir, gpu=None):
         super().__init__()
         self.plugin_dir = plugin_dir
+        self.gpu = gpu
 
     def run(self):
+        gpu = gpu_requested() if self.gpu is None else bool(self.gpu)
         try:
             info = setup_environment(
                 venv_location(self.plugin_dir), progress=self.log.emit,
-                gpu=gpu_requested())
+                gpu=gpu)
             self.done.emit(info["python"])
         except Exception as exc:
             self.failed.emit(str(exc))
