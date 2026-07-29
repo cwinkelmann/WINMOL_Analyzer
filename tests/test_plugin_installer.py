@@ -57,7 +57,7 @@ def test_marker_roundtrip_and_hash_invalidation(tmp_path, monkeypatch):
     req = tmp_path / "cpu.txt"
     req.write_text("-r core.txt\nonnxruntime>=1.17\n")
     monkeypatch.setattr(installer, "plugin_requirements_path",
-                        lambda: req)
+                        lambda gpu=False: req)
     venv = tmp_path / "venv"
     venv.mkdir()
     assert not installer.marker_matches(str(venv))

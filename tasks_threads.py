@@ -10,7 +10,11 @@ from PyQt5.QtCore import (
 )
 
 from .plugin_utils.childenv import child_env, safe_child_cwd
-from .plugin_utils.installer import setup_environment, venv_location
+from .plugin_utils.installer import (
+    gpu_requested,
+    setup_environment,
+    venv_location,
+)
 from .plugin_utils.model_registry import ensure_model
 
 
@@ -97,10 +101,11 @@ class Worker(QObject):
 
 
 class EnvSetupWorker(QObject):
-    """Builds the WINMOL compute environment off the GUI thread: creates
-    the managed venv and pip-installs requirements/cpu.txt (idempotent
-    via the sentinel, see plugin_utils/installer.py). Keeps QGIS
-    responsive during a multi-minute first-run install."""
+    """Builds the WINMOL compute environment off the GUI thread:
+    creates the managed venv and pip-installs requirements/cpu.txt —
+    or gpu.txt when WINMOL_GPU=1 opts into the CUDA runtime
+    (idempotent via the sentinel, see plugin_utils/installer.py).
+    Keeps QGIS responsive during a multi-minute first-run install."""
 
     log = pyqtSignal(str)
     done = pyqtSignal(str)      # interpreter path on success
@@ -113,7 +118,8 @@ class EnvSetupWorker(QObject):
     def run(self):
         try:
             info = setup_environment(
-                venv_location(self.plugin_dir), progress=self.log.emit)
+                venv_location(self.plugin_dir), progress=self.log.emit,
+                gpu=gpu_requested())
             self.done.emit(info["python"])
         except Exception as exc:
             self.failed.emit(str(exc))

@@ -1,0 +1,56 @@
+# THE CUDA TWIN OF cpu.txt — same environment, GPU inference runtime.
+# Installed by plugin_utils/installer.py when the user opts in
+# (WINMOL_GPU=1) and plugin_utils/gpu_probe.py sees an NVIDIA driver.
+#
+#     pip install -r requirements/gpu.txt
+#
+# MUST NOT BE COMBINED WITH cpu.txt. onnxruntime and onnxruntime-gpu
+# both provide the `onnxruntime` module, and pip will happily leave
+# both installed — the loser's shared libraries then shadow the
+# winner's and imports fail in ways that look like a broken CUDA
+# install. plugin_utils/installer.py uninstalls the other distribution
+# before pip runs; that is not belt-and-braces, it is the documented
+# requirement.
+#
+# Hence `-r core.txt`: core.txt carries the geo stack and NO runtime,
+# so this file and cpu.txt can share it without either one leaking a
+# runtime into the other.
+-r core.txt
+
+# THE CUDA RUNTIME, AND THE ONLY PLACE IN THIS REPO THAT NAMES IT.
+#
+# THE VERSION WINDOW IS LOAD-BEARING AT BOTH ENDS.
+#
+# The [cuda,cudnn] extras ship the CUDA userspace as wheels (cuBLAS,
+# cuDNN, cuFFT, cuRAND, nvrtc, cuda_runtime, nvJitLink), so the host
+# needs an NVIDIA DRIVER and nothing else — no system CUDA toolkit,
+# and no LD_LIBRARY_PATH: onnxruntime >= 1.26 preloads the wheel
+# libraries itself.
+#
+# CEILING (<1.27): onnxruntime-gpu 1.27 moved its extras to CUDA 13
+# (nvidia-*-cu13) and fails at import with `ImportError:
+# libcudart.so.13` on a cu12 machine (reproduced on an RTX 4080,
+# driver 580). The cap keeps the resolver on the cu12-era 1.26 line.
+#
+# FLOOR (>=1.26): an unsatisfiable EXTRA is a pip warning, never an
+# error. Without a floor, a narrow wheel-tag set makes pip backtrack
+# to 1.20.2, print "does not provide the extra 'cuda'", install ZERO
+# nvidia wheels and exit 0 — a build that claims success and then runs
+# on the CPU. The floor turns that silent degradation into a resolver
+# failure.
+#
+# Adding CUDA to an environment that already has cpu.txt is a SWAP,
+# not an addition: uninstall the CPU wheel FIRST, then install this
+# file. Then verify CUDA is actually offered — installing is not the
+# same as working:
+#
+#     <venv>/bin/python -c \
+#       "import onnxruntime as ort; print(ort.get_available_providers())"
+#
+# 'CUDAExecutionProvider' must appear in that list.
+onnxruntime-gpu[cuda,cudnn]>=1.26,<1.27
+
+# Without psutil, HardwareInfo._detect_total_ram_gb() returns 0.0 and
+# the run logs "RAM=0.0 GB" — a wrong number in the log is a wrong
+# number, and psutil is tiny.
+psutil>=5.9
