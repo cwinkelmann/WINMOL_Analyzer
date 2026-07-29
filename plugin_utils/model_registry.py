@@ -54,6 +54,14 @@ class ModelEntry:
     precision: str = "fp32"
     sha256: Optional[str] = None
     size_mb: Optional[float] = None
+    #: Certified to reproduce the fp32 reference's results. Gates the
+    #: ``variant="auto"`` (lossless-only) resolution rule; an fp32
+    #: reference is lossless by definition, quantised builds only when
+    #: the registry says so.
+    lossless: bool = True
+    #: Never shown in choosers (forward-compat with registries that
+    #: carry non-runnable formats, e.g. the TensorFlow .hdf5 originals).
+    hidden: bool = False
 
 
 @dataclass
@@ -94,21 +102,40 @@ class Registry:
             raise KeyError(f"unknown model {name!r}; known models: {known}")
         return self.entries[canonical]
 
+    def _family_precision_entry(self, fam, precision):
+        """``fam``'s entry carrying ``precision``, or None."""
+        eid = self._by_family_precision.get(fam.id, {}).get(precision)
+        return self.entries[eid] if eid else None
+
     def _device_variant(self, fam, device) -> ModelEntry:
         """``fam``'s entry whose precision matches ``device``'s rule
         (cpu->int8, gpu->fp16, coreml->fp32), else ``fam``'s default."""
         precision = _DEVICE_PRECISION.get(device)
-        variants = self._by_family_precision.get(fam.id, {})
-        eid = variants.get(precision) if precision else None
-        return self.entries[eid] if eid else self.entries[fam.default]
+        entry = (self._family_precision_entry(fam, precision)
+                 if precision else None)
+        return entry if entry else self.entries[fam.default]
 
-    def resolve(self, name, device="auto") -> ModelEntry:
+    def resolve(self, name, device=None, variant=None) -> ModelEntry:
         """Resolve a model or family id to a concrete entry.
 
-        An explicit entry id is returned as-is — device selection never
-        rewrites it. A family id resolves to its device variant (see
-        ``_device_variant``). Lookup order: exact entry id, exact
-        family id, case-insensitive entry, case-insensitive family.
+        An explicit entry id is returned as-is — neither ``device`` nor
+        ``variant`` ever rewrites it. A family id resolves by
+        ``variant``:
+
+        * ``None`` / ``"default"`` — the device rule (cpu->int8,
+          gpu->fp16, coreml->fp32, see ``_device_variant``), falling
+          back to the family default. Unchanged legacy behavior.
+        * ``"auto"`` — lossless-only: the device variant is substituted
+          ONLY when it is certified lossless (``ModelEntry.lossless``),
+          otherwise the fp32 family default — results stay identical to
+          the published reference.
+        * ``"fp32"``/``"int8"``/``"fp16"`` — that precision within the
+          family; KeyError (naming the family and what it does provide)
+          when the family lacks it.
+
+        ``device`` ``None``/``"auto"`` probes the machine. Lookup
+        order: exact entry id, exact family id, case-insensitive
+        entry, case-insensitive family.
         """
         name_s = str(name).strip()
         if name_s in self.entries:
@@ -122,9 +149,32 @@ class Registry:
             if fam_id is None:
                 return self.get(name)   # raises the descriptive KeyError
             fam = self.families[fam_id]
-        if device == "auto":
+        if device in (None, "auto"):
             device = detect_device()
-        return self._device_variant(fam, device)
+        v = str(variant).strip().lower() if variant is not None else "default"
+        if v in ("", "default"):
+            return self._device_variant(fam, device)
+        if v == "auto":
+            cand = self._family_precision_entry(
+                fam, _DEVICE_PRECISION.get(device))
+            if cand is not None and cand.lossless:
+                return cand
+            return self.entries[fam.default]
+        if v in ("fp32", "int8", "fp16"):
+            entry = self._family_precision_entry(fam, v)
+            if entry is None:
+                have = sorted(self._by_family_precision.get(fam.id, {}))
+                raise KeyError(
+                    f"family '{fam.id}' has no {v} variant; "
+                    f"available precisions: {', '.join(have) or 'none'}")
+            return entry
+        raise ValueError(
+            f"unknown variant {variant!r} "
+            "(use default/auto/fp32/int8/fp16)")
+
+    def visible(self) -> List[ModelEntry]:
+        """Non-hidden entries in registry (curated) order."""
+        return [e for e in self.entries.values() if not e.hidden]
 
     def default_entry(self, device="auto") -> ModelEntry:
         """The effective default entry for ``device``: the declared
@@ -211,6 +261,8 @@ def _parse_v2(raw, config_path) -> Registry:
             file=file.strip(),
             sha256=spec.get("sha256") or None,
             size_mb=spec.get("size_mb"),
+            lossless=bool(spec.get("lossless", True)),
+            hidden=bool(spec.get("hidden", False)),
         )
 
     families = {}

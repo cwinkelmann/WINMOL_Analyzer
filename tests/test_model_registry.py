@@ -30,19 +30,22 @@ FIXTURE_V2 = {
             "file": "spruce_fp32.onnx", "sha256": "a" * 64,
             "size_mb": 12.3,
         },
+        # int8: quantised, NOT certified lossless (like the shipped
+        # Keras-family int8 builds) -> variant="auto" must refuse it.
         "spruce_int8": {
             "label": "Spruce (int8)", "family": "spruce",
             "precision": "int8",
             "url": "https://example.com/spruce_int8.onnx",
             "file": "spruce_int8.onnx", "sha256": "b" * 64,
-            "size_mb": 3.1,
+            "size_mb": 3.1, "lossless": False,
         },
+        # fp16: certified lossless -> variant="auto" may substitute it.
         "spruce_fp16": {
             "label": "Spruce (fp16)", "family": "spruce",
             "precision": "fp16",
             "url": "https://example.com/spruce_fp16.onnx",
             "file": "spruce_fp16.onnx", "sha256": "c" * 64,
-            "size_mb": 6.2,
+            "size_mb": 6.2, "lossless": True,
         },
         # beech has ONLY the fp32 default -> cpu/gpu must fall back to it.
         "beech_fp32": {
@@ -103,6 +106,87 @@ def test_unknown_name_raises_key_error():
     reg = _registry()
     with pytest.raises(KeyError):
         reg.resolve("no-such-model")
+
+
+# --- the variant kwarg ---------------------------------------------------
+
+def test_variant_explicit_precision_ignores_device():
+    reg = _registry()
+    for device in ("cpu", "gpu", "coreml"):
+        assert reg.resolve("spruce", device=device,
+                           variant="int8").id == "spruce_int8"
+        assert reg.resolve("spruce", device=device,
+                           variant="fp16").id == "spruce_fp16"
+        assert reg.resolve("spruce", device=device,
+                           variant="fp32").id == "spruce_fp32"
+
+
+def test_variant_explicit_precision_missing_raises_clear_key_error():
+    reg = _registry()
+    # beech ships only the fp32 default.
+    for missing in ("int8", "fp16"):
+        with pytest.raises(KeyError, match="beech.*has no"):
+            reg.resolve("beech", device="cpu", variant=missing)
+    assert reg.resolve("beech", device="cpu", variant="fp32").id \
+        == "beech_fp32"
+
+
+def test_variant_default_and_none_keep_device_rule():
+    reg = _registry()
+    for variant in (None, "default"):
+        assert reg.resolve("spruce", device="cpu",
+                           variant=variant).id == "spruce_int8"
+        assert reg.resolve("spruce", device="gpu",
+                           variant=variant).id == "spruce_fp16"
+        # missing device precision falls back to the family default.
+        assert reg.resolve("beech", device="cpu",
+                           variant=variant).id == "beech_fp32"
+
+
+def test_variant_auto_is_lossless_only():
+    reg = _registry()
+    # cpu wants int8, which is NOT lossless -> stay on the fp32 default.
+    assert reg.resolve("spruce", device="cpu",
+                       variant="auto").id == "spruce_fp32"
+    # gpu wants fp16, which IS lossless -> substituted.
+    assert reg.resolve("spruce", device="gpu",
+                       variant="auto").id == "spruce_fp16"
+    assert reg.resolve("spruce", device="coreml",
+                       variant="auto").id == "spruce_fp32"
+    # no variants at all -> the default, on every device.
+    assert reg.resolve("beech", device="cpu",
+                       variant="auto").id == "beech_fp32"
+
+
+def test_variant_never_rewrites_explicit_entry_id():
+    reg = _registry()
+    assert reg.resolve("spruce_int8", device="gpu",
+                       variant="fp32").id == "spruce_int8"
+
+
+def test_variant_unknown_value_raises_value_error():
+    reg = _registry()
+    with pytest.raises(ValueError, match="unknown variant"):
+        reg.resolve("spruce", device="cpu", variant="int4")
+
+
+def test_lossless_defaults_true_and_hidden_defaults_false():
+    reg = _registry()
+    # fixture fp32 entries carry no flags at all.
+    assert reg.entries["spruce_fp32"].lossless is True
+    assert reg.entries["spruce_fp32"].hidden is False
+    assert reg.entries["spruce_int8"].lossless is False
+
+
+def test_hidden_entries_dropped_from_visible():
+    raw = json.loads(json.dumps(FIXTURE_V2))   # deep copy
+    raw["models"]["spruce_fp16"]["hidden"] = True
+    reg = mr._parse_v2(raw, "<fixture>")
+    ids = [e.id for e in reg.visible()]
+    assert "spruce_fp16" not in ids
+    assert "spruce_fp32" in ids
+    # hidden filters choosers, never resolution.
+    assert reg.resolve("spruce", device="gpu").id == "spruce_fp16"
 
 
 # --- fixture-registry pinning property ----------------------------------
@@ -299,3 +383,33 @@ def test_shipped_config_default_entry_resolves_on_cpu():
     entry = reg.default_entry(device="cpu")
     assert entry.id == reg.gui_default
     assert entry.sha256
+
+
+def test_shipped_config_lossless_flags_match_release_metadata():
+    """fp32 references and the fp16 builds are certified lossless; the
+    Keras-family int8 builds are not; the PyTorch w05 int8 build is the
+    one certified int8 (mirrors the models-v1 release metadata)."""
+    reg = _shipped_registry()
+    for entry in reg.entries.values():
+        if entry.precision in ("fp32", "fp16"):
+            assert entry.lossless, entry.id
+        elif entry.id == "beech_pytorch_int8":
+            assert entry.lossless, entry.id
+        else:
+            assert not entry.lossless, entry.id
+
+
+@pytest.mark.parametrize("family", CLASSIC_FAMILIES)
+def test_shipped_config_auto_variant_refuses_uncertified_int8(family):
+    reg = _shipped_registry()
+    # cpu device rule wants int8, which is not certified -> fp32.
+    assert reg.resolve(family, device="cpu",
+                       variant="auto").precision == "fp32"
+    # gpu wants fp16, which is certified -> substituted.
+    assert reg.resolve(family, device="gpu",
+                       variant="auto").precision == "fp16"
+
+
+def test_shipped_config_has_no_hidden_entries():
+    reg = _shipped_registry()
+    assert [e.id for e in reg.visible()] == list(reg.entries)
