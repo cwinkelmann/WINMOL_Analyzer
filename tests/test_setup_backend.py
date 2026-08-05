@@ -23,8 +23,9 @@ from plugin_utils import installer, model_status, setup_state  # noqa: E402
 def _make_venv(plugin_dir, payload=b"x" * 1024):
     """A fake managed venv (off QGIS, managed_root == plugin_dir)."""
     venv = Path(installer.venv_location(str(plugin_dir)))
-    (venv / "bin").mkdir(parents=True)
-    (venv / "bin" / "python").write_bytes(payload)
+    py = Path(installer.get_venv_python_path(str(venv)))
+    py.parent.mkdir(parents=True, exist_ok=True)
+    py.write_bytes(payload)
     (venv / "lib.bin").write_bytes(payload)
     return venv
 
