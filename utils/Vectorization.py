@@ -50,6 +50,26 @@ def _clone_stem(stem: Stem) -> Stem:
     )
 
 
+def _merge_diameter_lists(first: Stem, second: Stem) -> List[float]:
+    """Per-node diameters for a merged path built as
+    ``first.path.coords[:-1] + second.path.coords[1:]`` (the construction every
+    merge branch in calc_connectivity_votes uses).
+
+    Only meaningful when BOTH parents carry one diameter per path node -- the
+    tiled edge-merge case, where diameters were measured in-tile before
+    merging. In-tile connect_stems runs BEFORE quantification (the lists are
+    empty), so this returns ``[]`` there and behaviour is unchanged; the
+    diameters are measured fresh afterwards. Without it a merged stem kept the
+    base's SHORTER diameter list, and quantify_stem then indexed
+    ``segment_diameter_list[i + 1]`` off the end (issue #41)."""
+    d_first = list(getattr(first, 'segment_diameter_list', []) or [])
+    d_second = list(getattr(second, 'segment_diameter_list', []) or [])
+    if (len(d_first) == len(first.path.coords)
+            and len(d_second) == len(second.path.coords)):
+        return d_first[:-1] + d_second[1:]
+    return []
+
+
 def _stem_end_lines(stem: Stem):
     if len(stem.path.coords) < 4:
         line_start = LineString([stem.path.coords[0], stem.path.coords[-1]])
@@ -299,6 +319,14 @@ def calc_connectivity_votes(
             candidate = _clone_stem(stems0)
             candidate.path = new_path
             candidate.stop = stem.stop
+            # merged path = stems0[:-1] + stem[1:]; merge the parents' per-node
+            # diameters the same way and drop the now-stale measures, so a
+            # later quantify_stem on this merged stem cannot IndexError (#41).
+            candidate.segment_diameter_list = \
+                _merge_diameter_lists(stems0, stem)
+            candidate.segment_length_list = []
+            candidate.segment_volume_list = []
+            candidate.vector = []
             slave = stem
             vote = calc_vote(ang_l_sp_el_st, ang_l_sp_mp, ang_mp_el_st,
                              candidate, stem, stems0, tolerance_angle)
@@ -342,6 +370,13 @@ def calc_connectivity_votes(
             candidate = _clone_stem(stems0)
             candidate.path = new_path
             candidate.start = stem.start
+            # merged path = stem[:-1] + stems0[1:] in this branch; merge the
+            # diameter lists the same way and drop the stale measures (#41).
+            candidate.segment_diameter_list = \
+                _merge_diameter_lists(stem, stems0)
+            candidate.segment_length_list = []
+            candidate.segment_volume_list = []
+            candidate.vector = []
             slave = stem
             vote = calc_vote(ang_el_sp_l_st, ang_el_sp_mp, ang_mp_l_st,
                              candidate, stems0, stem, tolerance_angle)

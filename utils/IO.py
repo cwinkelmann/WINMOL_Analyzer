@@ -1478,11 +1478,25 @@ def _reconstruct_edge_stems_for_tiled_merge(
     connected_edge_stems = \
         Vec.connect_stems(list(original_edge_stems), recon_cfg)
 
-    # Quantify the direct connect_stems outputs
-    # so their profile metadata is refreshed
-    # consistently with geometry after edge merging.
-    quantified_edge_stems = \
-        [Quant.quantify_stem(stem) for stem in connected_edge_stems]
+    # Quantify the direct connect_stems outputs so their lengths/volumes are
+    # consistent with the merged geometry. connect_stems now merges the
+    # parents' per-node diameter lists (Vectorization._merge_diameter_lists),
+    # but guard anyway: a stem whose diameter list does not match its path
+    # would crash quantify_stem with an IndexError at the very last step
+    # (issue #41) -- keep its geometry and clear the measures instead of dying.
+    quantified_edge_stems = []
+    n_unmeasured = 0
+    for stem in connected_edge_stems:
+        if len(stem.segment_diameter_list) == len(stem.path.coords):
+            quantified_edge_stems.append(Quant.quantify_stem(stem))
+        else:
+            stem.segment_length_list = []
+            stem.segment_volume_list = []
+            n_unmeasured += 1
+            quantified_edge_stems.append(stem)
+    if n_unmeasured:
+        print(f"WARNING: {n_unmeasured} merged edge stems kept without "
+              f"re-quantified measures (diameter/path mismatch)", flush=True)
 
     final_stems = inner_stems + quantified_edge_stems
     print(
