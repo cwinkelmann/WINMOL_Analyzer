@@ -99,6 +99,49 @@ def test_predict_batch_adaptive_halves_batch_on_runtime_oom_message(
     assert calls == [4, 2, 1]
 
 
+def test_predict_batch_adaptive_halves_on_arena_alloc_failure(monkeypatch):
+    """onnxruntime's CUDA BFC-arena OOM ("Failed to allocate memory for
+    requested buffer of size N") carries neither 'oom' nor 'out of memory',
+    so it slipped past the back-off and aborted the run. It must now halve
+    like any other OOM (issue #40)."""
+    from utils import Prediction as Pred
+
+    calls = []
+
+    def fake_core(raw_tiles, raw_masks, model, config):
+        calls.append(len(raw_tiles))
+        if len(raw_tiles) > 1:
+            raise RuntimeError(
+                "[ONNXRuntimeError] : 6 : RUNTIME_EXCEPTION : Non-zero status "
+                "code returned while running Conv node. bfc_arena.cc "
+                "AllocateRawInternal Failed to allocate memory for requested "
+                "buffer of size 604127488")
+        return ["ok"]
+
+    monkeypatch.setattr(Pred, "_predict_batch_core", fake_core)
+
+    result, used = Pred._predict_batch_adaptive(
+        ["t"] * 4, ["m"] * 4, object(), object(), 4)
+
+    assert used == 1
+    assert result == ["ok"]
+    assert calls == [4, 2, 1]
+
+
+def test_oom_detection_catches_arena_failure_but_not_cudnn_failure():
+    """The normalizer must recognize the arena allocation failure (#40) yet
+    NOT misclassify a cuDNN execution failure (issue #24) as OOM -- that would
+    send the batch loop halving to 1 and still fail, hiding the real cause."""
+    from utils import onnx_runtime as ort_mod
+
+    assert ort_mod._looks_like_oom(
+        "Failed to allocate memory for requested buffer of size 604127488")
+    assert ort_mod._looks_like_oom("CUDA error: out of memory")
+    assert not ort_mod._looks_like_oom(
+        "CUDNN_FE failure 11: CUDNN_BACKEND_API_FAILED")
+    assert not ort_mod._looks_like_oom("some unrelated runtime error")
+
+
 def test_predict_batch_adaptive_reraises_non_oom_runtime_error(monkeypatch):
     from utils import Prediction as Pred
 

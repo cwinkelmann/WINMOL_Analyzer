@@ -502,8 +502,14 @@ def _predict_batch_adaptive(
             raw_tiles, raw_masks, model, config), batch_size
     except (RuntimeError, MemoryError) as exc:
         msg = str(exc).lower()
+        # onnx_runtime normalizes an onnxruntime OOM to MemoryError; this
+        # string check is the fallback for a raw RuntimeError. Match the CUDA
+        # BFC-arena wording too ("Failed to allocate memory for requested
+        # buffer ..."), which carries neither 'oom' nor 'out of memory' and so
+        # slipped past the back-off before, aborting the run (issue #40).
         is_oom = isinstance(exc, MemoryError) or (
-            'oom' in msg or 'out of memory' in msg)
+            'oom' in msg or 'out of memory' in msg
+            or 'failed to allocate memory' in msg)
         if batch_size <= 1 or not is_oom:
             raise
         reduced = max(1, batch_size // 2)

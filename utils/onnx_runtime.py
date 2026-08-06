@@ -33,6 +33,25 @@ _PRELOADED = None
 # can be corrected afterwards with what actually bound.
 _LAST_ACTIVE = None
 
+#: onnxruntime words an out-of-memory failure differently per execution
+#: provider, and most variants contain NEITHER "out of memory" NOR "oom":
+#: the CUDA BFC arena says "Failed to allocate memory for requested buffer of
+#: size N" (bfc_arena.cc), CUDA proper says "cudaErrorMemoryAllocation", and
+#: TensorRT says "ResourceExhausted". Missing any of these means the batch-size
+#: back-off in Prediction never fires and the whole run aborts on an OOM that
+#: a smaller micro-batch would have survived (issue #40).
+_OOM_MARKERS = (
+    "out of memory", "oom", "cudaerror", "failed to allocate memory",
+    "bfc_arena", "resource_exhausted", "resourceexhausted", "bad_alloc",
+)
+
+
+def _looks_like_oom(message) -> bool:
+    """True if an exception message reads like an allocation/OOM failure from
+    any onnxruntime execution provider (see _OOM_MARKERS)."""
+    msg = str(message).lower()
+    return any(marker in msg for marker in _OOM_MARKERS)
+
 
 def _truthy(val):
     return str(val).strip().lower() in ("1", "true", "yes", "on")
@@ -235,8 +254,7 @@ class OnnxSegmenter:
             out = self.session.run(
                 [self.output_name], {self.input_name: feed})[0]
         except Exception as exc:       # normalize OOM for the retry loop
-            msg = str(exc).lower()
-            if "out of memory" in msg or "oom" in msg or "cudaerror" in msg:
+            if _looks_like_oom(exc):
                 raise MemoryError(str(exc)) from exc
             raise
         if self.output_layout == "NCHW":
