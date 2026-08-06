@@ -197,6 +197,43 @@ def test_safe_extract_writes_real_members(tmp_path):
     assert (dest / "python" / "bin" / "python3.11").read_bytes() == b"stub"
 
 
+def _make_tar_gz_with_symlink(path, regular, symlinks):
+    """Tarball with regular files ``{name: bytes}`` plus symlinks
+    ``{name: linkname}`` — mirrors the terminfo symlinks in a real PBS asset."""
+    with tarfile.open(path, "w:gz") as tar:
+        for name, data in regular.items():
+            info = tarfile.TarInfo(name=name)
+            info.size = len(data)
+            info.mode = 0o644
+            tar.addfile(info, io.BytesIO(data))
+        for name, linkname in symlinks.items():
+            info = tarfile.TarInfo(name=name)
+            info.type = tarfile.SYMTYPE
+            info.linkname = linkname
+            tar.addfile(info)
+
+
+def test_safe_extract_allows_escaping_symlinks_data_would_reject(tmp_path):
+    """PBS ships terminfo symlinks whose targets the strict 'data' filter
+    rejects as "outside the destination", aborting the whole extract (issue
+    #25). _safe_extract uses the 'tar' filter, which still blocks name
+    traversal but permits these links — reverting to 'data' makes this raise."""
+    archive = tmp_path / "pbs.tar.gz"
+    _make_tar_gz_with_symlink(
+        str(archive),
+        {"python/bin/python3.11": b"stub"},
+        {"python/share/terminfo/1/1178": "../../../../../a/adm1178"},
+    )
+    dest = tmp_path / "out"
+    dest.mkdir()
+    with tarfile.open(str(archive), "r:gz") as tar:
+        py311._safe_extract(tar, str(dest))
+    assert (dest / "python" / "bin" / "python3.11").read_bytes() == b"stub"
+    assert (
+        dest / "python" / "share" / "terminfo" / "1" / "1178"
+    ).is_symlink()
+
+
 class _FakeMember:
     def __init__(self, name):
         self.name = name

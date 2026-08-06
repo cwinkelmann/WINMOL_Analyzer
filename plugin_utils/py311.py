@@ -132,11 +132,20 @@ def _download(url, dest, progress=None):
 
 
 def _safe_extract(tar, path):
-    """extractall guarding against path traversal. Uses the stdlib 'data'
+    """extractall guarding against path traversal. Uses the stdlib 'tar'
     filter where available (Py>=3.8.17/3.9.17/3.10.12/3.11.4/3.12), else a
-    manual member check."""
+    manual member check.
+
+    The 'tar' filter -- not 'data' -- is deliberate. 'data' additionally
+    rejects any symlink whose target resolves outside the destination, which
+    the relocatable Python build's terminfo tree trips (a member such as
+    share/terminfo/1/1178 -> ../a/adm1178), aborting the whole extract with
+    "'...' would link to '...', which is outside the destination" (issue #25).
+    The archive is verified by pinned SHA-256 above, so it is trusted; the
+    'tar' filter still blocks the actual traversal attack -- absolute paths and
+    '..' components in member names -- while honouring those symlinks."""
     try:
-        tar.extractall(path, filter="data")
+        tar.extractall(path, filter="tar")
         return
     except TypeError:
         pass  # old Python without the filter kwarg
