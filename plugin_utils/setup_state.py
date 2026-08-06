@@ -206,6 +206,28 @@ TXT_PRERUN_RUN_ANYWAY = "Run on the CPU anyway"
 PRERUN_RUN_CPU = "run_cpu"
 PRERUN_OFFER = "offer"
 
+#: Substrings marking a run failure as a GPU/accelerator DEVICE failure -- the
+#: model executed on the GPU but the GPU stack (driver / cuDNN / cuBLAS) could
+#: not run it (issue #24: "CUDNN_BACKEND_API_FAILED" on an older card). NOT
+#: out-of-memory (a capacity problem the prediction path already absorbs by
+#: shrinking the micro-batch) -- a "this GPU cannot run the model" problem whose
+#: remedy is to fall back to the CPU.
+_GPU_FAILURE_MARKERS = (
+    "cudnn", "cublas", "cufft", "curand", "cusparse",
+    "cuda error", "cudaerror", "cuda_error",
+)
+
+
+def looks_like_gpu_failure(text) -> bool:
+    """True if a failed run's output points at a GPU/accelerator device
+    failure for which retrying on the CPU is the remedy (issue #24).
+    Out-of-memory is excluded on purpose: the prediction path already handles
+    it by halving the batch, so a smaller batch -- not the CPU -- is the fix."""
+    low = str(text).lower()
+    if "out of memory" in low or "failed to allocate memory" in low:
+        return False
+    return any(marker in low for marker in _GPU_FAILURE_MARKERS)
+
 
 def accelerator_token(gpu_label) -> str:
     """The value persisted when the user chooses "run on the CPU

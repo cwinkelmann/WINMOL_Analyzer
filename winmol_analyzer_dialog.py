@@ -308,6 +308,13 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         # both shell out (bounded), so they run at most once per dialog.
         self._gpu_probe = None
         self._device = None
+        # Force-CPU retry (issue #24): once the user accepts "run on the CPU"
+        # after a GPU/cuDNN device failure, _force_cpu makes _start_analysis
+        # pin WINMOL_ONNX_FORCE_CPU for the rest of the session. _run_tail
+        # keeps the last child-output lines so a failure can be classified.
+        self._force_cpu = False
+        self._retry_cpu_pending = False
+        self._run_tail = []
 
         # --- status narration (never-empty status + 1 Hz ticker) -------
         # _last_status backs the elapsed-seconds ticker: while any job
@@ -1889,6 +1896,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             return
         path_dirname = os.path.dirname(__file__)
         script_path = os.path.join(path_dirname, "winmol_run.py")
+        self._run_tail = []
 
         command = [
             python_exe,
@@ -1918,6 +1926,13 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             # environment is the only other channel that carries a config
             # value to the child.
             env_extra.update(self._batch_override_env())
+            if self._force_cpu:
+                # Issue #24: the user chose CPU after a GPU/cuDNN device
+                # failure. Pin the CPU provider for the child so the model
+                # runs on the CPU regardless of the auto provider precedence.
+                env_extra["WINMOL_ONNX_FORCE_CPU"] = "1"
+                self.update_output_log(
+                    "Running on the CPU (GPU disabled for this session).")
             self.worker = Worker(command, env_extra=env_extra)
             self.worker.moveToThread(self.thread)
             self.thread.started.connect(self.worker.run_process)
@@ -1928,7 +1943,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             # layers load ONLY on success; failures surface in the log
             # and a dialog instead of loading empty/absent layers.
             self.worker.succeeded.connect(self._on_run_succeeded)
-            self.worker.error.connect(self.handle_process_error)
+            self.worker.error.connect(self._on_run_error)
             self.worker.finished.connect(self.thread.quit)
             self.worker.finished.connect(self.worker.deleteLater)
             self.thread.finished.connect(self.thread.deleteLater)
@@ -1962,11 +1977,30 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         the progress bar when it carries one of the pipeline's done/total
         counters (plugin_utils.run_progress)."""
         self.update_output_log(text)
+        # Keep a bounded tail of child output so a failure can be classified
+        # (GPU device error -> offer a CPU retry, issue #24).
+        self._run_tail.append(text)
+        if len(self._run_tail) > 100:
+            del self._run_tail[:-100]
         if self._run_progress is None:
             return
         percent = self._run_progress.feed(text)
         if percent is not None:
             self.update_progress(percent)
+
+    def _on_run_error(self, message):
+        """Worker error slot. A GPU/accelerator device failure gets a
+        targeted 'retry on the CPU' offer (issue #24) — but only after the
+        run's QThread has fully torn down, so the relaunch cannot reassign
+        self.thread over a live thread (qFatal). Everything else surfaces
+        immediately, as before."""
+        haystack = str(message) + "\n" + "\n".join(self._run_tail)
+        if (not self._force_cpu
+                and setup_state.looks_like_gpu_failure(haystack)):
+            self._retry_cpu_pending = True
+            self.update_output_log(message)
+            return
+        self.handle_process_error(message)
 
     def handle_process_error(self, message):
         """Show a failure instead of silently loading empty/absent layers."""
@@ -2001,6 +2035,35 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self.update_output_log(
                 "Outputs were written to a temp folder. Use 'Export…' to "
                 "save them to a permanent location.")
+        # Deferred from _on_run_error: the failed run's thread is gone now,
+        # so relaunching on the CPU is safe (issue #24).
+        if self._retry_cpu_pending:
+            self._retry_cpu_pending = False
+            self._offer_cpu_retry()
+
+    def _offer_cpu_retry(self):
+        """After a GPU/device failure, offer to re-run on the CPU (issue
+        #24). The GPU driver/cuDNN could not run the model on this machine;
+        the CPU can. Accepting pins CPU for the rest of the session and
+        re-launches with the inputs already validated for the failed run."""
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Warning)
+        box.setWindowTitle("GPU inference failed")
+        box.setText(
+            "The run failed on the GPU with a CUDA/cuDNN device error — the "
+            "GPU driver or cuDNN on this machine could not run the model.\n\n"
+            "Re-run on the CPU instead? It is slower but does not use the "
+            "GPU.")
+        retry = box.addButton("Run on the CPU",
+                              QtWidgets.QMessageBox.AcceptRole)
+        box.addButton("Cancel", QtWidgets.QMessageBox.RejectRole)
+        box.setDefaultButton(retry)
+        box.exec_()
+        if box.clickedButton() is not retry:
+            return
+        self._force_cpu = True
+        self.update_output_log("Retrying on the CPU…")
+        self._start_analysis(self.python_exe)
 
     def _show_run_progress(self, on):
         """Show the detection progress bar ONLY while a detection runs.

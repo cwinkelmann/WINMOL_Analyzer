@@ -69,3 +69,26 @@ def test_nudge_text_names_the_gpu_and_the_cost():
     text = setup_state.accel_nudge_text("NVIDIA T4")
     assert "NVIDIA T4" in text
     assert "5 s" in text and "12 ms" in text
+
+
+# --- looks_like_gpu_failure: the "retry on CPU" trigger (issue #24) --------
+
+def test_gpu_failure_detects_cudnn_backend_error():
+    msg = ("onnxruntime ... FAIL : Non-zero status code returned while "
+           "running Conv node ... CUDNN_FE failure 11: "
+           "CUDNN_BACKEND_API_FAILED ; GPU=0 ; hostname=FIT21")
+    assert setup_state.looks_like_gpu_failure(msg)
+
+
+def test_gpu_failure_excludes_out_of_memory():
+    # OOM is #40's problem (batch back-off), not a CPU-fallback trigger,
+    # even though the arena message mentions CUDA.
+    assert not setup_state.looks_like_gpu_failure(
+        "bfc_arena.cc Failed to allocate memory for requested buffer of size N")
+    assert not setup_state.looks_like_gpu_failure("CUDA error: out of memory")
+
+
+def test_gpu_failure_ignores_ordinary_errors():
+    assert not setup_state.looks_like_gpu_failure(
+        "IndexError: list index out of range")
+    assert not setup_state.looks_like_gpu_failure("")
