@@ -60,9 +60,16 @@ def test_ceiling_applied_before_timing_caps_candidates(monkeypatch):
     result = Pred._autotune_batch_size(
         list(range(20)), list(range(20)), _fake_model(), config, initial)
 
-    assert attempted == [4, 5, 6]
+    # The sweep now starts at b1 (a machine that cannot fit the planner's
+    # batch must be able to find the low end); the memory ceiling still
+    # caps the TOP at 6, which is what this test is about.
+    assert attempted == [1, 2, 3, 4, 5, 6]
     assert 7 not in attempted and 20 not in attempted
-    assert result == 4
+    # fake_time makes every bigger batch genuinely faster (1.0/cand), so the
+    # sweep now settles on the ceiling instead of returning `initial`
+    # unchanged -- the absolute 0.2 s/tile bar used to make every
+    # candidate after the first look like jitter.
+    assert result == 6
 
 
 def test_memory_batch_ceiling_blind_headroom_when_memory_unknown(
@@ -119,10 +126,15 @@ def test_jitter_not_progress_absolute_bar_stops_via_patience(monkeypatch):
         Pred, "_free_memory_bytes",
         lambda model, cfg: (1024.0 ** 4, "mocked-plenty"))
 
-    # b3 and b4 are each ~0.001-0.002s faster than b2 -- real, but under the
-    # 0.2s absolute bar, so jitter. b6 would be a genuine 0.999s win but
-    # must never be reached.
-    timings = {2: 1.000, 3: 0.999, 4: 0.998, 5: 0.997, 6: 0.001}
+    # Each step is ~0.001s faster than the last -- real, but far under the
+    # noise floor, so jitter. b6 would be a genuine 0.999s win but must
+    # never be reached: patience stops the sweep first.
+    #
+    # The floor is now RELATIVE (5% of the measured baseline, capped by
+    # min_improve_s) rather than a flat 0.2s. At a ~1s baseline that is
+    # ~0.05s, so these 0.001s steps are still correctly rejected -- the
+    # property this test guards is unchanged.
+    timings = {1: 1.001, 2: 1.000, 3: 0.999, 4: 0.998, 5: 0.997, 6: 0.001}
     attempted = []
 
     def fake_time(sample_tiles, sample_masks, model, cfg, cand, repeats=1):
@@ -134,9 +146,9 @@ def test_jitter_not_progress_absolute_bar_stops_via_patience(monkeypatch):
     result = Pred._autotune_batch_size(
         list(range(20)), list(range(20)), _fake_model(), config, initial)
 
-    assert attempted == [2, 3, 4]
+    assert attempted == [1, 2, 3]
     assert 5 not in attempted and 6 not in attempted
-    assert result == 2
+    assert result == 1
 
 
 # --- post-OOM working ceiling ----------------------------------------------
@@ -166,7 +178,7 @@ def test_post_oom_working_ceiling_never_retries_at_or_above(monkeypatch):
     Pred._autotune_batch_size(
         list(range(20)), list(range(20)), _fake_model(), config, initial)
 
-    assert attempted == [2, 3, 4, 5]
+    assert attempted == [1, 2, 3, 4, 5]
     assert 6 not in attempted and 7 not in attempted
 
 

@@ -214,7 +214,12 @@ def _prediction_batch_candidates(config, initial_batch: int) -> list[int]:
         initial,
         int(max_batch_attr if max_batch_attr is not None else initial),
     )
-    return list(range(initial, max_batch + 1))
+    # Sweep from 1, not from the planner's `initial`. Starting at `initial`
+    # made the low end unreachable: a machine that cannot fit the planner's
+    # batch had no way to discover 1 or 2 and simply OOMed at run time.
+    # `initial` still seeds the planner and the cache; it is no longer the
+    # floor of the search.
+    return list(range(1, max_batch + 1))
 
 
 #: How far above the initial batch the sweep may go when free memory could
@@ -479,6 +484,57 @@ def _write_prediction_core(dst, pred_core, job, layout):
     return time.perf_counter() - t0
 
 
+def _is_oom_error(exc) -> bool:
+    """True when ``exc`` is an out-of-memory failure from the backend.
+
+    onnx_runtime normalizes an onnxruntime OOM to MemoryError; the string
+    check is the fallback for a raw RuntimeError. The CUDA BFC-arena
+    wording ("Failed to allocate memory for requested buffer ...") carries
+    neither 'oom' nor 'out of memory' and so slipped past the back-off
+    before, aborting the run (issue #40).
+    """
+    if isinstance(exc, MemoryError):
+        return True
+    msg = str(exc).lower()
+    return ('oom' in msg or 'out of memory' in msg
+            or 'failed to allocate memory' in msg)
+
+
+def _predict_tensor_adaptive(tile_tensor, model, batch_size):
+    """Run the model over an already-prepared batch, halving on OOM.
+
+    Returns ``(pred, used)``. The ENTIRE tensor is always predicted: a
+    reduction re-runs it in slices and concatenates, so the caller gets one
+    row per input tile no matter how far the batch had to come down. This
+    is what the streaming loop calls -- it used to call
+    ``model.predict_on_batch`` directly, so the first steady-state OOM
+    killed the whole run even though the back-off below already existed
+    (it was reachable only from the autotune).
+    """
+    try:
+        return np.asarray(model.predict_on_batch(tile_tensor)), batch_size
+    except (RuntimeError, MemoryError) as exc:
+        if batch_size <= 1 or not _is_oom_error(exc):
+            raise
+        reduced = max(1, batch_size // 2)
+        print(f"Prediction batch too large; reducing micro-batch size from "
+              f"{batch_size} to {reduced}", flush=True)
+        # Carry the working size forward across slices: once a slice has
+        # backed off to N, start the next one at N rather than re-probing
+        # from `reduced` and paying another failed allocation. On a
+        # 99k-tile ortho that difference is the whole cost of the fallback.
+        parts = []
+        used = reduced
+        start = 0
+        while start < len(tile_tensor):
+            part, part_used = _predict_tensor_adaptive(
+                tile_tensor[start:start + used], model, used)
+            parts.append(part)
+            start += len(part)
+            used = min(used, part_used)
+        return np.concatenate(parts, axis=0), used
+
+
 def _predict_batch_adaptive(
     raw_tiles, raw_masks, model, config, batch_size
 ):
@@ -486,23 +542,33 @@ def _predict_batch_adaptive(
         return _predict_batch_core(
             raw_tiles, raw_masks, model, config), batch_size
     except (RuntimeError, MemoryError) as exc:
-        msg = str(exc).lower()
-        # onnx_runtime normalizes an onnxruntime OOM to MemoryError; this
-        # string check is the fallback for a raw RuntimeError. Match the CUDA
-        # BFC-arena wording too ("Failed to allocate memory for requested
-        # buffer ..."), which carries neither 'oom' nor 'out of memory' and so
-        # slipped past the back-off before, aborting the run (issue #40).
-        is_oom = isinstance(exc, MemoryError) or (
-            'oom' in msg or 'out of memory' in msg
-            or 'failed to allocate memory' in msg)
-        if batch_size <= 1 or not is_oom:
+        if batch_size <= 1 or not _is_oom_error(exc):
             raise
         reduced = max(1, batch_size // 2)
         print(f"Prediction batch too large; reducing micro-batch size from "
               f"{batch_size} to {reduced}", flush=True)
-        return _predict_batch_adaptive(raw_tiles[:reduced], raw_masks[:reduced]
-                                       if raw_masks is not None
-                                       else None, model, config, reduced)
+        # Re-run the WHOLE input in slices of `reduced` -- never just
+        # raw_tiles[:reduced]. Truncating here silently dropped every tile
+        # past the first slice: harmless while only the autotune called this
+        # (it keeps timings, not predictions), but the streaming loop writes
+        # what comes back, so a truncated result is a hole in the stem map
+        # with no error anywhere.
+        cores = []
+        used = reduced
+        start = 0
+        while start < len(raw_tiles):
+            stop = start + used
+            slice_masks = (
+                raw_masks[start:stop] if raw_masks is not None else None)
+            slice_cores, slice_used = _predict_batch_adaptive(
+                raw_tiles[start:stop], slice_masks, model, config, used)
+            cores.extend(slice_cores)
+            start += len(slice_cores)
+            # Report the SMALLEST size that worked: a later slice may have
+            # had to back off further, and the caller latches this value for
+            # the rest of the run.
+            used = min(used, slice_used)
+        return cores, used
 
 
 def _time_batch_candidate(
@@ -633,6 +699,25 @@ def _autotune_cache_persist(
             "the result will be re-measured next run.",
             flush=True,
         )
+
+
+def _persist_autotune_batch(key, cache_file, batch):
+    """Lower the cached batch after a steady-state OOM.
+
+    The sweep caches the size that fit a warm sample; once the real run
+    OOMs and backs off, that cached value is known-fatal for this
+    model/machine pair. Leaving it in place makes the NEXT run load it and
+    die exactly the same way without even re-probing -- which is what the
+    reported crash did.
+    """
+    if key is None:
+        return
+    stored = autotune_cache.store(
+        key, int(batch), meta={'lowered_after_oom': True}, path=cache_file)
+    if stored:
+        print(f"Prediction micro-batch autotune: lowered cached batch to "
+              f"{int(batch)} after an out-of-memory back-off "
+              f"(key {key[:8]}, {cache_file})", flush=True)
 
 
 def _autotune_batch_size(
@@ -767,13 +852,27 @@ def _autotune_batch_size(
         results.append((cand, used, per_tile, oomed))
 
         # A candidate only counts as progress if it clears BOTH bars: the
-        # existing relative one (min_improve) AND a new absolute floor
-        # (min_improve_s). 0.337 vs 0.340 s/tile is jitter, not a win, and
-        # treating it as one just chases noise to the top of the range.
+        # relative one (min_improve) AND a noise floor. 0.337 vs 0.340
+        # s/tile is jitter, not a win, and treating it as one just chases
+        # noise to the top of the range.
+        #
+        # The floor is RELATIVE to the measured baseline. A fixed
+        # min_improve_s (0.2 s/tile by default) is unreachable on a GPU,
+        # where per-tile times are 0.01-0.05 s: candidates[0] always wins
+        # on the isfinite() branch, every later candidate then needs
+        # per_tile <= best - 0.2 (negative), and the sweep could only ever
+        # return its own starting point -- timing 5 candidates x 5 repeats
+        # to re-derive the planner's value.
+        #
+        # min_improve_s stays as an upper bound, so the floor never gets
+        # LOOSER than the tuned value; on slow CPU tiles (~0.8 s) it does
+        # get tighter (0.2 -> ~0.04), which is the point: 5% of measured is
+        # a real win at any speed, 0.2 s absolute is not a scale-free test.
+        noise_floor = min(min_improve_s, max(0.002, 0.05 * best_per_tile))
         improved = (
             not np.isfinite(best_per_tile)
             or (per_tile < best_per_tile * (1.0 - min_improve)
-                and per_tile <= best_per_tile - min_improve_s)
+                and per_tile <= best_per_tile - noise_floor)
         )
 
         if improved:
@@ -911,6 +1010,11 @@ def predict_stream_to_raster(
     total_infer_s = 0.0
     total_write_s = 0.0
     active_batch_size = initial_batch_size
+    # Resolved once so a steady-state OOM can lower the cached batch: the
+    # sweep caches what fit a warm sample, and if the real run then backs
+    # off, that cached value is known-fatal for this model/machine.
+    autotune_key, autotune_cache_file = _autotune_cache_key(
+        model, config, 'Prediction micro-batch')
     pending_items = []
     finished_producers = 0
 
@@ -967,8 +1071,17 @@ def predict_stream_to_raster(
             total_prep_s += time.perf_counter() - prep0
 
             infer0 = time.perf_counter()
-            pred = model.predict_on_batch(tile_tensor)
+            pred, used_batch = _predict_tensor_adaptive(
+                tile_tensor, model, current_n)
             total_infer_s += time.perf_counter() - infer0
+            # Latch the reduction for the REST of the run. Without this every
+            # subsequent batch re-hits the same memory cliff, pays the failed
+            # allocation, and backs off again -- and a batch that OOMs at the
+            # very first tile would never make progress at all.
+            if used_batch < active_batch_size:
+                active_batch_size = used_batch
+                _persist_autotune_batch(autotune_key, autotune_cache_file,
+                                        used_batch)
 
             crop = config.overlap_pred // 2
             write_batch_s = 0.0

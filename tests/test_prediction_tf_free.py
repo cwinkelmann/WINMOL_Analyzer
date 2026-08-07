@@ -72,8 +72,17 @@ def test_predict_batch_adaptive_halves_batch_on_memory_error(monkeypatch):
         ["t"] * 4, ["m"] * 4, object(), object(), 4)
 
     assert used == 1
-    assert result == ["core-for-1"]
-    assert calls == [4, 2, 1]
+    # All FOUR tiles come back. This assertion used to read
+    # `result == ["core-for-1"]`: the back-off recursed on
+    # raw_tiles[:reduced] and silently dropped the remainder, so a 4-tile
+    # batch that halved to 1 returned a single core. Harmless while only
+    # the autotune called this (it keeps timings, not predictions), but it
+    # became holes in the stem map once the streaming loop started using
+    # the back-off -- see tests/test_prediction_oom_backoff.py.
+    assert result == ["core-for-1"] * 4
+    # 4 and 2 fail; the first tile succeeds at 1 and the working size is
+    # then carried forward, so the remaining three go straight to 1.
+    assert calls == [4, 2, 1, 1, 1, 1]
 
 
 def test_predict_batch_adaptive_halves_batch_on_runtime_oom_message(
@@ -95,8 +104,8 @@ def test_predict_batch_adaptive_halves_batch_on_runtime_oom_message(
         ["t"] * 4, ["m"] * 4, object(), object(), 4)
 
     assert used == 1
-    assert result == ["ok"]
-    assert calls == [4, 2, 1]
+    assert result == ["ok"] * 4     # every tile, not just the first slice
+    assert calls == [4, 2, 1, 1, 1, 1]
 
 
 def test_predict_batch_adaptive_halves_on_arena_alloc_failure(monkeypatch):
@@ -124,8 +133,8 @@ def test_predict_batch_adaptive_halves_on_arena_alloc_failure(monkeypatch):
         ["t"] * 4, ["m"] * 4, object(), object(), 4)
 
     assert used == 1
-    assert result == ["ok"]
-    assert calls == [4, 2, 1]
+    assert result == ["ok"] * 4     # every tile, not just the first slice
+    assert calls == [4, 2, 1, 1, 1, 1]
 
 
 def test_oom_detection_catches_arena_failure_but_not_cudnn_failure():
