@@ -40,7 +40,10 @@ def resolve_model_path(
     it is missing or stale. Raises KeyError for an unknown name and
     ModelDownloadError if the fetch/verification fails."""
     registry = load_registry(config_path)
-    entry = registry.resolve(name, device=detect_device())
+    # sys.prefix is the environment this batch run will itself predict
+    # in, so its sentinel is the right answer to "can we use the card?".
+    # Without it a CPU-only env on an NVIDIA box fetches the fp16 variant.
+    entry = registry.resolve(name, device=detect_device(sys.prefix))
     return ensure_model(entry, model_dir)
 
 
