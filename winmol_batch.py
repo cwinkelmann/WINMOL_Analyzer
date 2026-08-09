@@ -14,6 +14,7 @@ import subprocess
 import sys
 from typing import List, Optional
 
+from plugin_utils import container
 from plugin_utils.config_overrides import set_default
 from plugin_utils.gpu_probe import run_nvidia_smi_query
 from plugin_utils.model_registry import (
@@ -91,7 +92,8 @@ def _with_cpu_budget(overrides_json: str, cpu_budget: int) -> str:
 
 def run_winmol(input_image: str, model_path: str, output_folder: str,
                gpu_id: Optional[int] = None,
-               cpu_budget: Optional[int] = None) -> None:
+               cpu_budget: Optional[int] = None,
+               process_type: str = 'Nodes') -> None:
     base_name = os.path.splitext(os.path.basename(input_image))[0]
     output_stem_map = os.path.join(output_folder, f"{base_name}_stem_map.tif")
     output_prefix = os.path.join(output_folder, base_name)
@@ -106,7 +108,7 @@ def run_winmol(input_image: str, model_path: str, output_folder: str,
         input_image,
         output_stem_map,
         output_prefix,
-        "Nodes",
+        process_type,
     ]
 
     env = dict(os.environ)
@@ -148,7 +150,8 @@ def merge_results(
     )
 
 
-def process_orthos(orthos, model_path, output_folder, jobs=1):
+def process_orthos(orthos, model_path, output_folder, jobs=1,
+                   process_type='Nodes'):
     """Run every orthomosaic, optionally several at once.
 
     Returns a list of (path, reason) for those that failed -- the batch
@@ -171,7 +174,8 @@ def process_orthos(orthos, model_path, output_folder, jobs=1):
     if jobs == 1 or len(orthos) == 1:
         for ortho in orthos:
             try:
-                run_winmol(ortho, model_path, output_folder)
+                run_winmol(ortho, model_path, output_folder,
+                           process_type=process_type)
             except subprocess.CalledProcessError as e:
                 print(f"  FAILED: {ortho}: {e}", flush=True)
                 failures.append((ortho, str(e)))
@@ -185,7 +189,10 @@ def process_orthos(orthos, model_path, output_folder, jobs=1):
     for i in range(jobs):
         slots.put(i % gpus if gpus else None)
 
-    cpu_budget = max(1, (os.cpu_count() or 1) // jobs)
+    # container.cpu_count(), not os.cpu_count(): inside `docker run
+    # --cpus=4` the latter reports the HOST's cores and every job would
+    # be budgeted for cores the container cannot use.
+    cpu_budget = max(1, container.cpu_count() // jobs)
 
     print(f"Processing {len(orthos)} orthomosaics, {jobs} at a time"
           + (f" across {gpus} GPU(s)" if gpus else " (no GPU detected)")
@@ -196,7 +203,8 @@ def process_orthos(orthos, model_path, output_folder, jobs=1):
         slot = slots.get()
         try:
             run_winmol(ortho, model_path, output_folder, gpu_id=slot,
-                       cpu_budget=cpu_budget)
+                       cpu_budget=cpu_budget,
+                       process_type=process_type)
             return ortho, None
         except subprocess.CalledProcessError as e:
             return ortho, str(e)
@@ -263,6 +271,14 @@ def main(argv: List[str]) -> int:
         ),
     )
     parser.add_argument(
+        "--process-type",
+        default="Nodes",
+        choices=["Stems", "Trees", "Nodes"],
+        help=("How far to run the pipeline: Stems writes only the binary "
+              "stem-map raster; Trees/Nodes also vectorise into a "
+              "GeoPackage (default: Nodes)."),
+    )
+    parser.add_argument(
         "--merge",
         action="store_true",
         help=(
@@ -309,7 +325,8 @@ def main(argv: List[str]) -> int:
         print(f"No orthomosaics found in {args.input}.")
         return 0
 
-    failures = process_orthos(orthos, model_path, args.output, args.jobs)
+    failures = process_orthos(orthos, model_path, args.output, args.jobs,
+                              process_type=args.process_type)
     if failures:
         print(f"\n{len(failures)} of {len(orthos)} orthomosaics FAILED:")
         for path, reason in failures:
