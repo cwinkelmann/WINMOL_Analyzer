@@ -66,7 +66,48 @@ class Config(object):
     gpu_workers = None
     vector_mode = 'none'
     vector_tile_workers = 1
-    max_vector_tile_workers = 4
+    # Ceiling on the vector-phase process pool. NOTE: on a large ortho the
+    # VECTOR phase, not prediction, is the run. Measured end-to-end on
+    # Tegel Revier_13 (392558x335327 px, 1512 vector tiles): prediction
+    # 23.5 min, vector 65.0 min -- 73% of an 88.5 min run. Barnekow: 88%.
+    #
+    # Two caps compound, both in ExecutionPlan._vector_worker_split:
+    #
+    #   tile_workers = min(max_vector_tile_workers,
+    #                      max(1, cpu_workers // 4), tiles)
+    #   return max(1, tile_workers), 1        # inner forced to 1
+    #
+    #   * `cpu_workers // 4` divides the budget by four to leave room for
+    #     inner workers -- but that same branch pins inner workers to 1,
+    #     so it reserves cores for parallelism it never creates. On a
+    #     12-core box (cpu_workers=11) the result is 2.
+    #   * this ceiling is absolute: a 64-core machine still gets 4.
+    #
+    # Scaling from the measured 65 min on 2 workers:
+    #   2 -> 65 min | 4 -> ~33 min | 8 -> ~16 min | 10 -> ~13 min
+    #
+    # Size the pool from PRIVATE memory, not RSS. Measured per worker with
+    # smaps_rollup on a live vector phase:
+    #   RSS 2734 MB | Shared_Dirty 1257 MB | Private_Dirty 1381 MB
+    # The Shared_Dirty half is copy-on-write state inherited from the
+    # parent at fork -- shared with the parent and every sibling, so it
+    # costs physical RAM ONCE, not per worker. Sizing off RSS triple-counts
+    # it and starves the pool. Real marginal cost is ~1.4 GB/worker, so a
+    # 46 GB box fits 8-11 workers comfortably.
+    #
+    # Pre-existing, not a reimplementation regression: the old formula is
+    # identical in origin/main and v0.5.0 (both from b5e98eb).
+    max_vector_tile_workers = 16
+
+    # Private resident bytes to budget per vector tile worker; the planner
+    # divides free RAM by this. Raise it if the vector phase swaps on
+    # unusually dense orthos, lower it to pack more workers in.
+    vector_worker_bytes = None      # None -> ExecutionPlan measured default
+
+    # Fraction of TOTAL RAM the vector pool may budget for itself. Used as
+    # a stable floor because the plan is built at startup, when free RAM is
+    # unrepresentative of the vector phase.
+    vector_ram_fraction = 0.4
     prediction_batch_size = None
     prediction_producer_workers = None
     progress_interval_s = 30.0

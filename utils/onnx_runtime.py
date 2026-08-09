@@ -206,6 +206,10 @@ class OnnxSegmenter:
         self.input_name = inp.name
         self.output_name = out.name
         self.input_layout = _layout(inp.shape, IN_CHANNELS)
+        # A graph that carries its own normalize+resize takes RAW uint8
+        # NHWC tiles; casting to float32 here would undo the point (4x
+        # the PCIe traffic) and break the feed type.
+        self.input_is_uint8 = str(getattr(inp, 'type', '')) == 'tensor(uint8)'
         self.output_layout = _layout(out.shape, OUT_CHANNELS)
 
     def _verify_providers(self):
@@ -246,8 +250,14 @@ class OnnxSegmenter:
         return np.ascontiguousarray(np.asarray(x, dtype=np.float32))
 
     def predict_on_batch(self, x):
-        """x: NHWC [N,512,512,3] -> NHWC [N,512,512,1]."""
-        x = self._as_numpy(x)
+        """x: NHWC [N,512,512,3] -> NHWC [N,512,512,1].
+
+        With an in-graph preprocessing head the input is instead raw
+        uint8 NHWC at NATIVE tile size, and the graph resizes it."""
+        if getattr(self, 'input_is_uint8', False):
+            x = np.ascontiguousarray(x, dtype=np.uint8)
+        else:
+            x = self._as_numpy(x)
         feed = x if self.input_layout == "NHWC" else \
             np.ascontiguousarray(np.transpose(x, (0, 3, 1, 2)))
         try:

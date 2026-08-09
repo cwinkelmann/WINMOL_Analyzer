@@ -48,11 +48,38 @@ def _suppress_native_stderr(enabled=True):
 """Prediction of the semantic stem map with U-Net"""
 
 
+#: Benchmark toggles for issue #43. Temporary: they exist so one build can
+#: A/B the candidate fixes on the real pipeline. Once the numbers decide,
+#: the winning path becomes unconditional and these go away.
+#: Tile-read strategy (WINMOL_BENCH_READ). DEFAULT is `overview`: it is
+#: the only one measured flat across a whole large ortho (4229 tiles/min
+#: over 99231 tiles, vs `boundless` collapsing 3843 -> 2001 and falling),
+#: and it produces IDENTICAL stems to `boundless` (455 stems, 4537.7 m,
+#: 269.47 m3). The others remain selectable for benchmarking only.
+#: All produce
+#: DIFFERENT pixels, so the choice is an accuracy question, not just a
+#: speed one -- compare them on real stem output, not on throughput.
+#:   boundless : out_shape+cubic through the boundless VRT (current prod)
+#:   overview  : out_shape+cubic, plain path -> GDAL serves an overview
+#:   fullres   : out_shape+cubic with overviews disabled (no VRT)
+#:   native    : read at native resolution, resize in skimage downstream
+#:               -- what v0.5.0 (and therefore training) did
+#:   native_producer : `native` pixels EXACTLY (verified bit-identical),
+#:               but the skimage resize runs in the producer threads so it
+#:               parallelises instead of serialising on the GIL-holding
+#:               consumer -- training-time accuracy without its cost
+_BENCH_READ = (os.environ.get("WINMOL_BENCH_READ") or "overview").lower()
+
+
 def _to_float32_image(arr):
     if arr.dtype == np.float32:
         return arr
     if np.issubdtype(arr.dtype, np.integer):
-        return (arr / 255.0).astype(np.float32, copy=False)
+        # NOT `(arr / 255.0).astype(np.float32)`: that promotes uint8 to
+        # float64 (a 6.3 MB temporary per 512x512x3 tile) only to round it
+        # back down, at 4.9x the cost. Dividing straight into float32 is
+        # one pass and BIT-IDENTICAL across all 256 uint8 values.
+        return np.divide(arr, np.float32(255.0), dtype=np.float32)
     return arr.astype(np.float32, copy=False)
 
 
@@ -149,6 +176,24 @@ def _resize_batch(batch_nhwc, size, order):
             anti_aliasing=False, preserve_range=True,
         ).astype(np.float32)
     return out
+
+
+def _resize_like_consumer(tile, valid_mask, out_size):
+    """Producer-side twin of _prepare_inference_batch's resize.
+
+    Reproduces the consumer's operation order exactly -- uint8 -> float32
+    /255 via _to_float32_image, then skimage order=3 for imagery and
+    order=0 for the mask -- so a tile resized here is bit-comparable to
+    one resized there. The consumer's fast paths then short-circuit:
+    _to_float32_image passes float32 through untouched and _resize_batch
+    sees the batch already at target size.
+    """
+    size = (int(out_size[0]), int(out_size[1]))
+    tile_f = _raw_tile_to_batchable(tile)
+    tile_r = _resize_batch(tile_f[None, ...], size, order=3)[0]
+    mask_f = valid_mask.astype(np.float32)[:, :, None]
+    mask_r = _resize_batch(mask_f[None, ...], size, order=0)[0, :, :, 0]
+    return tile_r, mask_r > 0.5
 
 
 def _prepare_inference_batch(raw_tiles, raw_masks, config):
@@ -394,7 +439,12 @@ class TileBatchProducer(threading.Thread):
         try:
             batch_items = []
             batch_read_s = 0.0
-            with rasterio.open(self.uav_path) as src:
+            # WINMOL_BENCH_READ picks the tile-read strategy so the four
+            # candidates can be compared end-to-end on real stems:
+            #   boundless (current production) | overview | fullres | native
+            open_kw = ({"OVERVIEW_LEVEL": "NONE"}
+                       if _BENCH_READ == "fullres" else {})
+            with rasterio.open(self.uav_path, **open_kw) as src:
                 indexes = list(range(1, min(self.n_channels, src.count) + 1))
                 for job in self.jobs:
                     t0 = time.perf_counter()
@@ -409,22 +459,37 @@ class TileBatchProducer(threading.Thread):
                     # then short-circuits). boundless+fill_value=0 keeps
                     # the requested (oh, ow) shape even when the window
                     # runs past the raster edge.
-                    if self.out_size is not None:
+                    if (self.out_size is not None
+                            and _BENCH_READ not in ("native",
+                                                    "native_producer",
+                                                    "onnx_gpu")):
                         oh, ow = self.out_size
+                        # A window that runs past the raster edge ALWAYS
+                        # needs boundless, whatever the strategy: it is
+                        # what keeps the returned shape at (oh, ow).
+                        # Interior windows are the ones under test.
+                        interior = (
+                            _BENCH_READ != "boundless"
+                            and window.col_off >= 0
+                            and window.row_off >= 0
+                            and window.col_off + window.width <= src.width
+                            and window.row_off + window.height <= src.height
+                        )
+                        bl = not interior
                         tile = src.read(
                             indexes,
                             window=window,
                             out_shape=(len(indexes), oh, ow),
                             resampling=Resampling.cubic,
-                            boundless=True,
-                            fill_value=0,
+                            boundless=bl,
+                            fill_value=0 if bl else None,
                         ).transpose(1, 2, 0)
                         gdal_mask = src.read_masks(
                             1,
                             window=window,
                             out_shape=(oh, ow),
                             resampling=Resampling.nearest,
-                            boundless=True,
+                            boundless=bl,
                         ) > 0
                     else:
                         tile = src.read(
@@ -448,6 +513,27 @@ class TileBatchProducer(threading.Thread):
                         valid_mask = pixel_mask
                     else:
                         valid_mask = gdal_mask & pixel_mask
+
+                    if _BENCH_READ == "onnx_gpu" and self.out_size:
+                        # The graph resizes the IMAGE on device; the mask
+                        # is only needed at model resolution for the
+                        # binarize step, and nearest on one channel is
+                        # cheap enough to keep here (and parallel).
+                        mk = valid_mask.astype(np.float32)[:, :, None]
+                        valid_mask = _resize_batch(
+                            mk[None, ...], (int(self.out_size[0]),
+                                            int(self.out_size[1])),
+                            order=0)[0, :, :, 0] > 0.5
+                    elif _BENCH_READ == "native_producer" and self.out_size:
+                        # Same skimage resize the consumer would do, but
+                        # run HERE so it parallelises across producers
+                        # instead of serialising on the GIL-holding
+                        # consumer. Order of operations matches
+                        # _prepare_inference_batch exactly -- float32
+                        # scale FIRST, then resize -- so the pixels are
+                        # identical to `native`, not merely similar.
+                        tile, valid_mask = _resize_like_consumer(
+                            tile, valid_mask, self.out_size)
 
                     batch_read_s += time.perf_counter() - t0
                     batch_items.append((job, tile, valid_mask))
@@ -1066,8 +1152,17 @@ def predict_stream_to_raster(
             raw_masks = [mask for _, _, mask in items]
 
             prep0 = time.perf_counter()
-            tile_tensor, mask_resized = _prepare_inference_batch(
-                raw_tiles, raw_masks, config)
+            if _BENCH_READ == "onnx_gpu":
+                # No CPU normalize, no CPU resize: the graph does both.
+                # `prep` should collapse to a stack() of uint8 views.
+                from utils.onnx_preprocess import as_uint8_nhwc
+                tile_tensor = as_uint8_nhwc(raw_tiles)
+                mask_resized = np.stack(
+                    [m.astype(np.float32)[:, :, None] for m in raw_masks],
+                    axis=0)
+            else:
+                tile_tensor, mask_resized = _prepare_inference_batch(
+                    raw_tiles, raw_masks, config)
             total_prep_s += time.perf_counter() - prep0
 
             infer0 = time.perf_counter()

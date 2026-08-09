@@ -34,12 +34,49 @@ from classes.Stem import Stem
 """Streaming and tiling operations"""
 
 
+#: Below this, a run is too short for the read cost to matter and the
+#: overview warning would just be noise.
+_OVERVIEW_WARN_GB = 2.0
+
+
+def _warn_if_no_overviews(src, estimated_input_gb):
+    """Tell the user when an ortho will be read the slow way.
+
+    Prediction resamples each tile to the model grid during the GDAL
+    read. When the file HAS overviews, GDAL serves that from a decimated
+    level -- measured 7.5 ms per tile on Tegel R13. Without them it must
+    read every source pixel and shrink in RAM: 13.9 ms per tile, and
+    ~4x the bytes through GDAL's global block cache (default 5% of RAM,
+    shared by every producer thread). On a large ortho that is what makes
+    throughput decay and then collapse (issue #43).
+
+    Building overviews once is the fix, and `-ro` keeps the original
+    file untouched by writing a .ovr sidecar.
+    """
+    try:
+        overviews = src.overviews(1)
+    except Exception:
+        return
+    if overviews or estimated_input_gb < _OVERVIEW_WARN_GB:
+        return
+    print(
+        f"WARNING: {src.name} has NO overviews and is "
+        f"{estimated_input_gb:.1f} GB. Every prediction tile will be read "
+        f"at full resolution and downsampled in RAM -- roughly 2x the read "
+        f"time and 4x the bytes through GDAL's shared cache, which makes "
+        f"throughput decay on large orthos. Build them once with:\n"
+        f"    gdaladdo -ro -r average {src.name} 2 4 8 16 32 64 128\n"
+        f"(-ro writes a .ovr sidecar and leaves the original file "
+        f"unchanged.)", flush=True)
+
+
 def get_raster_info(path) -> dict:
     with rasterio.open(path) as src:
         dtype = src.dtypes[0] if src.dtypes else 'unknown'
         estimated_input_gb = (
             src.width * src.height * src.count * np.dtype(dtype).itemsize
         ) / (1024 ** 3)
+        _warn_if_no_overviews(src, estimated_input_gb)
         return {
             'width': int(src.width),
             'height': int(src.height),
@@ -218,6 +255,16 @@ def _load_onnx_model(model_path):
             "available (" + str(e) + "). Install it with "
             "'pip install onnxruntime' (or 'onnxruntime-gpu' for CUDA) "
             "and try again.") from e
+    import os as _os
+    if (_os.environ.get("WINMOL_BENCH_READ") or "").lower() == "onnx_gpu":
+        # Prepend normalize + bicubic resize to the graph so they run on
+        # the session's device instead of the CPU, and GDAL goes back to
+        # plain native reads. See utils/onnx_preprocess.
+        from utils.onnx_preprocess import build_preprocessed_model
+        wrapped = build_preprocessed_model(model_path, (512, 512))
+        print(f"Loading ONNX model with IN-GRAPH preprocessing "
+              f"(normalize + bicubic resize on device): {wrapped}")
+        return OnnxSegmenter(wrapped)
     print(f"Loading ONNX model via OnnxSegmenter: {model_path}")
     return OnnxSegmenter(model_path)
 

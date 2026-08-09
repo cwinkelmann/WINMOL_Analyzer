@@ -121,6 +121,12 @@ class ImageProcessing:
         print(f"  producer_workers = {plan.producer_workers}")
         print(f"  progress_interval_s = {plan.progress_interval_s}")
         print(f"  est_pred_tiles   = {plan.estimated_prediction_tiles}")
+        # Say so when the planner overrode a configured value. These caps
+        # used to be silent, which is how a configured
+        # prediction_producer_workers_gpu=6 ran as 3, and the vector pool
+        # ran on 2 of 12 cores, without anyone noticing they were capped.
+        for note in getattr(plan, 'capped', None) or []:
+            print(f"  WARNING: {note}")
         self._apply_plan_to_config(plan, hardware)
         return plan
 
