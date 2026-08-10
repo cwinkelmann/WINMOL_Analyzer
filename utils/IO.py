@@ -259,9 +259,12 @@ def _load_onnx_model(model_path, config=None, wrap_preprocess=None):
             "available (" + str(e) + "). Install it with "
             "'pip install onnxruntime' (or 'onnxruntime-gpu' for CUDA) "
             "and try again.") from e
+    antialias = False
     if wrap_preprocess is None:
         from utils.Prediction import resolve_read_strategy
-        wrap_preprocess = resolve_read_strategy(config) == "graph"
+        strategy = resolve_read_strategy(config)
+        wrap_preprocess = strategy in ("graph", "graph_aa")
+        antialias = strategy == "graph_aa"
     if wrap_preprocess:
         # Prepend normalize + bicubic resize to the graph so they run on
         # the session's device instead of the CPU, and GDAL goes back to
@@ -270,7 +273,8 @@ def _load_onnx_model(model_path, config=None, wrap_preprocess=None):
         target = ((int(getattr(config, 'img_height', 512) or 512),
                    int(getattr(config, 'img_width', 512) or 512))
                   if config is not None else (512, 512))
-        wrapped = build_preprocessed_model(model_path, target)
+        wrapped = build_preprocessed_model(model_path, target,
+                                           antialias=antialias)
         print(f"Loading ONNX model with IN-GRAPH preprocessing "
               f"(normalize + bicubic resize on device): {wrapped}")
         return OnnxSegmenter(wrapped)

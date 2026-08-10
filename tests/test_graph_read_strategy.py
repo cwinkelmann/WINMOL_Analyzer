@@ -34,6 +34,28 @@ def test_env_var_overrides_config_for_benching(monkeypatch):
     assert resolve_read_strategy(cfg) == "graph"
 
 
+def test_graph_aa_wraps_with_antialias_and_differs_from_graph(tmp_path,
+                                                              monkeypatch):
+    """`graph_aa` = the same in-graph Resize with antialias=1: portable,
+    deterministic AA semantics. Its wrapped model must produce different
+    downsampled pixels than the no-AA `graph` wrap on the same input."""
+    pytest.importorskip("onnxruntime")
+    from classes.Config import Config
+    from utils.IO import load_model_from_path
+    from utils.Prediction import resolve_read_strategy
+    monkeypatch.setenv("WINMOL_BENCH_READ", "graph_aa")
+    assert resolve_read_strategy(Config()) == "graph_aa"
+    m = _build_model(tmp_path / "m.onnx")
+    seg_aa = load_model_from_path(m)
+    monkeypatch.setenv("WINMOL_BENCH_READ", "graph")
+    seg = load_model_from_path(m)
+    rng = np.random.default_rng(1)
+    x = rng.integers(0, 256, (1, 1024, 1024, 3), dtype=np.uint8)
+    d = float(np.abs(seg_aa.predict_on_batch(x)
+                     - seg.predict_on_batch(x)).max())
+    assert d > 1e-4, "antialias attribute had no effect on the wrapped graph"
+
+
 def test_cupy_strategy_is_recognized_but_guarded(tmp_path, monkeypatch):
     """`cupy` is a valid flag value (rc12's path, for A/B on CUDA boxes),
     but selecting it without the port/hardware fails fast and clearly."""
@@ -119,6 +141,7 @@ class _SpyModel:
 @pytest.mark.parametrize("env,want_dtype,want_h", [
     # graph default: native uint8 (window = px_per_tile-1 = 299 at 5 cm)
     (None, np.uint8, 299),
+    ("graph_aa", np.uint8, 299),    # AA variant feeds the model identically
     ("overview", np.float32, 512),  # bench override still wins
 ])
 def test_stream_feeds_model_per_strategy(tmp_path, monkeypatch,

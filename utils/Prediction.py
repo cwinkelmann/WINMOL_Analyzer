@@ -57,6 +57,9 @@ def _suppress_native_stderr(enabled=True):
 #:   graph     : native uint8 reads; normalize + Catmull-Rom resize run
 #:               INSIDE the ONNX graph. v0.5.0-equivalent on every
 #:               execution provider. THE DEFAULT.
+#:   graph_aa  : `graph` with ONNX Resize antialias=1 -- GDAL-like AA
+#:               semantics, but deterministic and portable. For settling
+#:               the AA accuracy question, not v0.5-equivalent.
 #:   overview  : out_shape+cubic, plain path -> GDAL serves an overview.
 #:               Fastest measured (4229 tiles/min over 99231 tiles) but
 #:               an anti-aliased kernel: NOT v0.5.0 pixels at >=2x.
@@ -67,7 +70,7 @@ def _suppress_native_stderr(enabled=True):
 #:   native_producer : `native` pixels EXACTLY, resized in the producers
 #:   cupy      : rc12's CUDA/CuPy preprocessing (guarded until the port
 #:               is validated on a CUDA box)
-_READ_STRATEGIES = ("graph", "overview", "fullres", "boundless",
+_READ_STRATEGIES = ("graph", "graph_aa", "overview", "fullres", "boundless",
                     "native", "native_producer", "cupy")
 #: The in-graph path predates its promotion under the bench name
 #: `onnx_gpu`; keep the alias so existing bench scripts keep working.
@@ -215,7 +218,7 @@ def _resize_like_consumer(tile, valid_mask, out_size):
 
 
 def _prepare_inference_batch(raw_tiles, raw_masks, config):
-    if resolve_read_strategy(config) == "graph":
+    if resolve_read_strategy(config) in ("graph", "graph_aa"):
         # The wrapped model normalizes and resizes in-graph: hand it the
         # native uint8 batch untouched. Producers already resized the
         # masks to the model grid, so only stacking remains. EVERY caller
@@ -495,7 +498,7 @@ class TileBatchProducer(threading.Thread):
                     # runs past the raster edge.
                     if (self.out_size is not None
                             and strat not in ("native", "native_producer",
-                                              "graph", "cupy")):
+                                              "graph", "graph_aa", "cupy")):
                         oh, ow = self.out_size
                         # A window that runs past the raster edge ALWAYS
                         # needs boundless, whatever the strategy: it is
@@ -547,7 +550,7 @@ class TileBatchProducer(threading.Thread):
                     else:
                         valid_mask = gdal_mask & pixel_mask
 
-                    if strat in ("graph", "cupy") and self.out_size:
+                    if strat in ("graph", "graph_aa", "cupy") and self.out_size:
                         # The graph resizes the IMAGE on device; the mask
                         # is only needed at model resolution for the
                         # binarize step, and nearest on one channel is
