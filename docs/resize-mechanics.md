@@ -53,9 +53,35 @@ Resize, real Barnekow windows, same fp32 Spruce.onnx:
 
 The only difference — rc12 clamps border taps where TF excludes+renormalizes
 — dies in the 4 px core crop. **rc12's resize is v0.5-equivalent**; its
-open "interpolation equivalence check" is closed by these numbers, and its
-R13 stem counts (15,935/15,954, Spruce *fp16*) cannot be explained by its
-resize — the fp16 model file is the remaining variable.
+open "interpolation equivalence check" is closed by these numbers.
+
+## R13 end-to-end (measured 2026-08-10, RTX 4080, fp32 Spruce 36e5397c)
+
+| Pipeline | stems | total wall |
+|---|---:|---:|
+| our `graph` (this branch) | 15,930 | 96.7 min |
+| rc12 CUDA pipeline | 15,969 | 117 min |
+| rc12 with his fp16 Spruce (his report) | 15,935 / 15,954 | — |
+
+Two independent implementations of the v0.5 kernel — different resize
+engineering, different vector stages — agree to **0.24 %** in stems and
+**IoU 0.99877** at the prediction-raster level (fg ±0.004 %). fp16 vs fp32
+was 0.2 % — never the explanation for anything.
+
+**The era A/B table (12,714 "v0.5" / 12,722 "onnx_gpu" / 15,556 fullres /
+16,548 overview, and "455 on every variant" on Barnekow) did not survive
+re-measurement** and must not be cited as a baseline: current re-runs give
+~15.9k for v0.5 semantics on R13 and 470–498 on Barnekow depending on
+kernel family. The honest kernel effect is a few percent (AA vs no-AA),
+not 30 %. A reproduction run of the era measurement at its own commit
+(9e7ff5e, `reimpl/docker-batch`) is in progress to pin down what that
+context did differently; until it lands, treat era numbers as unattributed.
+
+Also measured: **ONNX Runtime 1.19.2's CUDA EP computes the opset-18
+antialias Resize incorrectly** (graph_aa: 82 stems on CUDA EP vs 478 on
+CPU EP, same run, CPU-side kernel verified sane against GDAL-AA to
+0.01 DN mean). graph_aa therefore pins CPUExecutionProvider (a8b6a33);
+report upstream, retest on newer ORT.
 
 ## Portability matrix — which kernel actually runs where
 
