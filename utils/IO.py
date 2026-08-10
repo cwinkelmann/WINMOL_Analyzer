@@ -277,6 +277,15 @@ def _load_onnx_model(model_path, config=None, wrap_preprocess=None):
                                            antialias=antialias)
         print(f"Loading ONNX model with IN-GRAPH preprocessing "
               f"(normalize + bicubic resize on device): {wrapped}")
+        if antialias:
+            # onnxruntime's CUDA EP mis-executes the opset-18 antialias
+            # Resize (measured: 82 stems vs 478 on the CPU EP, same run).
+            # Pin the CPU provider until that is fixed upstream; graph_aa
+            # is a comparison mode, so correctness beats speed here.
+            print("graph_aa: pinning CPUExecutionProvider (CUDA EP "
+                  "computes antialias Resize incorrectly, ORT<=1.19)")
+            return OnnxSegmenter(wrapped,
+                                 providers=["CPUExecutionProvider"])
         return OnnxSegmenter(wrapped)
     print(f"Loading ONNX model via OnnxSegmenter: {model_path}")
     return OnnxSegmenter(model_path)

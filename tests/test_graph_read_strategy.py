@@ -56,6 +56,18 @@ def test_graph_aa_wraps_with_antialias_and_differs_from_graph(tmp_path,
     assert d > 1e-4, "antialias attribute had no effect on the wrapped graph"
 
 
+def test_graph_aa_pins_cpu_provider(tmp_path, monkeypatch):
+    """onnxruntime's CUDA EP mis-executes the opset-18 antialias Resize
+    (measured 2026-08-10 on ORT 1.19.2 / RTX 4080: 82 stems vs 478 on the
+    CPU EP, same model+ortho). Until that is fixed upstream, graph_aa
+    must pin the CPU provider rather than silently produce garbage."""
+    pytest.importorskip("onnxruntime")
+    monkeypatch.setenv("WINMOL_BENCH_READ", "graph_aa")
+    from utils.IO import load_model_from_path
+    seg = load_model_from_path(_build_model(tmp_path / "m.onnx"))
+    assert seg.providers == ["CPUExecutionProvider"]
+
+
 def test_cupy_strategy_is_recognized_but_guarded(tmp_path, monkeypatch):
     """`cupy` is a valid flag value (rc12's path, for A/B on CUDA boxes),
     but selecting it without the port/hardware fails fast and clearly."""
