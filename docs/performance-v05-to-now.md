@@ -172,7 +172,7 @@ Both pre-existing (identical in `origin/main` and `v0.5.0`, from `b5e98eb`):
 
 | | prediction | vector | total |
 |---|---|---|---|
-| **Tegel R13**, v0.5.0 | — | — | **229 min** |
+| **Tegel R13**, v0.5.0 | 164.1 min | 64.7 min | **229.1 min** |
 | Tegel R13, current, 2 vector workers | 23.5 min | 65.0 min | 88.5 min |
 | Tegel R13, current, 11 vector workers | 24.3 min | 38.5 min | **62.8 min** |
 | **Tegel R12**, v0.5.0 | 136.5 min | 30.8 min | **167.4 min** |
@@ -236,29 +236,50 @@ slowness that was concealing it.
 every digit. Worker counts likewise: R13 gave **16548 stems and 160623
 nodes** with 2 vector workers, with 11, and in the container.
 
-**Between v0.5.0 and now: close but not identical**, and the difference is
-*not* the pipeline:
+**Between v0.5.0 and now: NOT comparable, and the cause is the resampling
+operator, not the model.**
 
-| | Barnekow stems |
-|---|---|
-| v0.5.0 (`.hdf5` via TensorFlow) | 411 |
-| current (`.onnx` fp16) | 454–457 |
+This is the most important caveat in this document. On Tegel R13:
 
-Those runs use **different model artifacts** — the fp16 ONNX conversion of
-the same network, not the same weights bit-for-bit — so the gap is model
-conversion, not resampling or tiling. Within a single model artifact, every
-pipeline variant tested agrees.
+| configuration | model | resampling | stems |
+|---|---|---|---|
+| v0.5.0 | `.hdf5` | `tf.image.resize` bicubic | **12714** |
+| in-graph ONNX | `.onnx` fp16 | ONNX Resize ≡ tf bicubic (4.2e-07) | **12722** |
+| overview read (default) | `.onnx` fp16 | GDAL cubic | **16548** |
+| 11 vector workers | `.onnx` fp16 | GDAL cubic | **16548** |
+| containerised | `.onnx` fp16 | GDAL cubic | **16548** |
 
-One genuine pipeline-level difference exists and is worth recording: the
-resampling operator changed. v0.5.0 used `tf.image.resize(method='bicubic')`
-on the GPU; the current version uses GDAL's cubic during the read. On
-Barnekow, a skimage-cubic variant produced 451 stems where GDAL-cubic
-produced 455 — a ~1% difference. If exact v0.5.0 numerics are ever
-required, ONNX Resize with `cubic_coeff_a=-0.5`,
-`coordinate_transformation_mode=half_pixel`, `exclude_outside=1` reproduces
-`tf.image.resize` bicubic to **4.2e-07** (see `utils/onnx_preprocess.py`) —
-but note it requires native-resolution reads and therefore reintroduces the
-clogging, so it is available as an option, not the default.
+Read that carefully. The two runs that share a **resampling method** agree
+to **0.06%** despite using *different model artifacts*. The runs that share
+a **model artifact** differ by **30%** because of resampling. So the model
+conversion (`.hdf5` → fp16 `.onnx`) is nearly irrelevant to stem count, and
+**the resampling operator dominates it**.
+
+An earlier version of this document claimed the opposite. It was wrong: it
+compared v0.5.0 against the current default and attributed the whole gap to
+the model, without a run that isolated the two variables. The in-graph ONNX
+run is that control, and it points the other way.
+
+The same effect is visible but milder on Barnekow — 411 (v0.5.0) vs 454–457
+(GDAL cubic), about +10% — which is consistent with resampling mattering
+more the harder the downsample: R13 goes 1172 px → 512 (2.3×), Barnekow
+727 px → 504 (1.4×).
+
+**What this means in practice.** Within one resampling method, everything
+is reproducible: read strategy, worker count and containerisation all give
+byte-identical stem counts. Across methods they are not, and the current
+default finds **~30% more stems on R13 than v0.5.0 did**. Whether that is
+better or worse cannot be settled from these runs — there is no ground
+truth here, only two different answers — so it needs validation against
+reference data before the numbers from the two versions are treated as
+interchangeable.
+
+If exact v0.5.0 numerics are required, ONNX Resize with
+`cubic_coeff_a=-0.5`, `coordinate_transformation_mode=half_pixel`,
+`exclude_outside=1` reproduces `tf.image.resize` bicubic to **4.2e-07**
+(`utils/onnx_preprocess.py`), and the 12722 above confirms it end to end.
+It requires native-resolution reads, so it reintroduces the clogging
+(R13: 118.4 min vs 88.5) — available as an option, not the default.
 
 ---
 

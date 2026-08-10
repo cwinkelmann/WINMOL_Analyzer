@@ -459,23 +459,26 @@ class TileBatchProducer(threading.Thread):
                     # then short-circuits). boundless+fill_value=0 keeps
                     # the requested (oh, ow) shape even when the window
                     # runs past the raster edge.
+                    # A window that runs past the raster edge ALWAYS needs
+                    # boundless -- it is what keeps the returned shape
+                    # correct. Interior windows do not, and paying for it
+                    # there is expensive: the VRT wrapper costs 3.2x on a
+                    # native read (47.3 -> 15.0 ms) for pixel-IDENTICAL
+                    # output, and on the out_shape path it also blocks
+                    # overview use. Applies to EVERY read strategy.
+                    interior = (
+                        _BENCH_READ != "boundless"
+                        and window.col_off >= 0
+                        and window.row_off >= 0
+                        and window.col_off + window.width <= src.width
+                        and window.row_off + window.height <= src.height
+                    )
+                    bl = not interior
                     if (self.out_size is not None
                             and _BENCH_READ not in ("native",
                                                     "native_producer",
                                                     "onnx_gpu")):
                         oh, ow = self.out_size
-                        # A window that runs past the raster edge ALWAYS
-                        # needs boundless, whatever the strategy: it is
-                        # what keeps the returned shape at (oh, ow).
-                        # Interior windows are the ones under test.
-                        interior = (
-                            _BENCH_READ != "boundless"
-                            and window.col_off >= 0
-                            and window.row_off >= 0
-                            and window.col_off + window.width <= src.width
-                            and window.row_off + window.height <= src.height
-                        )
-                        bl = not interior
                         tile = src.read(
                             indexes,
                             window=window,
@@ -492,16 +495,20 @@ class TileBatchProducer(threading.Thread):
                             boundless=bl,
                         ) > 0
                     else:
+                        # Native-resolution read (native / native_producer /
+                        # onnx_gpu). Same interior rule as above: this path
+                        # used boundless unconditionally, which is where
+                        # onnx_gpu's read 0.144s came from.
                         tile = src.read(
                             indexes,
                             window=window,
-                            boundless=True,
-                            fill_value=0,
+                            boundless=bl,
+                            fill_value=0 if bl else None,
                         ).transpose(1, 2, 0)
                         gdal_mask = src.read_masks(
                             1,
                             window=window,
-                            boundless=True,
+                            boundless=bl,
                         ) > 0
 
                     pixel_mask = np.any(tile != 0, axis=2)
