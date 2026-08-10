@@ -180,7 +180,7 @@ def prediction_worker(
     from utils.IO import load_model_from_path
 
     cfg = _config_from_dict(config_dict)
-    model = load_model_from_path(model_path)
+    model = load_model_from_path(model_path, cfg, wrap_preprocess=False)
     batch_size = max(1, int(getattr(cfg, 'prediction_batch_size', None)
                             or getattr(cfg, 'prediction_batch_gpu', 4)))
 
@@ -215,7 +215,7 @@ def prediction_service_worker(
     from utils.IO import load_model_from_path
 
     cfg = _config_from_dict(config_dict)
-    model = load_model_from_path(model_path)
+    model = load_model_from_path(model_path, cfg, wrap_preprocess=False)
     batch_size = max(1, int(getattr(cfg, 'prediction_batch_size', None)
                             or getattr(cfg, 'prediction_batch_gpu', 4)))
 

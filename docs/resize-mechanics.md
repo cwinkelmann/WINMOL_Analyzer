@@ -73,10 +73,12 @@ of the driver stack.
 
 ## Recommendations
 
-1. When v0.5-comparable output matters, run `onnx_gpu` (≈1.5× the
-   wall-clock of the fast path). The fast AA path stays available as an
-   explicitly-labeled deviation — possibly *more* accurate, but unresolvable
-   until the training-time resize recipe or field ground truth exists.
+1. When v0.5-comparable output matters, run the in-graph path — since the
+   `prediction_read_strategy` flag landed it IS the default (`graph`;
+   ≈1.5× the wall-clock of the fast path). The GDAL/skimage/cupy variants
+   stay selectable through the same flag or `WINMOL_BENCH_READ` for A/B —
+   possibly *more* accurate, but unresolvable until the training-time
+   resize recipe or field ground truth exists.
 2. Ask the training side for the training-pipeline resize recipe; it
    decides the 30% question (~3,800 stems on R13).
 3. From rc12, adopt ideas not code: uint8 through the queue,
