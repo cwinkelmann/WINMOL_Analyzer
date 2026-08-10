@@ -34,12 +34,14 @@ and renormalized at borders. The validity mask went through
 | consumer fallback (skimage `order=3`, AA off) | cubic B-spline | no | float32 | no (close) |
 
 "Cubic" names three different convolutions. GDAL's in-read cubic widens its
-kernel with the decimation factor — that is anti-aliasing, and it is the
-~22% of the 30% stem divergence on Tegel R13 (12,714 v0.5-equivalent vs
-16,548 current default; the other ~6% is the overview two-stage resample —
-see `docs/resampling-accuracy.md`). The divergence is scale-gated: invisible
-at Barnekow's 1.4× (455 stems on every variant), large at R13's 2.3×.
-**Validate resampling changes at ≥ 2.3×, never on Barnekow-class data.**
+kernel with the decimation factor — that is anti-aliasing. Measured on
+current code (Barnekow, 1.42×): a few percent of stems between the AA and
+no-AA families (470 vs 478 vs 498), with pixel-level divergence growing
+sharply with the decimation factor (mask IoU ≈0.3 at a simulated 4×). The
+era claim of a 30% effect on R13 did not survive re-measurement (see the
+R13 section below); the AA effect at R13 scale on current code is not yet
+re-measured. **Validate resampling changes at ≥ 2.3×, never on
+Barnekow-class data alone — and only against re-measured baselines.**
 
 ## rc12 equivalence (measured 2026-08-10)
 
@@ -106,7 +108,8 @@ of the driver stack.
    possibly *more* accurate, but unresolvable until the training-time
    resize recipe or field ground truth exists.
 2. Ask the training side for the training-pipeline resize recipe; it
-   decides the 30% question (~3,800 stems on R13).
+   settles the remaining few-percent AA question (train-faithful vs
+   signal-faithful input).
 3. From rc12, adopt ideas not code: uint8 through the queue,
    prediction-only D2H, and the installer-time CUDA smoke test. The CuPy
    stack itself is unnecessary — this branch's cliff fix reaches higher
