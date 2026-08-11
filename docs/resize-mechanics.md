@@ -85,8 +85,11 @@ refuting the 12,714 row directly. Five v0.5-semantics runs now agree at
 implementations). The kernel effect is scale-dependent and real: +5.6%
 stems at 1.42×, +20.3% stems / +26% volume at 2.29× (see the table in "Who
 computes what") — the era's ratio was directionally right, its absolute
-numbers were not. A reproduction at the era commit (9e7ff5e) remains
-pending purely as forensics on what that harness executed.
+numbers were not. **Post-mortem closed 2026-08-11: the v0.5 pipeline with
+the Spruce_Deadwood model (2024-12-19) gives 12,731 on R13 — within 0.13%
+of the era's 12,714/12,722. The era harness measured the Deadwood model
+while labeling it Spruce** (hypothesis: C. Winkelmann). The 9e7ff5e
+re-run remains queued only to confirm the label/model slip mechanically.
 
 Also measured: **ONNX Runtime 1.19.2's CUDA EP computes the opset-18
 antialias Resize incorrectly** (graph_aa: 82 stems on CUDA EP vs 478 on
