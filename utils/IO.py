@@ -261,18 +261,18 @@ def _load_onnx_model(model_path, config=None, wrap_preprocess=None):
             "and try again.") from e
     antialias = False
     if wrap_preprocess is None:
-        from utils.Prediction import resolve_read_strategy
+        from utils.Prediction import (resolve_read_strategy,
+                                      strategy_wraps_graph)
         strategy = resolve_read_strategy(config)
-        wrap_preprocess = strategy in ("graph", "graph_aa")
+        wrap_preprocess = strategy_wraps_graph(strategy)
         antialias = strategy == "graph_aa"
     if wrap_preprocess:
         # Prepend normalize + bicubic resize to the graph so they run on
         # the session's device instead of the CPU, and GDAL goes back to
         # plain native reads. See utils/onnx_preprocess.
         from utils.onnx_preprocess import build_preprocessed_model
-        target = ((int(getattr(config, 'img_height', 512) or 512),
-                   int(getattr(config, 'img_width', 512) or 512))
-                  if config is not None else (512, 512))
+        target = (int(getattr(config, 'img_height', None) or 512),
+                  int(getattr(config, 'img_width', None) or 512))
         wrapped = build_preprocessed_model(model_path, target,
                                            antialias=antialias)
         print(f"Loading ONNX model with IN-GRAPH preprocessing "

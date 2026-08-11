@@ -17,8 +17,8 @@ to 4.2e-07, see utils/onnx_preprocess.py):
 
   gdal   the in-read `Resampling.cubic` this repo uses on the fast path.
          NOT expected to pass: GDAL widens the kernel with the decimation
-         factor (it anti-aliases), which is the ~30% stem divergence on
-         Tegel R13 documented in docs/resampling-accuracy.md.
+         factor (it anti-aliases) -- measured +20% stems / +26% volume vs
+         v0.5 semantics at R13's 2.29x; see docs/resize-mechanics.md.
 
 Phases:
   kernel   input-level max/mean |diff|, interior vs 2px border band
@@ -30,9 +30,12 @@ Phases:
         --model standalone/model_onnx/Spruce.onnx --phase model
 """
 import argparse
+import functools
 import math
 import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 import rasterio
@@ -42,9 +45,11 @@ from rasterio.windows import Window
 IMG, THR, CROP = 512, 0.5, 4
 
 
+@functools.lru_cache(maxsize=8)
 def catmull_rom_matrix(n_in, n_out):
     """The rc12 CUDA kernel as a 1-D matrix: Catmull-Rom a=-0.5, half-pixel
-    centers, weights from the unclamped tap position, indices edge-clamped."""
+    centers, weights from the unclamped tap position, indices edge-clamped.
+    Cached: every window in a run shares the same shapes."""
     a, scale = -0.5, n_in / n_out
     M = np.zeros((n_out, n_in), dtype=np.float64)
     for o in range(n_out):
@@ -80,9 +85,13 @@ def v05_resize(img_f32, out=IMG):
     h, w, _ = img_f32.shape
     key = (h, w, out)
     if key not in _REF_SESSIONS:
+        # Same attribute set as utils.onnx_preprocess.build_preprocessed_model
+        # prepends in production -- import the coefficient so they cannot drift.
+        from utils.onnx_preprocess import TF_CUBIC_COEFF_A
         node = helper.make_node(
             "Resize", ["x", "roi", "scales", "sizes"], ["y"], mode="cubic",
-            cubic_coeff_a=-0.5, coordinate_transformation_mode="half_pixel",
+            cubic_coeff_a=TF_CUBIC_COEFF_A,
+            coordinate_transformation_mode="half_pixel",
             exclude_outside=1, nearest_mode="floor")
         graph = helper.make_graph(
             [node], "resize",
@@ -103,7 +112,7 @@ def v05_resize(img_f32, out=IMG):
     return y[0].transpose(1, 2, 0)
 
 
-def candidate(src, name, win, wpx):
+def candidate(src, name, win):
     nat = src.read([1, 2, 3], window=win).transpose(1, 2, 0)
     f = np.divide(nat, np.float32(255.0), dtype=np.float32)
     if name == "rc12":
@@ -151,7 +160,7 @@ def main():
     if args.phase == "kernel":
         stats = []
         for c, r in wins:
-            cand, f = candidate(src, args.probe, Window(c, r, wpx, wpx), wpx)
+            cand, f = candidate(src, args.probe, Window(c, r, wpx, wpx))
             d = np.abs(cand - v05_resize(f)) * 255.0
             stats.append((d.max(), d[2:-2, 2:-2].max(), d.mean()))
         s = np.array(stats)
@@ -179,7 +188,7 @@ def main():
     tot_a = tot_b = 0
     worst = 1.0
     for c, r in wins:
-        cand, f = candidate(src, args.probe, Window(c, r, wpx, wpx), wpx)
+        cand, f = candidate(src, args.probe, Window(c, r, wpx, wpx))
         ba = infer(cand) >= THR
         bb = infer(v05_resize(f)) >= THR
         u = (ba | bb).sum()

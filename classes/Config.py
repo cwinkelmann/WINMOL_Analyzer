@@ -131,16 +131,10 @@ class Config(object):
     num_classes = 1
     overlap_pred = 8
     # Feature flag: which tile-read/resample implementation streams tiles
-    # onto the model grid. `graph` is v0.5.0-equivalent (native uint8
-    # reads, Catmull-Rom resize inside the ONNX graph) and is the default;
-    # `graph_aa` (same graph resize with antialias=1) exists to settle the
-    # AA accuracy question portably; `overview` is the flag-gated GDAL
-    # fast path (+20% stems / +26% volume vs v0.5 semantics at R13 scale,
-    # validity unresolved — do not default to it before that is settled);
-    # skimage (`native`/`native_producer`) and rc12 CuPy
-    # (`cupy`) variants stay selectable
-    # for A/B comparison. WINMOL_BENCH_READ overrides this for benching.
-    # The choice changes PIXELS, not just speed: docs/resize-mechanics.md.
+    # onto the model grid. The choice changes PIXELS, not just speed —
+    # strategy semantics, measured deltas and the WINMOL_BENCH_READ
+    # override live with `_READ_STRATEGIES` in utils/Prediction.py and in
+    # docs/resize-mechanics.md. `graph` is v0.5.0-equivalent, the default.
     prediction_read_strategy = "graph"
 
     # binary stem-map prediction

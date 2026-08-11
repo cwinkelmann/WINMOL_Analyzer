@@ -97,8 +97,13 @@ def _format_eta(seconds: float) -> str:
 
 
 def _predict_batch(raw_tiles, raw_masks, model, config):
+    # This path loads the RAW model (wrap_preprocess=False) and supplies
+    # tiles already on the model grid, so batch preparation must take the
+    # float path regardless of the session-wide read-strategy flag --
+    # under the `graph` default it would otherwise feed uint8 to a model
+    # without the in-graph preprocessing.
     tile_tensor, mask_resized = _prepare_inference_batch(
-        raw_tiles, raw_masks, config)
+        raw_tiles, raw_masks, config, read_strategy="native")
     pred = model.predict_on_batch(tile_tensor)
     crop = config.overlap_pred // 2
     threshold = float(getattr(config, 'stem_binary_threshold', 0.5))

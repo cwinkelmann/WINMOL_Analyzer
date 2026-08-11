@@ -40,21 +40,19 @@ def test_env_var_overrides_config_for_benching(monkeypatch):
             resolve_read_strategy(cfg)
 
 
-def test_graph_aa_wraps_with_antialias_and_differs_from_graph(tmp_path,
-                                                              monkeypatch):
-    """`graph_aa` = the same in-graph Resize with antialias=1: portable,
-    deterministic AA semantics. Its wrapped model must produce different
-    downsampled pixels than the no-AA `graph` wrap on the same input."""
+def test_graph_aa_wraps_antialiased_and_pins_cpu(tiny_unet_file, monkeypatch):
+    """`graph_aa` = the same in-graph Resize with antialias=1: its wrap
+    must produce different downsampled pixels than `graph`, and it must
+    pin the CPU provider — onnxruntime's CUDA EP mis-executes the
+    opset-18 antialias Resize (measured 2026-08-10, ORT 1.19.2 / RTX
+    4080: 82 stems vs 478 on the CPU EP, same model+ortho)."""
     pytest.importorskip("onnxruntime")
-    from classes.Config import Config
     from utils.IO import load_model_from_path
-    from utils.Prediction import resolve_read_strategy
     monkeypatch.setenv("WINMOL_BENCH_READ", "graph_aa")
-    assert resolve_read_strategy(Config()) == "graph_aa"
-    m = _build_model(tmp_path / "m.onnx")
-    seg_aa = load_model_from_path(m)
+    seg_aa = load_model_from_path(tiny_unet_file)
+    assert seg_aa.providers == ["CPUExecutionProvider"]
     monkeypatch.setenv("WINMOL_BENCH_READ", "graph")
-    seg = load_model_from_path(m)
+    seg = load_model_from_path(tiny_unet_file)
     rng = np.random.default_rng(1)
     x = rng.integers(0, 256, (1, 1024, 1024, 3), dtype=np.uint8)
     d = float(np.abs(seg_aa.predict_on_batch(x)
@@ -62,87 +60,29 @@ def test_graph_aa_wraps_with_antialias_and_differs_from_graph(tmp_path,
     assert d > 1e-4, "antialias attribute had no effect on the wrapped graph"
 
 
-def test_graph_aa_pins_cpu_provider(tmp_path, monkeypatch):
-    """onnxruntime's CUDA EP mis-executes the opset-18 antialias Resize
-    (measured 2026-08-10 on ORT 1.19.2 / RTX 4080: 82 stems vs 478 on the
-    CPU EP, same model+ortho). Until that is fixed upstream, graph_aa
-    must pin the CPU provider rather than silently produce garbage."""
-    pytest.importorskip("onnxruntime")
-    monkeypatch.setenv("WINMOL_BENCH_READ", "graph_aa")
-    from utils.IO import load_model_from_path
-    seg = load_model_from_path(_build_model(tmp_path / "m.onnx"))
-    assert seg.providers == ["CPUExecutionProvider"]
-
-
-def test_cupy_strategy_is_recognized_but_guarded(tmp_path, monkeypatch):
-    """`cupy` is a valid flag value (rc12's path, for A/B on CUDA boxes),
-    but selecting it without the port/hardware fails fast and clearly."""
-    pytest.importorskip("rasterio")
+def test_cupy_strategy_is_recognized_but_guarded(monkeypatch):
+    """`cupy` is a reserved flag value (rc12's path, unported); selecting
+    it fails fast at the resolver — the single chokepoint — so no entry
+    point can silently degrade it into another strategy's code path."""
     monkeypatch.setenv("WINMOL_BENCH_READ", "cupy")
     from classes.Config import Config
     from utils import Prediction as Pred
-    assert Pred.resolve_read_strategy(Config()) == "cupy"
-    uav = _build_geotiff(tmp_path / "ortho.tif")
+    assert "cupy" in Pred._READ_STRATEGIES
     with pytest.raises(RuntimeError, match="[Cc]uPy"):
-        Pred.predict_stream_to_raster(
-            uav, str(tmp_path / "stem.tif"), _SpyModel(), Config())
+        Pred.resolve_read_strategy(Config())
 
 
-def _build_model(path):
-    """1-conv sigmoid segmenter, NHWC [b,512,512,3] -> [b,512,512,1]."""
-    onnx = pytest.importorskip("onnx")
-    from onnx import TensorProto, helper
-    s = 512
-    rng = np.random.default_rng(0)
-    w = helper.make_tensor("w", TensorProto.FLOAT, [1, 3, 1, 1],
-                           rng.normal(size=3).astype(np.float32))
-    nodes = [
-        helper.make_node("Transpose", ["input"], ["nchw"], perm=[0, 3, 1, 2]),
-        helper.make_node("Conv", ["nchw", "w"], ["c"]),
-        helper.make_node("Sigmoid", ["c"], ["nchw_out"]),
-        helper.make_node("Transpose", ["nchw_out"], ["output"],
-                         perm=[0, 2, 3, 1]),
-    ]
-    graph = helper.make_graph(
-        nodes, "segmenter",
-        [helper.make_tensor_value_info(
-            "input", TensorProto.FLOAT, ["b", s, s, 3])],
-        [helper.make_tensor_value_info(
-            "output", TensorProto.FLOAT, ["b", s, s, 1])],
-        [w])
-    model = helper.make_model(
-        graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 9
-    onnx.save(model, str(path))
-    return str(path)
-
-
-def test_load_wraps_model_for_uint8_any_size_input(tmp_path, monkeypatch):
+def test_load_wraps_model_for_uint8_any_size_input(tiny_unet_file,
+                                                   monkeypatch):
     """By default the loaded segmenter takes NHWC uint8 at ANY tile size
     and resizes in-graph -- the wrapped contract, not the raw model's."""
     pytest.importorskip("onnxruntime")
     monkeypatch.delenv("WINMOL_BENCH_READ", raising=False)
     from utils.IO import load_model_from_path
-    seg = load_model_from_path(_build_model(tmp_path / "m.onnx"))
+    seg = load_model_from_path(tiny_unet_file)
     out = seg.predict_on_batch(
         np.zeros((1, 299, 299, 3), dtype=np.uint8))
     assert out.shape[1:3] == (512, 512)
-
-
-def _build_geotiff(path):
-    """600x600 px, 3-band uint8, 5 cm pixels -> px_per_tile-1 = 299."""
-    rasterio = pytest.importorskip("rasterio")
-    from rasterio.transform import from_origin
-    rng = np.random.default_rng(42)
-    data = rng.integers(1, 255, size=(3, 600, 600), dtype=np.uint8)
-    profile = {
-        "driver": "GTiff", "width": 600, "height": 600, "count": 3,
-        "dtype": "uint8", "crs": rasterio.crs.CRS.from_epsg(32633),
-        "transform": from_origin(400000.0, 5900000.0, 0.05, 0.05),
-    }
-    with rasterio.open(str(path), "w", **profile) as dst:
-        dst.write(data)
-    return str(path)
 
 
 class _SpyModel:
@@ -162,8 +102,9 @@ class _SpyModel:
     ("graph_aa", np.uint8, 299),    # AA variant feeds the model identically
     ("overview", np.float32, 512),  # bench override still wins
 ])
-def test_stream_feeds_model_per_strategy(tmp_path, monkeypatch,
-                                         env, want_dtype, want_h):
+def test_stream_feeds_model_per_strategy(tmp_path, test_geotiff_file,
+                                         monkeypatch, env, want_dtype,
+                                         want_h):
     pytest.importorskip("rasterio")
     if env is None:
         monkeypatch.delenv("WINMOL_BENCH_READ", raising=False)
@@ -171,10 +112,9 @@ def test_stream_feeds_model_per_strategy(tmp_path, monkeypatch,
         monkeypatch.setenv("WINMOL_BENCH_READ", env)
     from classes.Config import Config
     from utils import Prediction as Pred
-    uav = _build_geotiff(tmp_path / "ortho.tif")
     out = str(tmp_path / "stem.tif")
     spy = _SpyModel()
-    Pred.predict_stream_to_raster(uav, out, spy, Config())
+    Pred.predict_stream_to_raster(test_geotiff_file, out, spy, Config())
     assert os.path.exists(out)
     assert spy.batches, "model was never called"
     dtype, shape = spy.batches[0]

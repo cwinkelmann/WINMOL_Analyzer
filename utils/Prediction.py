@@ -90,7 +90,24 @@ def resolve_read_strategy(config=None):
         raise ValueError(
             f"unknown read strategy {raw!r}; expected one of "
             f"{_READ_STRATEGIES}")
+    if raw == "cupy":
+        # Recognized but unported. Raising HERE, at the single chokepoint
+        # every consumer calls, means no entry point can silently degrade
+        # `cupy` into a different strategy's code path.
+        raise RuntimeError(
+            "the CuPy read strategy (rc12's CUDA preprocessing) is not "
+            "ported yet -- it needs cupy-cuda12x and a CUDA device, and "
+            "validation on such a box. Use 'graph' for v0.5-equivalent "
+            "output; see docs/resize-mechanics.md.")
     return raw
+
+
+def strategy_wraps_graph(strategy):
+    """True when the strategy loads a graph-wrapped model that takes raw
+    uint8 NHWC tiles. Model loading (utils.IO) and batch preparation
+    below MUST agree on this set, or the wrapped model's uint8 input
+    rejects every batch -- hence one shared predicate."""
+    return strategy in ("graph", "graph_aa")
 
 
 def _to_float32_image(arr):
@@ -218,34 +235,33 @@ def _resize_like_consumer(tile, valid_mask, out_size):
     return tile_r, mask_r > 0.5
 
 
-def _prepare_inference_batch(raw_tiles, raw_masks, config):
-    if resolve_read_strategy(config) in ("graph", "graph_aa"):
+def _prepare_inference_batch(raw_tiles, raw_masks, config,
+                             read_strategy=None):
+    """read_strategy: pass the already-resolved strategy on hot paths (the
+    stream loop resolves once); None resolves from config. Callers that
+    load an UNWRAPPED model (wrap_preprocess=False) must pass a non-graph
+    strategy explicitly -- see PredictWorkers."""
+    if read_strategy is None:
+        read_strategy = resolve_read_strategy(config)
+    if raw_masks is None:
+        raw_masks = [_default_valid_mask(t) for t in raw_tiles]
+    mask_batch = np.stack(
+        [m.astype(np.float32)[:, :, None] for m in raw_masks],
+        axis=0,
+    )
+
+    if strategy_wraps_graph(read_strategy):
         # The wrapped model normalizes and resizes in-graph: hand it the
         # native uint8 batch untouched. Producers already resized the
         # masks to the model grid, so only stacking remains. EVERY caller
         # -- the consumer loop and the autotune probes alike -- must feed
         # the model this way, or the uint8 graph input rejects the batch.
         from utils.onnx_preprocess import as_uint8_nhwc
-        tile_batch = as_uint8_nhwc(raw_tiles)
-        if raw_masks is None:
-            raw_masks = [_default_valid_mask(t) for t in raw_tiles]
-        mask_resized = np.stack(
-            [m.astype(np.float32)[:, :, None] for m in raw_masks],
-            axis=0,
-        )
-        return tile_batch, mask_resized
+        return as_uint8_nhwc(raw_tiles), mask_batch
 
     batch = np.stack([_raw_tile_to_batchable(t) for t in raw_tiles], axis=0)
     size = (config.img_height, config.img_width)
     tile_batch = _resize_batch(batch, size, order=3)
-
-    if raw_masks is None:
-        raw_masks = [_default_valid_mask(t) for t in raw_tiles]
-
-    mask_batch = np.stack(
-        [m.astype(np.float32)[:, :, None] for m in raw_masks],
-        axis=0,
-    )
     mask_resized = _resize_batch(mask_batch, size, order=0)
     return tile_batch, mask_resized
 
@@ -495,14 +511,11 @@ class TileBatchProducer(threading.Thread):
                     # then short-circuits). boundless+fill_value=0 keeps
                     # the requested (oh, ow) shape even when the window
                     # runs past the raster edge.
-                    if (self.out_size is not None
-                            and strat not in ("native", "native_producer",
-                                              "graph", "graph_aa", "cupy")):
+                    if self.out_size is not None and strat == "overview":
                         oh, ow = self.out_size
                         # A window that runs past the raster edge ALWAYS
-                        # needs boundless, whatever the strategy: it is
-                        # what keeps the returned shape at (oh, ow).
-                        # Interior windows are the ones under test.
+                        # needs boundless: it is what keeps the returned
+                        # shape at (oh, ow).
                         interior = (
                             window.col_off >= 0
                             and window.row_off >= 0
@@ -548,7 +561,7 @@ class TileBatchProducer(threading.Thread):
                     else:
                         valid_mask = gdal_mask & pixel_mask
 
-                    if strat in ("graph", "graph_aa", "cupy") and self.out_size:
+                    if strategy_wraps_graph(strat) and self.out_size:
                         # The graph resizes the IMAGE on device; the mask
                         # is only needed at model resolution for the
                         # binarize step, and nearest on one channel is
@@ -1104,12 +1117,6 @@ def predict_stream_to_raster(
 
     read_strategy = resolve_read_strategy(config)
     print(f"Tile read strategy: {read_strategy}")
-    if read_strategy == "cupy":
-        raise RuntimeError(
-            "the CuPy read strategy (rc12's CUDA preprocessing) is not "
-            "ported yet -- it needs cupy-cuda12x and a CUDA device, and "
-            "validation on such a box. Use 'graph' for v0.5-equivalent "
-            "output; see docs/resize-mechanics.md.")
 
     q = queue.Queue(maxsize=queue_depth)
     producer_job_lists = _split_jobs_for_producers(
@@ -1197,7 +1204,7 @@ def predict_stream_to_raster(
 
             prep0 = time.perf_counter()
             tile_tensor, mask_resized = _prepare_inference_batch(
-                raw_tiles, raw_masks, config)
+                raw_tiles, raw_masks, config, read_strategy=read_strategy)
             total_prep_s += time.perf_counter() - prep0
 
             infer0 = time.perf_counter()
