@@ -64,9 +64,12 @@ open "interpolation equivalence check" is closed by these numbers.
 
 | Pipeline | stems | total wall |
 |---|---:|---:|
-| our `graph` (this branch) | 15,930 | 96.7 min |
-| rc12 CUDA pipeline | 15,969 | 117 min |
-| rc12 with his fp16 Spruce (his report) | 15,935 / 15,954 | — |
+| our `graph` (RTX 4080) | 15,930 | 96.7 min |
+| rc12 CUDA pipeline (RTX 4080) | 15,969 | 117 min |
+| rc12 with his fp16 Spruce (his report, his hardware) | 15,935 / 15,954 | — |
+| **genuine v0.5.0** — TF + original hdf5, Docker/H100 (2026-08-11) | **15,954** | 99.5 min |
+| our `graph` (H100, ORT 1.23, 2026-08-11) | 15,942 | 34.9 min |
+| our `overview` — GDAL fast path (H100, 2026-08-11) | **19,186** | 26.1 min |
 
 Two independent implementations of the v0.5 kernel — different resize
 engineering, different vector stages — agree to **0.24 %** in stems and
@@ -75,12 +78,15 @@ was 0.2 % — never the explanation for anything.
 
 **The era A/B table (12,714 "v0.5" / 12,722 "onnx_gpu" / 15,556 fullres /
 16,548 overview, and "455 on every variant" on Barnekow) did not survive
-re-measurement** and must not be cited as a baseline: current re-runs give
-~15.9k for v0.5 semantics on R13 and 470–498 on Barnekow depending on
-kernel family. The honest kernel effect is a few percent (AA vs no-AA),
-not 30 %. A reproduction run of the era measurement at its own commit
-(9e7ff5e, `reimpl/docker-batch`) is in progress to pin down what that
-context did differently; until it lands, treat era numbers as unattributed.
+re-measurement** and must not be cited as a baseline. The decisive witness
+has since landed: the genuine v0.5.0 tag itself produces 15,954 on R13 —
+refuting the 12,714 row directly. Five v0.5-semantics runs now agree at
+15,930–15,969 (two hardwares, two ORT versions, two frameworks, three
+implementations). The kernel effect is scale-dependent and real: +5.6%
+stems at 1.42×, +20.3% stems / +26% volume at 2.29× (see the table in "Who
+computes what") — the era's ratio was directionally right, its absolute
+numbers were not. A reproduction at the era commit (9e7ff5e) remains
+pending purely as forensics on what that harness executed.
 
 Also measured: **ONNX Runtime 1.19.2's CUDA EP computes the opset-18
 antialias Resize incorrectly** (graph_aa: 82 stems on CUDA EP vs 478 on
@@ -105,11 +111,13 @@ of the driver stack.
 ## Recommendations
 
 1. When v0.5-comparable output matters, run the in-graph path — since the
-   `prediction_read_strategy` flag landed it IS the default (`graph`;
-   ≈1.5× the wall-clock of the fast path). The GDAL/skimage/cupy variants
-   stay selectable through the same flag or `WINMOL_BENCH_READ` for A/B —
-   possibly *more* accurate, but unresolvable until the training-time
-   resize recipe or field ground truth exists.
+   `prediction_read_strategy` flag landed it IS the default (`graph`).
+   Measured cost vs the fast path: 34.9 vs 26.1 min on an R13-scale ortho
+   (H100); free at mild factors. The GDAL/skimage/cupy variants stay
+   selectable through the same flag or `WINMOL_BENCH_READ` for A/B. The
+   fast path reports +20% stems / +26% volume at R13 scale — possibly
+   *more* accurate, but unresolvable until the training-time resize recipe
+   or field ground truth exists; do not switch defaults before that.
 2. Ask the training side for the training-pipeline resize recipe; it
    settles the remaining few-percent AA question (train-faithful vs
    signal-faithful input).
