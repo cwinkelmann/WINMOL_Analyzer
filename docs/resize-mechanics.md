@@ -122,8 +122,9 @@ of the driver stack.
    *more* accurate, but unresolvable until the training-time resize recipe
    or field ground truth exists; do not switch defaults before that.
 2. Ask the training side for the training-pipeline resize recipe; it
-   settles the remaining few-percent AA question (train-faithful vs
-   signal-faithful input).
+   decides whether the fast path's +20% stems / +26% volume at R13 scale
+   are recovered truth or aliasing artifacts (train-faithful vs
+   signal-faithful input) — ~1,700 m³ per scene rides on it.
 3. From rc12, adopt ideas not code: uint8 through the queue,
    prediction-only D2H, and the installer-time CUDA smoke test. The CuPy
    stack itself is unnecessary — this branch's cliff fix reaches higher
