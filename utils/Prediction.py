@@ -60,17 +60,18 @@ def _suppress_native_stderr(enabled=True):
 #:   graph_aa  : `graph` with ONNX Resize antialias=1 -- GDAL-like AA
 #:               semantics, but deterministic and portable. For settling
 #:               the AA accuracy question, not v0.5-equivalent.
-#:   overview  : out_shape+cubic, plain path -> GDAL serves an overview.
-#:               Fastest measured (4229 tiles/min over 99231 tiles) but
-#:               an anti-aliased kernel: NOT v0.5.0 pixels at >=2x.
-#:   fullres   : out_shape+cubic with overviews disabled (no VRT)
-#:   boundless : out_shape+cubic through the boundless VRT (the path that
-#:               collapsed 3843 -> 2001 tiles/min, kept for comparison)
+#:   overview  : out_shape+cubic in the GDAL read (overview-served).
+#:               The flag-gated fast path: ~25% faster end-to-end on
+#:               R13-scale orthos but an anti-aliased kernel — measured
+#:               +20% stems / +26% volume vs v0.5 semantics at 2.29x,
+#:               validity unresolved. NOT the default for that reason.
+#:               (The `fullres`/`boundless` bench variants of this kernel
+#:               were removed 2026-08-11 after the investigation closed.)
 #:   native    : read at native resolution, resize in skimage downstream
 #:   native_producer : `native` pixels EXACTLY, resized in the producers
 #:   cupy      : rc12's CUDA/CuPy preprocessing (guarded until the port
 #:               is validated on a CUDA box)
-_READ_STRATEGIES = ("graph", "graph_aa", "overview", "fullres", "boundless",
+_READ_STRATEGIES = ("graph", "graph_aa", "overview",
                     "native", "native_producer", "cupy")
 #: The in-graph path predates its promotion under the bench name
 #: `onnx_gpu`; keep the alias so existing bench scripts keep working.
@@ -479,9 +480,7 @@ class TileBatchProducer(threading.Thread):
             strat = self.read_strategy
             batch_items = []
             batch_read_s = 0.0
-            open_kw = ({"OVERVIEW_LEVEL": "NONE"}
-                       if strat == "fullres" else {})
-            with rasterio.open(self.uav_path, **open_kw) as src:
+            with rasterio.open(self.uav_path) as src:
                 indexes = list(range(1, min(self.n_channels, src.count) + 1))
                 for job in self.jobs:
                     t0 = time.perf_counter()
@@ -505,8 +504,7 @@ class TileBatchProducer(threading.Thread):
                         # what keeps the returned shape at (oh, ow).
                         # Interior windows are the ones under test.
                         interior = (
-                            strat != "boundless"
-                            and window.col_off >= 0
+                            window.col_off >= 0
                             and window.row_off >= 0
                             and window.col_off + window.width <= src.width
                             and window.row_off + window.height <= src.height

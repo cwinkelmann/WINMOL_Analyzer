@@ -32,6 +32,12 @@ def test_env_var_overrides_config_for_benching(monkeypatch):
     # the historical bench name for the in-graph path stays an alias
     monkeypatch.setenv("WINMOL_BENCH_READ", "onnx_gpu")
     assert resolve_read_strategy(cfg) == "graph"
+    # the redundant GDAL bench variants were removed 2026-08-11; only
+    # `overview` stays as the flag-gated fast path
+    for gone in ("fullres", "boundless"):
+        monkeypatch.setenv("WINMOL_BENCH_READ", gone)
+        with pytest.raises(ValueError):
+            resolve_read_strategy(cfg)
 
 
 def test_graph_aa_wraps_with_antialias_and_differs_from_graph(tmp_path,

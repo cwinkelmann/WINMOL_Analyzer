@@ -134,8 +134,10 @@ class Config(object):
     # onto the model grid. `graph` is v0.5.0-equivalent (native uint8
     # reads, Catmull-Rom resize inside the ONNX graph) and is the default;
     # `graph_aa` (same graph resize with antialias=1) exists to settle the
-    # AA accuracy question portably; the GDAL (`overview`/`fullres`/
-    # `boundless`), skimage (`native`/`native_producer`) and rc12 CuPy
+    # AA accuracy question portably; `overview` is the flag-gated GDAL
+    # fast path (+20% stems / +26% volume vs v0.5 semantics at R13 scale,
+    # validity unresolved — do not default to it before that is settled);
+    # skimage (`native`/`native_producer`) and rc12 CuPy
     # (`cupy`) variants stay selectable
     # for A/B comparison. WINMOL_BENCH_READ overrides this for benching.
     # The choice changes PIXELS, not just speed: docs/resize-mechanics.md.
