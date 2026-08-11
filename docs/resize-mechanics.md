@@ -35,12 +35,15 @@ and renormalized at borders. The validity mask went through
 
 "Cubic" names three different convolutions. GDAL's in-read cubic widens its
 kernel with the decimation factor — that is anti-aliasing. Measured on
-current code (Barnekow, 1.42×): a few percent of stems between the AA and
-no-AA families (470 vs 478 vs 498), with pixel-level divergence growing
-sharply with the decimation factor (mask IoU ≈0.3 at a simulated 4×). The
-era claim of a 30% effect on R13 did not survive re-measurement (see the
-R13 section below); the AA effect at R13 scale on current code is not yet
-re-measured. **Validate resampling changes at ≥ 2.3×, never on
+current code, the effect is strongly scale-dependent: +5.6% stems at
+Barnekow's 1.42× (470 vs 498), and at R13's 2.29× (fresh A/B, H100,
+2026-08-11) **+20.3% stems / +23.2% length / +26.0% volume** (overview
+19,186 / 105,023 m / 8,104 m³ / 26.1 min vs graph 15,942 / 85,226 m /
+6,433 m³ / 34.9 min). The era context's absolute numbers were phantoms,
+but its scale-dependence claim was directionally right. Whether the fast
+path's extra detections are real stems or aliasing artifacts is decided by
+the training-recipe / ground-truth question — at these magnitudes that
+question carries ~1,700 m³ per R13-scale scene. **Validate resampling changes at ≥ 2.3×, never on
 Barnekow-class data alone — and only against re-measured baselines.**
 
 ## rc12 equivalence (measured 2026-08-10)
