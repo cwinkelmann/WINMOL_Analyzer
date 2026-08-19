@@ -130,6 +130,12 @@ class Config(object):
     n_channels = 3
     num_classes = 1
     overlap_pred = 8
+    # Feature flag: which tile-read/resample implementation streams tiles
+    # onto the model grid. The choice changes PIXELS, not just speed —
+    # strategy semantics, measured deltas and the WINMOL_BENCH_READ
+    # override live with `_READ_STRATEGIES` in utils/Prediction.py and in
+    # docs/resize-mechanics.md. `graph` is v0.5.0-equivalent, the default.
+    prediction_read_strategy = "graph"
 
     # binary stem-map prediction
     stem_map_binary = True

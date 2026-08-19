@@ -48,27 +48,66 @@ def _suppress_native_stderr(enabled=True):
 """Prediction of the semantic stem map with U-Net"""
 
 
-#: Benchmark toggles for issue #43. Temporary: they exist so one build can
-#: A/B the candidate fixes on the real pipeline. Once the numbers decide,
-#: the winning path becomes unconditional and these go away.
-#: Tile-read strategy (WINMOL_BENCH_READ). DEFAULT is `overview`: it is
-#: the only one measured flat across a whole large ortho (4229 tiles/min
-#: over 99231 tiles, vs `boundless` collapsing 3843 -> 2001 and falling),
-#: and it produces IDENTICAL stems to `boundless` (455 stems, 4537.7 m,
-#: 269.47 m3). The others remain selectable for benchmarking only.
-#: All produce
+#: Tile-read/resample strategies, selectable per run through
+#: ``Config.prediction_read_strategy`` (default `graph`) or, for A/B
+#: benchmarking, the WINMOL_BENCH_READ environment variable. They produce
 #: DIFFERENT pixels, so the choice is an accuracy question, not just a
-#: speed one -- compare them on real stem output, not on throughput.
-#:   boundless : out_shape+cubic through the boundless VRT (current prod)
-#:   overview  : out_shape+cubic, plain path -> GDAL serves an overview
-#:   fullres   : out_shape+cubic with overviews disabled (no VRT)
+#: speed one -- compare them on real stem output (docs/resize-mechanics.md,
+#: benchmark/bench_resize_parity.py):
+#:   graph     : native uint8 reads; normalize + Catmull-Rom resize run
+#:               INSIDE the ONNX graph. v0.5.0-equivalent on every
+#:               execution provider. THE DEFAULT.
+#:   graph_aa  : `graph` with ONNX Resize antialias=1 -- GDAL-like AA
+#:               semantics, but deterministic and portable. For settling
+#:               the AA accuracy question, not v0.5-equivalent.
+#:   overview  : out_shape+cubic in the GDAL read (overview-served).
+#:               The flag-gated fast path: ~25% faster end-to-end on
+#:               R13-scale orthos but an anti-aliased kernel — measured
+#:               +20% stems / +26% volume vs v0.5 semantics at 2.29x,
+#:               validity unresolved. NOT the default for that reason.
+#:               (The `fullres`/`boundless` bench variants of this kernel
+#:               were removed 2026-08-11 after the investigation closed.)
 #:   native    : read at native resolution, resize in skimage downstream
-#:               -- what v0.5.0 (and therefore training) did
-#:   native_producer : `native` pixels EXACTLY (verified bit-identical),
-#:               but the skimage resize runs in the producer threads so it
-#:               parallelises instead of serialising on the GIL-holding
-#:               consumer -- training-time accuracy without its cost
-_BENCH_READ = (os.environ.get("WINMOL_BENCH_READ") or "overview").lower()
+#:   native_producer : `native` pixels EXACTLY, resized in the producers
+#:   cupy      : rc12's CUDA/CuPy preprocessing (guarded until the port
+#:               is validated on a CUDA box)
+_READ_STRATEGIES = ("graph", "graph_aa", "overview",
+                    "native", "native_producer", "cupy")
+#: The in-graph path predates its promotion under the bench name
+#: `onnx_gpu`; keep the alias so existing bench scripts keep working.
+_STRATEGY_ALIASES = {"onnx_gpu": "graph"}
+
+
+def resolve_read_strategy(config=None):
+    """The feature-flag resolution: WINMOL_BENCH_READ (benching override)
+    beats ``config.prediction_read_strategy`` beats the `graph` default."""
+    raw = (os.environ.get("WINMOL_BENCH_READ") or "").lower()
+    if not raw and config is not None:
+        raw = str(getattr(config, "prediction_read_strategy", "")
+                  or "").lower()
+    raw = _STRATEGY_ALIASES.get(raw, raw) or "graph"
+    if raw not in _READ_STRATEGIES:
+        raise ValueError(
+            f"unknown read strategy {raw!r}; expected one of "
+            f"{_READ_STRATEGIES}")
+    if raw == "cupy":
+        # Recognized but unported. Raising HERE, at the single chokepoint
+        # every consumer calls, means no entry point can silently degrade
+        # `cupy` into a different strategy's code path.
+        raise RuntimeError(
+            "the CuPy read strategy (rc12's CUDA preprocessing) is not "
+            "ported yet -- it needs cupy-cuda12x and a CUDA device, and "
+            "validation on such a box. Use 'graph' for v0.5-equivalent "
+            "output; see docs/resize-mechanics.md.")
+    return raw
+
+
+def strategy_wraps_graph(strategy):
+    """True when the strategy loads a graph-wrapped model that takes raw
+    uint8 NHWC tiles. Model loading (utils.IO) and batch preparation
+    below MUST agree on this set, or the wrapped model's uint8 input
+    rejects every batch -- hence one shared predicate."""
+    return strategy in ("graph", "graph_aa")
 
 
 def _to_float32_image(arr):
@@ -196,18 +235,33 @@ def _resize_like_consumer(tile, valid_mask, out_size):
     return tile_r, mask_r > 0.5
 
 
-def _prepare_inference_batch(raw_tiles, raw_masks, config):
-    batch = np.stack([_raw_tile_to_batchable(t) for t in raw_tiles], axis=0)
-    size = (config.img_height, config.img_width)
-    tile_batch = _resize_batch(batch, size, order=3)
-
+def _prepare_inference_batch(raw_tiles, raw_masks, config,
+                             read_strategy=None):
+    """read_strategy: pass the already-resolved strategy on hot paths (the
+    stream loop resolves once); None resolves from config. Callers that
+    load an UNWRAPPED model (wrap_preprocess=False) must pass a non-graph
+    strategy explicitly -- see PredictWorkers."""
+    if read_strategy is None:
+        read_strategy = resolve_read_strategy(config)
     if raw_masks is None:
         raw_masks = [_default_valid_mask(t) for t in raw_tiles]
-
     mask_batch = np.stack(
         [m.astype(np.float32)[:, :, None] for m in raw_masks],
         axis=0,
     )
+
+    if strategy_wraps_graph(read_strategy):
+        # The wrapped model normalizes and resizes in-graph: hand it the
+        # native uint8 batch untouched. Producers already resized the
+        # masks to the model grid, so only stacking remains. EVERY caller
+        # -- the consumer loop and the autotune probes alike -- must feed
+        # the model this way, or the uint8 graph input rejects the batch.
+        from utils.onnx_preprocess import as_uint8_nhwc
+        return as_uint8_nhwc(raw_tiles), mask_batch
+
+    batch = np.stack([_raw_tile_to_batchable(t) for t in raw_tiles], axis=0)
+    size = (config.img_height, config.img_width)
+    tile_batch = _resize_batch(batch, size, order=3)
     mask_resized = _resize_batch(mask_batch, size, order=0)
     return tile_batch, mask_resized
 
@@ -421,7 +475,8 @@ def _describe_memory_budget(budget: dict) -> str:
 
 class TileBatchProducer(threading.Thread):
     def __init__(self, uav_path, chunk_size, jobs, n_channels,
-                 out_queue, producer_id=0, out_size=None):
+                 out_queue, producer_id=0, out_size=None,
+                 read_strategy="overview"):
         super().__init__(daemon=True)
         self.uav_path = uav_path
         self.chunk_size = max(1, int(chunk_size))
@@ -429,22 +484,19 @@ class TileBatchProducer(threading.Thread):
         self.n_channels = n_channels
         self.out_queue = out_queue
         self.producer_id = producer_id
-        # (H, W) to resample each tile to *during* the GDAL read (fast, in
-        # C, and able to use overviews). None keeps the native-resolution
-        # read, leaving resizing to the (slow) skimage path downstream.
+        # (H, W) of the model grid. For the GDAL strategies the tile is
+        # resampled to it *during* the read; for `graph`/`cupy` the tile
+        # stays native and only the validity mask is resized to it here.
         self.out_size = tuple(out_size) if out_size else None
+        self.read_strategy = read_strategy
         self.error = None
 
     def run(self):
         try:
+            strat = self.read_strategy
             batch_items = []
             batch_read_s = 0.0
-            # WINMOL_BENCH_READ picks the tile-read strategy so the four
-            # candidates can be compared end-to-end on real stems:
-            #   boundless (current production) | overview | fullres | native
-            open_kw = ({"OVERVIEW_LEVEL": "NONE"}
-                       if _BENCH_READ == "fullres" else {})
-            with rasterio.open(self.uav_path, **open_kw) as src:
+            with rasterio.open(self.uav_path) as src:
                 indexes = list(range(1, min(self.n_channels, src.count) + 1))
                 for job in self.jobs:
                     t0 = time.perf_counter()
@@ -467,17 +519,13 @@ class TileBatchProducer(threading.Thread):
                     # output, and on the out_shape path it also blocks
                     # overview use. Applies to EVERY read strategy.
                     interior = (
-                        _BENCH_READ != "boundless"
-                        and window.col_off >= 0
+                        window.col_off >= 0
                         and window.row_off >= 0
                         and window.col_off + window.width <= src.width
                         and window.row_off + window.height <= src.height
                     )
                     bl = not interior
-                    if (self.out_size is not None
-                            and _BENCH_READ not in ("native",
-                                                    "native_producer",
-                                                    "onnx_gpu")):
+                    if self.out_size is not None and strat == "overview":
                         oh, ow = self.out_size
                         tile = src.read(
                             indexes,
@@ -495,10 +543,12 @@ class TileBatchProducer(threading.Thread):
                             boundless=bl,
                         ) > 0
                     else:
-                        # Native-resolution read (native / native_producer /
-                        # onnx_gpu). Same interior rule as above: this path
-                        # used boundless unconditionally, which is where
-                        # onnx_gpu's read 0.144s came from.
+                        # Native-resolution read (graph / graph_aa /
+                        # native / native_producer). Same interior rule as
+                        # above: this path used boundless unconditionally,
+                        # which is where the 0.144 s/tile read came from --
+                        # and it is now the DEFAULT path, so the 3.2x
+                        # matters more here than on the overview branch.
                         tile = src.read(
                             indexes,
                             window=window,
@@ -521,7 +571,7 @@ class TileBatchProducer(threading.Thread):
                     else:
                         valid_mask = gdal_mask & pixel_mask
 
-                    if _BENCH_READ == "onnx_gpu" and self.out_size:
+                    if strategy_wraps_graph(strat) and self.out_size:
                         # The graph resizes the IMAGE on device; the mask
                         # is only needed at model resolution for the
                         # binarize step, and nearest on one channel is
@@ -531,7 +581,7 @@ class TileBatchProducer(threading.Thread):
                             mk[None, ...], (int(self.out_size[0]),
                                             int(self.out_size[1])),
                             order=0)[0, :, :, 0] > 0.5
-                    elif _BENCH_READ == "native_producer" and self.out_size:
+                    elif strat == "native_producer" and self.out_size:
                         # Same skimage resize the consumer would do, but
                         # run HERE so it parallelises across producers
                         # instead of serialising on the GIL-holding
@@ -1075,6 +1125,9 @@ def predict_stream_to_raster(
     jobs_iter = list(_iter_tile_jobs(layout, config)) \
         if tile_jobs is None else list(tile_jobs)
 
+    read_strategy = resolve_read_strategy(config)
+    print(f"Tile read strategy: {read_strategy}")
+
     q = queue.Queue(maxsize=queue_depth)
     producer_job_lists = _split_jobs_for_producers(
         jobs_iter, producer_workers)
@@ -1086,10 +1139,11 @@ def predict_stream_to_raster(
             n_channels=config.n_channels,
             out_queue=q,
             producer_id=idx,
-            # Tiles arrive on the model grid already; _resize_batch's
-            # identity fast path then makes _prepare_inference_batch a
-            # no-op for the resize step.
+            # For the GDAL strategies tiles arrive on the model grid
+            # already (identity fast path downstream); for `graph` the
+            # producers use it only to resize the validity mask.
             out_size=(config.img_height, config.img_width),
+            read_strategy=read_strategy,
         )
         for idx in range(len(producer_job_lists))
     ]
@@ -1159,17 +1213,8 @@ def predict_stream_to_raster(
             raw_masks = [mask for _, _, mask in items]
 
             prep0 = time.perf_counter()
-            if _BENCH_READ == "onnx_gpu":
-                # No CPU normalize, no CPU resize: the graph does both.
-                # `prep` should collapse to a stack() of uint8 views.
-                from utils.onnx_preprocess import as_uint8_nhwc
-                tile_tensor = as_uint8_nhwc(raw_tiles)
-                mask_resized = np.stack(
-                    [m.astype(np.float32)[:, :, None] for m in raw_masks],
-                    axis=0)
-            else:
-                tile_tensor, mask_resized = _prepare_inference_batch(
-                    raw_tiles, raw_masks, config)
+            tile_tensor, mask_resized = _prepare_inference_batch(
+                raw_tiles, raw_masks, config, read_strategy=read_strategy)
             total_prep_s += time.perf_counter() - prep0
 
             infer0 = time.perf_counter()

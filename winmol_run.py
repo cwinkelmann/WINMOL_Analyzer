@@ -173,7 +173,7 @@ class ImageProcessing:
                 os.environ["WINMOL_ONNX_FORCE_CPU"] = "1"
 
         print("\nLoading Model...")
-        model = IO.load_model_from_path(self.model_path)
+        model = IO.load_model_from_path(self.model_path, self.config)
         from utils.onnx_runtime import last_active_report
         report = last_active_report()
         if report:

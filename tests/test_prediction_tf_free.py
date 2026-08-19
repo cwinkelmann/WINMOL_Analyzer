@@ -292,6 +292,8 @@ def test_tile_batch_producer_bypasses_skimage_resize(tmp_path, monkeypatch):
     items = _run_producer(uav_path, [job], out_size=(512, 512))
     _, tile, valid_mask = items[0]
 
+    monkeypatch.setenv("WINMOL_BENCH_READ", "overview")
+
     def failing_resize(*args, **kwargs):
         raise AssertionError(
             "skimage resize must not run: tiles already arrive on the "

@@ -219,13 +219,17 @@ def load_raster_window_with_profile(path: str, window):
 """File operations"""
 
 
-def load_model_from_path(model_path):
+def load_model_from_path(model_path, config=None, wrap_preprocess=None):
     # ONNX models are architecture-agnostic: they are served by an
     # OnnxSegmenter adapter that duck-types the Keras model's
     # predict_on_batch(NHWC) interface, so no TensorFlow/Keras code is
     # needed here at all.
+    #
+    # wrap_preprocess: None resolves from the read-strategy flag (`graph`
+    # wraps); False forces the raw model for callers that feed
+    # pre-normalized float tiles themselves (PredictWorkers).
     if str(model_path).lower().endswith(".onnx"):
-        return _load_onnx_model(model_path)
+        return _load_onnx_model(model_path, config, wrap_preprocess)
 
     # The shipped runtime is TensorFlow-free: it loads only .onnx models
     # via onnxruntime. Legacy Keras/TensorFlow models (.hdf5/.h5/.keras)
@@ -238,7 +242,7 @@ def load_model_from_path(model_path):
         "the resulting .onnx file.")
 
 
-def _load_onnx_model(model_path):
+def _load_onnx_model(model_path, config=None, wrap_preprocess=None):
     """Load a .onnx segmenter via the vendored OnnxSegmenter.
 
     OnnxSegmenter exposes predict_on_batch(NHWC), so it is a drop-in for
@@ -255,15 +259,33 @@ def _load_onnx_model(model_path):
             "available (" + str(e) + "). Install it with "
             "'pip install onnxruntime' (or 'onnxruntime-gpu' for CUDA) "
             "and try again.") from e
-    import os as _os
-    if (_os.environ.get("WINMOL_BENCH_READ") or "").lower() == "onnx_gpu":
+    antialias = False
+    if wrap_preprocess is None:
+        from utils.Prediction import (resolve_read_strategy,
+                                      strategy_wraps_graph)
+        strategy = resolve_read_strategy(config)
+        wrap_preprocess = strategy_wraps_graph(strategy)
+        antialias = strategy == "graph_aa"
+    if wrap_preprocess:
         # Prepend normalize + bicubic resize to the graph so they run on
         # the session's device instead of the CPU, and GDAL goes back to
         # plain native reads. See utils/onnx_preprocess.
         from utils.onnx_preprocess import build_preprocessed_model
-        wrapped = build_preprocessed_model(model_path, (512, 512))
+        target = (int(getattr(config, 'img_height', None) or 512),
+                  int(getattr(config, 'img_width', None) or 512))
+        wrapped = build_preprocessed_model(model_path, target,
+                                           antialias=antialias)
         print(f"Loading ONNX model with IN-GRAPH preprocessing "
               f"(normalize + bicubic resize on device): {wrapped}")
+        if antialias:
+            # onnxruntime's CUDA EP mis-executes the opset-18 antialias
+            # Resize (measured: 82 stems vs 478 on the CPU EP, same run).
+            # Pin the CPU provider until that is fixed upstream; graph_aa
+            # is a comparison mode, so correctness beats speed here.
+            print("graph_aa: pinning CPUExecutionProvider (CUDA EP "
+                  "computes antialias Resize incorrectly, ORT<=1.19)")
+            return OnnxSegmenter(wrapped,
+                                 providers=["CPUExecutionProvider"])
         return OnnxSegmenter(wrapped)
     print(f"Loading ONNX model via OnnxSegmenter: {model_path}")
     return OnnxSegmenter(model_path)

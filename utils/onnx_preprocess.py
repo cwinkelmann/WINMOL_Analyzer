@@ -46,11 +46,16 @@ def _model_input(model):
     return model.graph.input[0]
 
 
-def build_preprocessed_model(model_path, target_hw, out_path=None):
+def build_preprocessed_model(model_path, target_hw, out_path=None,
+                             antialias=False):
     """Return a path to `model_path` with uint8 -> normalize -> resize in front.
 
     The wrapped model takes NHWC uint8 tiles at ANY spatial size (dims stay
     dynamic) and resizes them to ``target_hw`` inside the graph.
+
+    antialias=True widens the kernel with the downsampling factor (ONNX
+    Resize `antialias`, opset >= 18) -- GDAL-like AA semantics, but
+    deterministic and portable. False is the v0.5.0 behavior.
     """
     th, tw = int(target_hw[0]), int(target_hw[1])
     model = onnx.load(str(model_path))
@@ -62,7 +67,8 @@ def build_preprocessed_model(model_path, target_hw, out_path=None):
     if out_path is None:
         key = hashlib.sha256(
             f"{os.path.realpath(model_path)}|{os.path.getmtime(model_path)}"
-            f"|{th}x{tw}|{nchw}|{TF_CUBIC_COEFF_A}".encode()
+            f"|{th}x{tw}|{nchw}|{TF_CUBIC_COEFF_A}|aa{int(bool(antialias))}"
+            .encode()
         ).hexdigest()[:16]
         out_path = os.path.join(
             os.path.dirname(os.path.realpath(model_path)),
@@ -96,7 +102,8 @@ def build_preprocessed_model(model_path, target_hw, out_path=None):
             coordinate_transformation_mode="half_pixel",
             exclude_outside=1,
             nearest_mode="floor",
-            name="winmol_pre_resize"),
+            name="winmol_pre_resize",
+            **({"antialias": 1} if antialias else {})),
     ]
     if nchw:
         nodes[-1].output[0] = inp.name
@@ -125,10 +132,12 @@ def build_preprocessed_model(model_path, target_hw, out_path=None):
         model.graph.node.insert(i, n)
 
     # Resize with `sizes` and exclude_outside needs opset >= 11; cubic_coeff_a
-    # semantics settled by 13. Raise only if the model is older.
+    # semantics settled by 13; `antialias` exists from 18. Raise only if the
+    # model is older than what the built node needs.
+    min_opset = 18 if antialias else 13
     for op in model.opset_import:
-        if op.domain in ("", "ai.onnx") and op.version < 13:
-            op.version = 13
+        if op.domain in ("", "ai.onnx") and op.version < min_opset:
+            op.version = min_opset
     onnx.checker.check_model(model)
     onnx.save(model, out_path)
     return out_path
