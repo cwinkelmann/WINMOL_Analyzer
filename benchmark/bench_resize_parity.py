@@ -37,10 +37,10 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import numpy as np
-import rasterio
-from rasterio.enums import Resampling
-from rasterio.windows import Window
+import numpy as np  # noqa: E402
+import rasterio  # noqa: E402
+from rasterio.enums import Resampling  # noqa: E402
+from rasterio.windows import Window  # noqa: E402
 
 IMG, THR, CROP = 512, 0.5, 4
 
@@ -93,14 +93,16 @@ def v05_resize(img_f32, out=IMG):
             cubic_coeff_a=TF_CUBIC_COEFF_A,
             coordinate_transformation_mode="half_pixel",
             exclude_outside=1, nearest_mode="floor")
+        tvi = helper.make_tensor_value_info
         graph = helper.make_graph(
             [node], "resize",
-            [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 3, h, w])],
-            [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 3, out, out])],
+            [tvi("x", TensorProto.FLOAT, [1, 3, h, w])],
+            [tvi("y", TensorProto.FLOAT, [1, 3, out, out])],
             initializer=[
                 helper.make_tensor("roi", TensorProto.FLOAT, [0], []),
                 helper.make_tensor("scales", TensorProto.FLOAT, [0], []),
-                helper.make_tensor("sizes", TensorProto.INT64, [4], [1, 3, out, out]),
+                helper.make_tensor("sizes", TensorProto.INT64, [4],
+                                   [1, 3, out, out]),
             ])
         m = helper.make_model(graph,
                               opset_imports=[helper.make_opsetid("", 18)])
@@ -165,10 +167,14 @@ def main():
             stats.append((d.max(), d[2:-2, 2:-2].max(), d.mean()))
         s = np.array(stats)
         print(f"vs v0.5 reference over {len(wins)} windows:")
-        print(f"  whole    max|d| {s[:, 0].max():8.4f} DN   mean {s[:, 2].mean():.6f} DN")
-        print(f"  interior max|d| {s[:, 1].max():8.4f} DN   (border band excluded)")
+        print(f"  whole    max|d| {s[:, 0].max():8.4f} DN   "
+              f"mean {s[:, 2].mean():.6f} DN")
+        print(f"  interior max|d| {s[:, 1].max():8.4f} DN   "
+              "(border band excluded)")
         ok = s[:, 1].max() < 0.1
-        print(f"  -> {'v0.5-EQUIVALENT (interior < 0.1 DN)' if ok else 'NOT equivalent'}")
+        verdict = ("v0.5-EQUIVALENT (interior < 0.1 DN)" if ok
+                   else "NOT equivalent")
+        print(f"  -> {verdict}")
         return 0 if ok else 1
 
     if not args.model:
@@ -196,8 +202,10 @@ def main():
         worst = min(worst, iou)
         tot_a += int(ba.sum())
         tot_b += int(bb.sum())
-        print(f"  win({c:5d},{r:5d})  fg {ba.sum():6d} vs {bb.sum():6d}  IoU {iou:.5f}")
-    print(f"total fg {tot_a} vs {tot_b} ({100*(tot_a-tot_b)/max(tot_b,1):+.3f}%)  "
+        print(f"  win({c:5d},{r:5d})  fg {ba.sum():6d} vs "
+              f"{bb.sum():6d}  IoU {iou:.5f}")
+    pct = 100 * (tot_a - tot_b) / max(tot_b, 1)
+    print(f"total fg {tot_a} vs {tot_b} ({pct:+.3f}%)  "
           f"worst IoU {worst:.5f}")
     return 0 if worst > 0.999 else 1
 

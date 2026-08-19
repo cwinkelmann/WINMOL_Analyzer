@@ -8,7 +8,6 @@ import os
 import subprocess
 import sys
 
-import numpy as np
 import pytest
 
 from conftest import build_test_geotiff, build_tiny_unet
