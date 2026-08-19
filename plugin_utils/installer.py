@@ -225,12 +225,48 @@ def path_is_inside(path, root) -> bool:
 
 # --- sentinel (install once) ------------------------------------------------
 
+def _requirements_closure(path):
+    """``path`` and every file it pulls in with ``-r``, in stable order.
+
+    cpu.txt and gpu.txt are thin: both are little more than ``-r
+    core.txt`` plus a runtime. Hashing only the named file therefore
+    misses every change to the shared stack -- a dependency added to
+    core.txt would leave the sentinel matching, and no existing install
+    would ever rebuild its venv. That is how the `onnx` requirement
+    reached users as a ModuleNotFoundError instead of a reinstall.
+    """
+    seen, ordered, queue = set(), [], [Path(path)]
+    while queue:
+        current = queue.pop(0)
+        try:
+            key = current.resolve()
+        except Exception:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(current)
+        try:
+            lines = current.read_text().splitlines()
+        except Exception:
+            continue
+        for line in lines:
+            line = line.strip()
+            for flag in ("-r ", "--requirement "):
+                if line.startswith(flag):
+                    queue.append(current.parent / line[len(flag):].strip())
+    return ordered
+
+
 def _file_hash(path) -> str:
-    try:
-        data = Path(path).read_bytes()
-    except Exception:
-        data = b""
-    return hashlib.sha256(data).hexdigest()[:16]
+    """Hash of the whole requirements closure, not just the entry file."""
+    digest = hashlib.sha256()
+    for part in _requirements_closure(path):
+        try:
+            digest.update(part.read_bytes())
+        except Exception:
+            digest.update(b"")
+    return digest.hexdigest()[:16]
 
 
 def _marker_path(venv_path) -> str:
