@@ -1,6 +1,31 @@
-# The tile-resampling problem — 30% more stems, and which is right
+# The tile-resampling problem — the kernel question, and which is right
 
-**Status: unresolved. Needs a forestry judgement, not another benchmark.**
+> **RETRACTED NUMBERS (2026-08-11). Read `docs/resize-mechanics.md` first.**
+> The absolute stem counts in this file come from the "era" A/B harness
+> (12,714 "v0.5" / 12,722 in-graph / 15,556 fullres / 16,548 overview, and
+> "455 on every variant" on Barnekow). They did not survive
+> re-measurement and **must not be cited as baselines**. Root cause,
+> closed 2026-08-11: the era harness ran the **Spruce_Deadwood** model
+> (2024-12-19) while labelling it Spruce — that pipeline reproduces
+> 12,731 on R13, within 0.13 % of the era's 12,714.
+>
+> What replaced them: genuine v0.5.0 on R13 = **15,950 stems**, this
+> branch's `graph` default = **15,940** (−0.06 %), volume to 0.002 %.
+> The kernel effect is **scale-dependent and real** but smaller than
+> stated here: +5.6 % stems at 1.42×, **+20 % stems / +26 % volume at
+> 2.29×** — not "30 %", and not "0 % on Barnekow".
+>
+> **What survives:** the *structure* of the argument — that the effect
+> decomposes into a kernel term (GDAL anti-aliases with scale, TF's
+> 4-tap Keys kernel does not) and a smaller source term (overview =
+> two-stage resample), and that validating a resampling change on a 1.4×
+> ortho and shipping it for 2.3× data is what let it through. That
+> reasoning is why `graph` is the default and `overview` is flag-gated.
+
+**Status: the parity question is CLOSED (`graph` ≡ v0.5 to 0.06 %). The
+open question is narrower — whether the anti-aliased fast path is *more*
+accurate than v0.5 semantics, which needs the training-time resize recipe
+or field ground truth, not another benchmark.**
 
 ## The problem in one table
 
@@ -15,7 +40,9 @@ model's 512×512 grid differs.
 | GDAL cubic, **full-res** source (`fullres`) | **15556** | 3662/min |
 | GDAL cubic, **overview** source (`overview`, current default) | **16548** | 4229/min |
 
-The current default finds **30% more stems than v0.5.0** on this ortho.
+The current default finds substantially more stems than v0.5.0 on this
+ortho (era figure: 30 % — **retracted**; re-measured at R13 scale: +20 %
+stems / +26 % volume).
 Nobody noticed, because the change was validated on Barnekow, where all
 GDAL variants agree exactly (455 / 455 / 455) and the effect is invisible.
 

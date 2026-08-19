@@ -7,6 +7,18 @@ Two questions this answers:
 2. **What was the throughput cliff on large orthomosaics (issue #43), and
    what actually fixed it?**
 
+
+> **RETRACTION (2026-08-11) — read `docs/resize-mechanics.md` first.**
+> Every absolute stem count in this document that is attributed to
+> **v0.5.0** (12,714 / 12,722, "30 % because of resampling", "455 on
+> every Barnekow variant") comes from the era A/B harness and is
+> **retracted**: that harness ran the **Spruce_Deadwood** model while
+> labelling it Spruce. Genuine v0.5.0 on R13 is **15,950 stems**, and
+> this branch's default `graph` path reproduces it to **−0.06 %**
+> (volume to 0.002 %). The *throughput* measurements below — the cliff,
+> the stage-by-stage timings, GDAL_CACHEMAX, worker counts — are
+> unaffected; only the cross-era accuracy comparisons are.
+
 All measurements are from one machine — 12 cores, 46.75 GB RAM, RTX 4080
 SUPER (16 GB), local NVMe — on three orthomosaics:
 
@@ -239,7 +251,9 @@ nodes** with 2 vector workers, with 11, and in the container.
 **Between v0.5.0 and now: NOT comparable, and the cause is the resampling
 operator, not the model.**
 
-This is the most important caveat in this document. On Tegel R13:
+This is the most important caveat in this document. The *conclusion* held
+up; the numbers under it did not. On Tegel R13 (**era table — retracted
+2026-08-11, kept for the record of what was compared**):
 
 | configuration | model | resampling | stems |
 |---|---|---|---|
@@ -251,9 +265,18 @@ This is the most important caveat in this document. On Tegel R13:
 
 Read that carefully. The two runs that share a **resampling method** agree
 to **0.06%** despite using *different model artifacts*. The runs that share
-a **model artifact** differ by **30%** because of resampling. So the model
-conversion (`.hdf5` → fp16 `.onnx`) is nearly irrelevant to stem count, and
-**the resampling operator dominates it**.
+a **model artifact** differ because of resampling. So the model conversion
+(`.hdf5` → fp16 `.onnx`) is nearly irrelevant to stem count, and **the
+resampling operator dominates it**.
+
+Both halves of that claim were re-tested against genuine v0.5.0 on
+2026-08-11 and **survived — with corrected magnitudes**. Model conversion
+is indeed near-irrelevant (`graph` vs genuine v0.5.0: −0.06 % stems,
++0.002 % volume on R13; −0.13 % / −0.24 % on R12). The resampling operator
+does dominate, but the kernel gap is **+20 % stems / +26 % volume at
+2.29×**, not 30 %, and it is **scale-dependent** (+5.6 % at 1.42×) rather
+than absent on Barnekow. The 12,714 row was the Spruce_Deadwood model
+under a Spruce label, not a resampling result at all.
 
 An earlier version of this document claimed the opposite. It was wrong: it
 compared v0.5.0 against the current default and attributed the whole gap to

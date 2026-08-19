@@ -1,4 +1,4 @@
-# PR stack — current state (updated 2026-08-11)
+# PR stack — current state (updated 2026-08-19)
 
 Supersedes the 2026-07-21 restack notes in `push_restack.sh` and the
 July merge-order audit. Two generations exist on origin; only the
@@ -23,17 +23,32 @@ Linear, each PR based on the previous:
 | #36 | `reimpl/gui-parity` | detection-tab parity, CoreML bind |
 | #38 | `reimpl/ci` | cross-OS CI + ZIP build |
 | #39 | `reimpl/cleanup` | drop template scaffolding/cruft |
-| #42 | `reimpl/oom-resilience` | OOM survival + **overview-read cliff fix (02a8488)** |
+| **#42** | `reimpl/oom-resilience` | **stack tip.** OOM survival + overview-read cliff fix (#43), containerised batch (was #44), resize mechanics + v0.5-parity `graph` default (was #45) |
 
-After #42 the stack forks into two siblings (either order; rebase the
-other after the first merges):
+#42 is the tip and is **no longer a draft**. The two siblings that used
+to hang off it were folded into it on 2026-08-19 (merge `25c1eea`) to cut
+reviewer load — three PRs, one review:
 
-| # | branch | one-liner | caveat |
-|---|---|---|---|
-| **#45** | `winmol-oom-fix` | read-strategy flag (`graph` default, v0.5-parity **proven**: R13 −0.06 % / R12 −0.13 % stems, volume to 0.002 %), parity gate, graph_aa, resize-mechanics docs | none — carries the parity-proof table |
-| #44 | `reimpl/docker-batch` | containerised batch, desktop → multi-GPU | **must be amended before merge**: its `docs/resampling-accuracy.md` / `performance-v05-to-now.md` carry the retracted era numbers (12,714/12,722 "v0.5", "30 % effect", "455 on every variant") — refuted 2026-08-11, root-caused to a Spruce_Deadwood model mix-up; see `docs/resize-mechanics.md` on #45 |
+| was | branch | what it contributed to #42 |
+|---|---|---|
+| #45 | `winmol-oom-fix` | read-strategy flag (`graph` default, v0.5-parity **proven**: R13 −0.06 % / R12 −0.13 % stems, volume to 0.002 %), parity gate, `graph_aa`, `docs/resize-mechanics.md` |
+| #44 | `reimpl/docker-batch` | containerised batch (desktop → multi-GPU), cgroup-aware `HardwareInfo`, `GDAL_CACHEMAX` sizing |
 
-Suggested final order: **#26 → … → #39 → #42 → #45 → #44 (amended)**.
+The amendment #44 needed before merge is **done** (2026-08-19): the
+retracted era numbers in `docs/resampling-accuracy.md` and
+`docs/performance-v05-to-now.md` (12,714/12,722 "v0.5", "30 % effect",
+"455 on every variant") now carry retraction banners pointing at
+`docs/resize-mechanics.md`, which holds the genuine-v0.5.0 comparison.
+
+One conflict had to be resolved by hand, in `TileBatchProducer.run`
+(`utils/Prediction.py`): #44 keyed the interior-window/boundless rule off
+the `_BENCH_READ` global that #45 deleted, and #45 kept the rule only on
+the `overview` branch. Since `graph` is now the default, the rule is
+hoisted above the branch and applies to **every** strategy — which is
+where #44's measured 3.2× read win (47.3 → 15.0 ms, pixel-identical)
+actually lands.
+
+Final order: **#26 → … → #39 → #42**.
 
 ## Superseded: the July legacy stack (#1–#23)
 
