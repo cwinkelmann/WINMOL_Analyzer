@@ -508,58 +508,36 @@ class TileBatchProducer(threading.Thread):
                     # mask at full-ortho scale -- nearest for the validity
                     # mask), replacing the slow per-tile skimage resize in
                     # the consumer (_resize_batch's identity fast path
-                    # then short-circuits). boundless+fill_value=0 keeps
-                    # the requested (oh, ow) shape even when the window
-                    # runs past the raster edge.
-                    # A window that runs past the raster edge ALWAYS needs
-                    # boundless -- it is what keeps the returned shape
-                    # correct. Interior windows do not, and paying for it
-                    # there is expensive: the VRT wrapper costs 3.2x on a
-                    # native read (47.3 -> 15.0 ms) for pixel-IDENTICAL
-                    # output, and on the out_shape path it also blocks
-                    # overview use. Applies to EVERY read strategy.
-                    interior = (
+                    # then short-circuits).
+                    # Only an edge window needs boundless -- it is what
+                    # keeps the returned shape correct there. Paying for it
+                    # on interior windows costs 3.2x on a native read
+                    # (47.3 -> 15.0 ms) for pixel-IDENTICAL output, and
+                    # on the out_shape path it also blocks overview use.
+                    # Applies to EVERY read strategy.
+                    bl = not (
                         window.col_off >= 0
                         and window.row_off >= 0
                         and window.col_off + window.width <= src.width
                         and window.row_off + window.height <= src.height
                     )
-                    bl = not interior
+                    read_kw = {"boundless": bl,
+                               "fill_value": 0 if bl else None}
+                    mask_kw = {"boundless": bl}
+                    # `overview` resamples during the read; every other
+                    # strategy reads native and resizes downstream. The
+                    # native read is now the DEFAULT path, so the rule
+                    # above matters more here than on the overview branch.
                     if self.out_size is not None and strat == "overview":
                         oh, ow = self.out_size
-                        tile = src.read(
-                            indexes,
-                            window=window,
-                            out_shape=(len(indexes), oh, ow),
-                            resampling=Resampling.cubic,
-                            boundless=bl,
-                            fill_value=0 if bl else None,
-                        ).transpose(1, 2, 0)
-                        gdal_mask = src.read_masks(
-                            1,
-                            window=window,
-                            out_shape=(oh, ow),
-                            resampling=Resampling.nearest,
-                            boundless=bl,
-                        ) > 0
-                    else:
-                        # Native-resolution read (graph / graph_aa /
-                        # native / native_producer). Same interior rule as
-                        # above: this path used boundless unconditionally,
-                        # which is where the 0.144 s/tile read came from --
-                        # and it is now the DEFAULT path, so the 3.2x
-                        # matters more here than on the overview branch.
-                        tile = src.read(
-                            indexes,
-                            window=window,
-                            boundless=bl,
-                            fill_value=0 if bl else None,
-                        ).transpose(1, 2, 0)
-                        gdal_mask = src.read_masks(
-                            1,
-                            window=window,
-                            boundless=bl,
-                        ) > 0
+                        read_kw.update(out_shape=(len(indexes), oh, ow),
+                                       resampling=Resampling.cubic)
+                        mask_kw.update(out_shape=(oh, ow),
+                                       resampling=Resampling.nearest)
+                    tile = src.read(
+                        indexes, window=window, **read_kw).transpose(1, 2, 0)
+                    gdal_mask = src.read_masks(
+                        1, window=window, **mask_kw) > 0
 
                     pixel_mask = np.any(tile != 0, axis=2)
 

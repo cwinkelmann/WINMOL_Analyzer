@@ -2865,8 +2865,8 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         if not installer._has_compute_deps(file_path):
             reply = QtWidgets.QMessageBox.question(
                 self, "Missing dependencies",
-                f"{file_path}\n\nis missing WINMOL's dependencies "
-                "(onnxruntime / rasterio / geopandas).\n\n"
+                f"{file_path}\n\nis missing WINMOL's dependencies ("
+                + " / ".join(installer.REQUIRED_RUNTIME_MODULES) + ").\n\n"
                 "Install them into it now? pip runs in the "
                 "background and its output appears below; QGIS "
                 "stays usable.",
