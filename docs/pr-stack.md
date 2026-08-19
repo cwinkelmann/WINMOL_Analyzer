@@ -48,7 +48,23 @@ hoisted above the branch and applies to **every** strategy — which is
 where #44's measured 3.2× read win (47.3 → 15.0 ms, pixel-identical)
 actually lands.
 
-Final order: **#26 → … → #39 → #42**.
+## How Stefan merges it
+
+All 14 are **out of draft** and form a GitHub *stacked* PR chain (public
+preview): #26 targets `main`, every later PR targets the branch below it,
+and no branch is behind its base.
+
+**Merging the top PR (#42) merges the entire stack** — every PR below
+comes with it, bottom-up, producing the same history as merging them one
+at a time. Merging a mid-stack PR instead takes everything below it and
+leaves the rest open, auto-retargeted onto `main`. Merge commit, squash
+and rebase all work, and the stack is merge-queue aware.
+
+Do not merge them individually top-down, and do not retarget any base by
+hand — that breaks the chain GitHub uses to order the merge.
+
+Order, bottom to top: **#26 → #27 → #28 → #29 → #30 → #31 → #32 → #33 →
+#34 → #35 → #36 → #38 → #39 → #42**.
 
 ## Superseded: the July legacy stack (#1–#23)
 
