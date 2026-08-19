@@ -30,7 +30,7 @@ Severe storms are a major driver of biomass loss in European forests. Knowing th
 
 ### Installation as QGIS Plugin
 
-1. Download the latest release from the [Releases page](https://github.com/your-repo/releases) (a `.zip` file of the plugin)
+1. Download the latest release from the [Releases page](https://github.com/StefanReder/WINMOL_Analyzer/releases) (a `.zip` file of the plugin)
 2. In QGIS, go to **Plugins** > **Manage and Install Plugins**
 3. Click the **Install from ZIP** tab
 4. Browse to the downloaded `.zip` file and click **Install Plugin**
@@ -41,7 +41,7 @@ Once installed, the plugin will be available via the **Plugins** menu.
 
 1. Select an UAV orthomosaic as input file (preferably <3 cm GSD) and set an output file path
 2. Select a pre-trained model (**Spruce**, **Beech** or **General**) or a **Custom** model
-3. Otional: Adjust the parameters
+3. Optional: Adjust the parameters
 4. Run detection and quantification
 5. The results are exported as geojson and added to the canvas
 
@@ -52,14 +52,14 @@ Refer to the [documentation](https://stefanreder.github.io/WINMOL_Analyzer/) for
 Please cite the following peer-reviewed studies if you use WINMOL Analyzer in your work:
 
 1. **Reder, S., Kruse, M., Miranda, L., Voss, N., & Mund, J.-P. (2025).**  
-   *Unveiling wind-thrown trees: Detection and quantification of wind-thrown tree stems on UAV orthomosaics based on UNet and a heuristic stem reconstruction.*  
+   *Unveiling wind-thrown trees: Detection and quantification of wind-thrown tree stems on UAV-orthomosaics based on UNet and a heuristic stem reconstruction.*  
    *Forest Ecology and Management, 578, 122411.*  
    [https://doi.org/10.1016/j.foreco.2024.122411](https://doi.org/10.1016/j.foreco.2024.122411)
 
-2. **Reder, S., Mund, J.-P., Albert, N., & Miranda, L. (2024).**  
+2. **Reder, S., Mund, J.-P., Albert, N., Waßermann, L., & Miranda, L. (2022).**  
    *Detection of windthrown tree stems on UAV-orthomosaics using U-Net convolutional networks.*  
-   *Remote Sensing.*  
-   [https://doi.org/10.3390/rs16244710](https://doi.org/10.3390/rs16244710)
+   *Remote Sensing, 14(1), 75.*  
+   [https://doi.org/10.3390/rs14010075](https://doi.org/10.3390/rs14010075)
 
 ## 🤝 Contributing
 
@@ -71,7 +71,7 @@ We welcome contributions from the community! Whether you want to:
 
 …your input is appreciated!
 
-- Open an [issue](https://github.com/your-repo/issues)
+- Open an [issue](https://github.com/StefanReder/WINMOL_Analyzer/issues)
 - Fork the repository and submit a pull request
 
 ## 🙏 Acknowledgements
