@@ -11,6 +11,7 @@ from PyQt5.QtCore import (
 
 from .plugin_utils.childenv import child_env, safe_child_cwd
 from .plugin_utils.installer import setup_environment, venv_location
+from .plugin_utils.model_registry import ensure_model
 
 
 class Worker(QObject):
@@ -114,5 +115,38 @@ class EnvSetupWorker(QObject):
             info = setup_environment(
                 venv_location(self.plugin_dir), progress=self.log.emit)
             self.done.emit(info["python"])
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class ModelEnsureWorker(QObject):
+    """Resolves one registry model entry to a verified local file off the
+    GUI thread, downloading it if missing/stale (model_registry.
+    ensure_model, which is itself idempotent -- a verified-existing file
+    short-circuits, so calling this on every run is cheap)."""
+
+    log = pyqtSignal(str)
+    done = pyqtSignal(str)      # local model file path on success
+    failed = pyqtSignal(str)    # error message
+
+    def __init__(self, entry, model_dir):
+        super().__init__()
+        self.entry = entry
+        self.model_dir = model_dir
+
+    def run(self):
+        last_pct = [-1]
+
+        def progress(done, total, entry):
+            if not total:
+                return
+            pct = done * 100 // total
+            if pct != last_pct[0] and pct % 10 == 0:
+                last_pct[0] = pct
+                self.log.emit(f"Downloading {entry.label}: {pct}%")
+
+        try:
+            path = ensure_model(self.entry, self.model_dir, progress=progress)
+            self.done.emit(path)
         except Exception as exc:
             self.failed.emit(str(exc))

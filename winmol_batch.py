@@ -13,8 +13,15 @@ import os
 import queue
 import subprocess
 import sys
-from typing import Dict, List, Optional
+from typing import List, Optional
 
+from plugin_utils.model_registry import (
+    ModelDownloadError,
+    Registry,
+    detect_device,
+    ensure_model,
+    load_registry,
+)
 
 DEFAULT_INPUT_FOLDER = "./standalone/input"
 DEFAULT_OUTPUT_FOLDER = "./standalone/output"
@@ -22,40 +29,35 @@ DEFAULT_MODEL_DIR = "./standalone/model"
 DEFAULT_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 
 
-def url_to_filename(url: str) -> str:
-    """Turn a config.json URL into the local model filename."""
-    return url.split("/")[-1].split("?")[0]
-
-
-def load_model_paths(
-    config_path: str = DEFAULT_CONFIG_PATH,
+def resolve_model_path(
+    name: str,
     model_dir: str = DEFAULT_MODEL_DIR,
-) -> Dict[str, str]:
-    """Load model names from config.json and map them to local model paths."""
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(
-            "config.json not found at: "
-            f"{config_path} (expected repo root; next to winmol_batch.py)"
-        )
+    config_path: str = DEFAULT_CONFIG_PATH,
+) -> str:
+    """Resolve a family or model id from config.json to a verified local
+    file, downloading (and checksum-verifying) it into ``model_dir`` if
+    it is missing or stale. Raises KeyError for an unknown name and
+    ModelDownloadError if the fetch/verification fails."""
+    registry = load_registry(config_path)
+    entry = registry.resolve(name, device=detect_device())
+    return ensure_model(entry, model_dir)
 
-    with open(config_path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
 
-    if not isinstance(cfg, dict) or not cfg:
-        raise ValueError(f"Invalid/empty config.json: {config_path}")
-
-    model_paths: Dict[str, str] = {}
-    for model_name, url in cfg.items():
-        if not isinstance(model_name, str) or not isinstance(url, str):
-            continue
-        model_paths[model_name] = os.path.join(model_dir, url_to_filename(url))
-
-    if not model_paths:
-        raise ValueError(
-            "No model entries found in config.json. Expected {name: url}."
-        )
-
-    return model_paths
+def _format_model_list(registry: Registry) -> str:
+    """Human-readable listing of families and models for --list-models."""
+    lines = ["Families (device-aware; pick one to get the best variant "
+             "for this machine):"]
+    for fid in sorted(registry.families):
+        fam = registry.families[fid]
+        lines.append(f"  {fid:<20s} {fam.label}")
+    lines.append("")
+    lines.append("Models (id, label, precision, size):")
+    for mid in sorted(registry.entries):
+        e = registry.entries[mid]
+        size = f"{e.size_mb:.2f} MB" if e.size_mb is not None else "size ?"
+        lines.append(f"  {mid:<24s} {e.label:<45s} "
+                     f"precision={e.precision:<5s} {size}")
+    return "\n".join(lines)
 
 
 def list_orthomosaics(input_folder: str) -> List[str]:
@@ -220,18 +222,31 @@ def process_orthos(orthos, model_path, output_folder, jobs=1):
 
 
 def main(argv: List[str]) -> int:
-    model_paths = load_model_paths()
-
     parser = argparse.ArgumentParser(
         description=(
             "Batch process orthomosaics in a folder using WINMOL Analyzer. "
-            "Available models are loaded from config.json."
+            "Models are resolved from config.json: a family name (Spruce, "
+            "Beech, Spruce_Deadwood, General) picks the best precision for "
+            "this machine, or pass an explicit model id. See --list-models."
         )
     )
     parser.add_argument(
         "model",
-        choices=sorted(model_paths.keys()),
-        help="Model to use (from config.json)",
+        nargs="?",
+        default=None,
+        help="Model family or id from config.json (see --list-models)",
+    )
+    parser.add_argument(
+        "--list-models",
+        action="store_true",
+        help="Print the families and models available in config.json, "
+             "then exit.",
+    )
+    parser.add_argument(
+        "--model-dir",
+        default=DEFAULT_MODEL_DIR,
+        help="Directory holding (or to download) model files "
+             f"(default: {DEFAULT_MODEL_DIR})",
     )
     parser.add_argument(
         "--input",
@@ -286,13 +301,17 @@ def main(argv: List[str]) -> int:
 
     args = parser.parse_args(argv)
 
-    model_path = model_paths[args.model]
-    if not os.path.exists(model_path):
-        print(
-            "ERROR: Model file not found: "
-            f"{model_path}. Did you download models into standalone/model?\n"
-            "Models should be downloaded automatically during build."
-        )
+    if args.list_models:
+        print(_format_model_list(load_registry(DEFAULT_CONFIG_PATH)))
+        return 0
+
+    if not args.model:
+        parser.error("the following arguments are required: model")
+
+    try:
+        model_path = resolve_model_path(args.model, args.model_dir)
+    except (KeyError, ModelDownloadError) as e:
+        print(f"ERROR: {e}")
         return 2
 
     orthos = list_orthomosaics(args.input)

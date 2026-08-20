@@ -26,7 +26,6 @@ Dialog
 import os
 import psutil
 import glob
-import json
 from pathlib import Path
 
 from PyQt5.QtWidgets import QFileDialog
@@ -39,7 +38,8 @@ from qgis.core import QgsProject, QgsVectorLayer, QgsRasterLayer
 from qgis.PyQt import QtWidgets, uic
 
 from .classes.Config import Config
-from .tasks_threads import EnvSetupWorker, Worker
+from .plugin_utils.model_registry import load_registry
+from .tasks_threads import EnvSetupWorker, ModelEnsureWorker, Worker
 
 current_path = os.path.dirname(__file__)
 
@@ -51,6 +51,10 @@ FORM_CLASS, _ = uic.loadUiType(
 
 
 class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
+
+    #: combo-box item data marking the "browse for a file" option, as
+    #: opposed to a registry entry id.
+    CUSTOM_MODEL_ID = "__custom__"
 
     def __init__(self, parent=None, env=None):
         """Constructor."""
@@ -99,6 +103,15 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.setup_worker = None
         self._setup_running = False
         self.models_dir = os.path.join(os.path.dirname(self.venv_path), "models")
+
+        # Model registry (config.json, schema-2): resolved entry for the
+        # current combo selection, and the on-demand-download worker.
+        self.registry = None
+        self._selected_model_entry = None
+        self._model_ensuring = False
+        self._pending_python_exe = None
+        self.ensure_thread = None
+        self.ensure_worker = None
         self.populate_model_combo_box()
         self.process_type = None
 
@@ -142,24 +155,26 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             print(msg)
 
     def populate_model_combo_box(self) -> None:
-        """Fill the model dropdown from config.json.
+        """Fill the model dropdown from the model registry (config.json).
 
-        config.json is expected to be a mapping: {"ModelName": "https://.../model.hdf5"}
-        The installer downloads these into models/<ModelName>.hdf5, resolved
-        beside the managed environment (not necessarily <plugin>/models).
-
-        We always append a "Custom" entry that lets users pick their own *.hdf5.
+        Recommended entries come first, then the rest, each item's data
+        holding its registry entry id; the device-matched default entry
+        is preselected. A trailing "Custom..." entry (data
+        ``CUSTOM_MODEL_ID``) lets users browse to their own *.onnx file.
         """
         config_path = os.path.join(os.path.dirname(__file__), "config.json")
-        model_names = []
-
+        ordered_ids = []
         try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-            if isinstance(cfg, dict):
-                model_names = [k.strip() for k in cfg.keys() if isinstance(k, str) and k.strip()]
+            self.registry = load_registry(config_path)
+            seen = set()
+            for eid in list(self.registry.recommended) + sorted(
+                    self.registry.entries):
+                if eid in self.registry.entries and eid not in seen:
+                    seen.add(eid)
+                    ordered_ids.append(eid)
         except Exception as e:
-            self._log(f"Could not load model list from config.json ({config_path}): {e}")
+            self.registry = None
+            self._log(f"Could not load model registry ({config_path}): {e}")
 
         try:
             self.model_comboBox.blockSignals(True)
@@ -168,18 +183,18 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
 
         self.model_comboBox.clear()
 
-        if model_names:
-            for name in sorted(set(model_names), key=str.lower):
-                self.model_comboBox.addItem(name)
-        else:
-            # Backward-compatible fallback.
-            for name in ["Beech", "Spruce", "General"]:
-                self.model_comboBox.addItem(name)
+        for eid in ordered_ids:
+            self.model_comboBox.addItem(self.registry.entries[eid].label, eid)
+        self.model_comboBox.addItem("Custom...", self.CUSTOM_MODEL_ID)
 
-        self.model_comboBox.addItem("Custom")
-
-        if model_names and "General" in model_names:
-            idx = self.model_comboBox.findText("General")
+        default_id = None
+        if self.registry is not None and ordered_ids:
+            try:
+                default_id = self.registry.default_entry().id
+            except Exception:
+                default_id = ordered_ids[0]
+        if default_id is not None:
+            idx = self.model_comboBox.findData(default_id)
             if idx >= 0:
                 self.model_comboBox.setCurrentIndex(idx)
 
@@ -191,7 +206,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.handle_model_combo_box_change()
 
     def handle_model_combo_box_change(self):
-        selected_text = self.model_comboBox.currentText()
+        is_custom = self.model_comboBox.currentData() == self.CUSTOM_MODEL_ID
         widgets_to_enable = [
             self.tileside_label,
             self.image_spinBox,
@@ -206,12 +221,9 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         ]
 
         for widget in widgets_to_enable:
-            widget.setEnabled(selected_text == "Custom")
+            widget.setEnabled(is_custom)
 
-        if selected_text == "Custom":
-            self.apply_style_to_line_edit(self.model_lineEdit, True)
-        else:
-            self.apply_style_to_line_edit(self.model_lineEdit, False)
+        self.apply_style_to_line_edit(self.model_lineEdit, is_custom)
 
     def model_file_dialog(self):
         options = QFileDialog.Options()
@@ -219,7 +231,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self,
             "Select Model File",
             "",
-            "Model File (*.hdf5);;All Files (*)",
+            "ONNX Model (*.onnx);;All Files (*)",
             options=options,
         )
         if file_path:
@@ -479,14 +491,18 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self._update_derived_output_fields()
 
     def set_selected_model(self):
-        selected_text = self.model_comboBox.currentText().strip()
-        if selected_text == "Custom":
+        """Record the current combo selection. A registry entry is kept
+        unresolved (``model_path`` stays empty; resolved on Run by
+        ``_resolve_model_and_start``/``ModelEnsureWorker``); "Custom..."
+        uses the browsed path as-is, bypassing the registry entirely."""
+        entry_id = self.model_comboBox.currentData()
+        if entry_id is None or entry_id == self.CUSTOM_MODEL_ID:
+            self._selected_model_entry = None
             self.model_path = self.model_lineEdit.text().strip()
-            return
-
-        if selected_text:
-            self.model_path = os.path.join(self.models_dir, f"{selected_text}.hdf5")
         else:
+            self._selected_model_entry = (
+                self.registry.entries.get(entry_id) if self.registry else None
+            )
             self.model_path = ""
 
     def set_selected_process_type(self):
@@ -583,17 +599,18 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         # set chosen parameters
         self.set_selected_model()
 
-        if not self.model_path:
-            QtWidgets.QMessageBox.warning(self, "WINMOL Analyzer", "No model selected.")
-            return
-        if self.model_comboBox.currentText().strip() != "Custom" and not os.path.exists(self.model_path):
-            QtWidgets.QMessageBox.warning(
-                self,
-                "WINMOL Analyzer",
-                f"Selected model file was not found:\n{self.model_path}\n\n"
-                "Tip: restart QGIS to let the plugin download models, or pick a Custom model file.",
-            )
-            return
+        if self._selected_model_entry is None:
+            if not self.model_path:
+                QtWidgets.QMessageBox.warning(self, "WINMOL Analyzer", "No model selected.")
+                return
+            if not os.path.exists(self.model_path):
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "WINMOL Analyzer",
+                    f"Selected model file was not found:\n{self.model_path}\n\n"
+                    "Tip: pick a registry model, or browse to a valid Custom model file.",
+                )
+                return
 
         self.set_selected_process_type()
         self.set_path_from_line_edit()
@@ -633,7 +650,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             )
             return
         else:
-            self._start_analysis(self.python_exe)
+            self._resolve_model_and_start(self.python_exe)
 
     def _run_env_setup(self):
         """Build the compute venv off the GUI thread, then run the
@@ -658,11 +675,53 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.python_exe = python_exe
         self.env["status"] = "ready"
         self.update_output_log("WINMOL environment ready.")
-        self._start_analysis(python_exe)
+        self._resolve_model_and_start(python_exe)
 
     def _on_env_setup_failed(self, message):
         self._setup_running = False
         self.update_output_log(f"WINMOL environment setup failed: {message}")
+
+    def _resolve_model_and_start(self, python_exe):
+        """Ensure the selected model is present locally, then start the
+        analysis. A registry entry is resolved/downloaded off the GUI
+        thread (ModelEnsureWorker -> model_registry.ensure_model); a
+        Custom path (model_path already set) is used as-is."""
+        if self._selected_model_entry is None:
+            self._start_analysis(python_exe)
+            return
+        if self._model_ensuring:
+            self.update_output_log("Model download is already running...")
+            return
+
+        self._model_ensuring = True
+        self._pending_python_exe = python_exe
+        self.update_output_log(
+            f"Preparing model '{self._selected_model_entry.label}'..."
+        )
+        self.ensure_thread = QThread()
+        self.ensure_worker = ModelEnsureWorker(
+            self._selected_model_entry, self.models_dir
+        )
+        self.ensure_worker.moveToThread(self.ensure_thread)
+        self.ensure_thread.started.connect(self.ensure_worker.run)
+        self.ensure_worker.log.connect(self.update_output_log)
+        self.ensure_worker.done.connect(self._on_model_ensured)
+        self.ensure_worker.failed.connect(self._on_model_ensure_failed)
+        self.ensure_worker.done.connect(self.ensure_thread.quit)
+        self.ensure_worker.failed.connect(self.ensure_thread.quit)
+        self.ensure_worker.done.connect(self.ensure_worker.deleteLater)
+        self.ensure_worker.failed.connect(self.ensure_worker.deleteLater)
+        self.ensure_thread.finished.connect(self.ensure_thread.deleteLater)
+        self.ensure_thread.start()
+
+    def _on_model_ensured(self, model_path):
+        self._model_ensuring = False
+        self.model_path = model_path
+        self._start_analysis(self._pending_python_exe)
+
+    def _on_model_ensure_failed(self, message):
+        self._model_ensuring = False
+        self.update_output_log(f"Model download failed: {message}")
 
     def _start_analysis(self, python_exe):
         path_dirname = os.path.dirname(__file__)
