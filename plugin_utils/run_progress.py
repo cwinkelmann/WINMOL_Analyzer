@@ -1,70 +1,24 @@
 """Turn winmol_run.py's stdout into a run progress percentage.
 
-Why this exists
----------------
-The dialog's run progress bar used to be a LINE COUNTER: ``tasks_threads``
-divided the number of stdout lines seen so far by a hardcoded constant
-(``{"Stems": 34, "Trees": 118, "Nodes": 125}``). ``winmol_run.py`` is very
-chatty during setup — ``Config.display()`` alone prints ~58 lines and the
-execution plan another 16 — so **91 lines are printed before the first
-inference**. 91/118 = 77 %: the bar sat at ~78 % before any real work had
-happened, which is exactly what the user reported.
+Parses the ``done/total`` counters the pipeline already prints (see the
+regexes below) and maps them onto phase bands, instead of counting lines --
+a plain line-count is structurally wrong because setup logging dwarfs the
+first inference tiles.
 
-Rescaling the constant cannot fix it. The prediction phase logs one line per
-``progress_interval_s`` (60 s on GPU) plus the first and last tile, so on the
-documented 580-tile benchmark the ENTIRE inference phase is worth ~7 lines
-against ~91 lines of setup. The mapping from lines to work is structurally
-wrong, not merely miscalibrated.
+Phase bands (a documented judgement call, not an exact model, derived from
+``docs/benchmark-full-ortho.md``): ``Stems`` is setup 0-2, prediction 2-99.
+``Trees``/``Nodes`` are setup 0-2, prediction 2-57, vector 57-95, merge
+95-99. 100 is emitted only by :meth:`RunProgress.finish` on success.
 
-So this module ignores line counts and parses the ``done/total`` counters the
-pipeline **already** prints, mapping them onto phase bands.
-
-Phase weights
--------------
-Taken from ``docs/benchmark-full-ortho.md`` ("Wall time per phase", a
-10528x7252 ortho, ``Trees``, defaults) for the two shipped U-Net models:
-
-===========  ==========  ==========  =======
-model        prediction  vector      merge
-===========  ==========  ==========  =======
-U-Net #1     308.0 s     182.2 s     5.3 s
-             (62 %)      (37 %)      (1 %)
-U-Net #2     220.7 s     177.9 s     6.3 s
-             (55 %)      (44 %)      (1.5 %)
-===========  ==========  ==========  =======
-
-Chosen bands (a documented judgement call, not an exact model):
-
-* ``Stems``          setup 0-2, prediction 2-99.
-* ``Trees``/``Nodes`` setup 0-2, prediction 2-57, vector 57-95, merge 95-99.
-
-100 is emitted only by :meth:`RunProgress.finish` on a successful exit.
-
-The third model in that benchmark (a DeepLabV3+ where prediction is only 23 %
-of wall time) is an outlier: with a fast detector the bar advances faster than
-linear through the prediction band and then crawls. That is accepted — every
-number the bar shows still corresponds to real tiles completed, it is still
-monotonic, and it is never an interpolation over time.
-
-Contract with the producers
----------------------------
-The parsed formats live in four modules; ``tests/test_run_progress.py``
-asserts the exact prefixes at their production sites so a format change fails
-CI instead of silently freezing the bar:
+Contract with the producers -- ``tests/test_run_progress.py`` pins these
+exact prefixes so a format change fails CI instead of silently freezing
+the bar:
 
 * ``utils/Prediction.py``          ``Written tile {done}/{total} | ...``
 * ``utils/PredictWorkers.py``      ``Multi-GPU prediction {done}/{total} | ...``
 * ``utils/VectorTilePipeline.py``  ``Vector tiles {done}/{total} | ...``
 * ``winmol_run.py``                ``Prepared {n}/{m} vector tiles ...``
 * ``utils/IO.py``                  ``MERGE TILE READ | tile {id} | ...``
-
-Everything up to and including the first ``|`` is the contract; the payload
-after it is free. The unit labels the producers now append ("prediction
-tile", "vector tile ~4144x4144 px") and the standalone ``PREDICTION PHASE``
-/ ``VECTOR PHASE`` headers live entirely in that free part, and
-``tests/test_run_progress.py`` reconstructs each producer's line from its
-own f-string and feeds it through :class:`RunProgress` — a source-substring
-pin alone would not catch text inserted *inside* the counter.
 
 Pure stdlib, no Qt and no QGIS imports, so it is unit-testable off QGIS.
 """
@@ -102,10 +56,9 @@ def _band(lo, hi, done, total):
 class RunProgress:
     """Incremental parser: feed it stdout lines, get a percentage.
 
-    ``feed(line)`` returns the new percent **only when it changed**, else
-    ``None`` — so the caller emits one Qt signal per actual step instead of
-    one per log line. The value is clamped monotonically non-decreasing and
-    never exceeds 99 until :meth:`finish` is called.
+    ``feed(line)`` returns the new percent only when it changed, else
+    ``None``. The value is clamped monotonically non-decreasing and never
+    exceeds 99 until :meth:`finish` is called.
     """
 
     def __init__(self, process_type="Trees"):
@@ -184,8 +137,8 @@ class RunProgress:
     def finish(self, ok=True):
         """Return the terminal percent: 100 on success, else unchanged.
 
-        On failure the bar is deliberately left where it stood rather than
-        snapped anywhere — the log says what went wrong.
+        On failure the bar is left where it stood; the log says what went
+        wrong.
         """
         if not ok:
             return self.percent

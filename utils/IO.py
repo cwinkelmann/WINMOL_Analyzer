@@ -25,7 +25,6 @@ from collections.abc import Mapping
 from pyproj import CRS
 from pathlib import Path
 
-from utils import Log
 import utils.Quantification as Quant
 from classes.Stem import Stem
 
@@ -35,12 +34,49 @@ from classes.Stem import Stem
 """Streaming and tiling operations"""
 
 
+#: Below this, a run is too short for the read cost to matter and the
+#: overview warning would just be noise.
+_OVERVIEW_WARN_GB = 2.0
+
+
+def _warn_if_no_overviews(src, estimated_input_gb):
+    """Tell the user when an ortho will be read the slow way.
+
+    Prediction resamples each tile to the model grid during the GDAL
+    read. When the file HAS overviews, GDAL serves that from a decimated
+    level -- measured 7.5 ms per tile on Tegel R13. Without them it must
+    read every source pixel and shrink in RAM: 13.9 ms per tile, and
+    ~4x the bytes through GDAL's global block cache (default 5% of RAM,
+    shared by every producer thread). On a large ortho that is what makes
+    throughput decay and then collapse (issue #43).
+
+    Building overviews once is the fix, and `-ro` keeps the original
+    file untouched by writing a .ovr sidecar.
+    """
+    try:
+        overviews = src.overviews(1)
+    except Exception:
+        return
+    if overviews or estimated_input_gb < _OVERVIEW_WARN_GB:
+        return
+    print(
+        f"WARNING: {src.name} has NO overviews and is "
+        f"{estimated_input_gb:.1f} GB. Every prediction tile will be read "
+        f"at full resolution and downsampled in RAM -- roughly 2x the read "
+        f"time and 4x the bytes through GDAL's shared cache, which makes "
+        f"throughput decay on large orthos. Build them once with:\n"
+        f"    gdaladdo -ro -r average {src.name} 2 4 8 16 32 64 128\n"
+        f"(-ro writes a .ovr sidecar and leaves the original file "
+        f"unchanged.)", flush=True)
+
+
 def get_raster_info(path) -> dict:
     with rasterio.open(path) as src:
         dtype = src.dtypes[0] if src.dtypes else 'unknown'
         estimated_input_gb = (
             src.width * src.height * src.count * np.dtype(dtype).itemsize
         ) / (1024 ** 3)
+        _warn_if_no_overviews(src, estimated_input_gb)
         return {
             'width': int(src.width),
             'height': int(src.height),
@@ -56,13 +92,6 @@ def get_raster_info(path) -> dict:
 
 def atomic_tmp_path(final_path: str) -> str:
     p = Path(final_path)
-    # An empty/dir-only path yields Path('.') whose .with_suffix() raises the
-    # cryptic "PosixPath('.') has an empty name". Fail with an actionable
-    # message instead (e.g. when the stem-map output arg is empty).
-    if not p.name:
-        raise ValueError(
-            "No output stem-map path was provided (got "
-            f"{final_path!r}); pass a file path for the stem map raster.")
     return str(p.with_suffix(p.suffix + '.tmp'))
 
 
@@ -190,43 +219,75 @@ def load_raster_window_with_profile(path: str, window):
 """File operations"""
 
 
-def load_model_from_path(model_path):
-    # ONNX models (e.g. DeepLabV3+ / HRNet exported from winmol_unet) are
-    # architecture-agnostic: they are served by an OnnxSegmenter adapter that
-    # duck-types the Keras model's predict_on_batch(NHWC) interface, so no
-    # architecture code is needed here. See docs/winmol_unet-pytorch-bridge.md.
+def load_model_from_path(model_path, config=None, wrap_preprocess=None):
+    # ONNX models are architecture-agnostic: they are served by an
+    # OnnxSegmenter adapter that duck-types the Keras model's
+    # predict_on_batch(NHWC) interface, so no TensorFlow/Keras code is
+    # needed here at all.
+    #
+    # wrap_preprocess: None resolves from the read-strategy flag (`graph`
+    # wraps); False forces the raw model for callers that feed
+    # pre-normalized float tiles themselves (PredictWorkers).
     if str(model_path).lower().endswith(".onnx"):
-        return _load_onnx_model(model_path)
+        return _load_onnx_model(model_path, config, wrap_preprocess)
 
-    # The shipped runtime is TensorFlow-free: it loads only .onnx models via
-    # onnxruntime. Legacy Keras/TensorFlow models (.hdf5/.h5/.keras) are no
-    # longer loadable here -- convert them to ONNX first.
+    # The shipped runtime is TensorFlow-free: it loads only .onnx models
+    # via onnxruntime. Legacy Keras/TensorFlow models (.hdf5/.h5/.keras)
+    # are no longer loadable here -- convert them to ONNX first.
     raise RuntimeError(
-        f"Unsupported model format for {model_path!r}: the WINMOL runtime "
-        "loads only .onnx models (onnxruntime, no TensorFlow). Convert legacy "
-        "Keras/TensorFlow models (.hdf5/.h5/.keras) to ONNX first with "
-        "scripts/convert_models_to_onnx.py, then pass the resulting .onnx "
-        "file.")
+        f"Unsupported model format for {model_path!r}: the WINMOL "
+        "runtime loads only .onnx models (onnxruntime, no TensorFlow). "
+        "Convert legacy Keras/TensorFlow models (.hdf5/.h5/.keras) to "
+        "ONNX first with scripts/convert_models_to_onnx.py, then pass "
+        "the resulting .onnx file.")
 
 
-def _load_onnx_model(model_path):
+def _load_onnx_model(model_path, config=None, wrap_preprocess=None):
     """Load a .onnx segmenter via the vendored OnnxSegmenter.
 
-    OnnxSegmenter exposes predict_on_batch(NHWC) and normalizes runtime OOM to a
-    retryable exception, so it is a drop-in for the Keras model everywhere the
-    analyzer runs inference. Needs only numpy + onnxruntime (no TensorFlow, no
-    external winmol_unet).
+    OnnxSegmenter exposes predict_on_batch(NHWC), so it is a drop-in for
+    the old Keras model everywhere the analyzer runs inference. This
+    import is lazy (deferred to call time) so a missing/broken
+    onnxruntime install only breaks the .onnx path, not module import,
+    and so tests can stub utils.onnx_runtime without onnxruntime present.
     """
     try:
         from utils.onnx_runtime import OnnxSegmenter
     except Exception as e:
-        # The old message always said "pip install onnxruntime", which is
-        # wrong (and unhelpful) when onnxruntime IS installed and it is the
-        # native library that failed to load — the Windows DLL-shadowing bug.
-        # onnx_diagnostics classifies the failure without importing onnxruntime.
-        from plugin_utils.onnx_diagnostics import onnx_import_error_message
-        raise RuntimeError(onnx_import_error_message(e)) from e
-    Log.info(f"Loading ONNX model via OnnxSegmenter: {model_path}")
+        raise RuntimeError(
+            f"Cannot load ONNX model {model_path!r}: onnxruntime is not "
+            "available (" + str(e) + "). Install it with "
+            "'pip install onnxruntime' (or 'onnxruntime-gpu' for CUDA) "
+            "and try again.") from e
+    antialias = False
+    if wrap_preprocess is None:
+        from utils.Prediction import (resolve_read_strategy,
+                                      strategy_wraps_graph)
+        strategy = resolve_read_strategy(config)
+        wrap_preprocess = strategy_wraps_graph(strategy)
+        antialias = strategy == "graph_aa"
+    if wrap_preprocess:
+        # Prepend normalize + bicubic resize to the graph so they run on
+        # the session's device instead of the CPU, and GDAL goes back to
+        # plain native reads. See utils/onnx_preprocess.
+        from utils.onnx_preprocess import build_preprocessed_model
+        target = (int(getattr(config, 'img_height', None) or 512),
+                  int(getattr(config, 'img_width', None) or 512))
+        wrapped = build_preprocessed_model(model_path, target,
+                                           antialias=antialias)
+        print(f"Loading ONNX model with IN-GRAPH preprocessing "
+              f"(normalize + bicubic resize on device): {wrapped}")
+        if antialias:
+            # onnxruntime's CUDA EP mis-executes the opset-18 antialias
+            # Resize (measured: 82 stems vs 478 on the CPU EP, same run).
+            # Pin the CPU provider until that is fixed upstream; graph_aa
+            # is a comparison mode, so correctness beats speed here.
+            print("graph_aa: pinning CPUExecutionProvider (CUDA EP "
+                  "computes antialias Resize incorrectly, ORT<=1.19)")
+            return OnnxSegmenter(wrapped,
+                                 providers=["CPUExecutionProvider"])
+        return OnnxSegmenter(wrapped)
+    print(f"Loading ONNX model via OnnxSegmenter: {model_path}")
     return OnnxSegmenter(model_path)
 
 
@@ -266,11 +327,11 @@ def load_orthomosaic_with_resampling(path, config):
 
 def load_stem_map(path):
     if path.endswith('.tif') or path.endswith('.tiff'):
-        Log.debug("#" * 55)
-        Log.debug("#" * 55)
-        Log.debug("")
-        Log.debug(f"Loading stem map: {path}")
-        Log.debug("")
+        print("#######################################################")
+        print("#######################################################")
+        print("")
+        print(path)
+        print("")
         with rasterio.open(path) as src:
             pred = src.read(1)
             profile = src.profile
@@ -716,7 +777,7 @@ def _fiona_write_layer(path, layer_name, gdf, crs, append=False):
             except Exception:
                 crs_wkt = None
 
-    Log.debug(
+    print(
         f"Fiona schema for layer '{layer_name}': {schema} | mode {mode} | "
         f"layer_exists {layer_exists}",
     )
@@ -787,8 +848,8 @@ def _write_layers_to_temp_gpkg(  # noqa: C901
                 first = False
             return tmp_path
         except Exception as e:
-            Log.warn("pyogrio GeoPackage write failed, "
-                     f"falling back to Fiona: {e}")
+            print("pyogrio GeoPackage write failed, "
+                  f"falling back to Fiona: {e}")
             try:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
@@ -797,8 +858,8 @@ def _write_layers_to_temp_gpkg(  # noqa: C901
 
     first = True
     for name, gdf in prepared:
-        Log.debug(f"Writing GPKG layer '{name}' with {len(gdf)} features")
-        Log.debug(f"Layer '{name}' dtypes: {dict(gdf.dtypes.astype(str))}")
+        print(f"Writing GPKG layer '{name}' with {len(gdf)} features")
+        print(f"Layer '{name}' dtypes: {dict(gdf.dtypes.astype(str))}")
         try:
             if first:
                 if os.path.exists(tmp_path):
@@ -843,22 +904,12 @@ def write_all_layers_to_gpkg(stems, profile, path_prefix):
         crs=crs,
         final_path=final_path,
     )
-    Log.debug(f"Geopackage written to temporary file: {tmp_path}")
+    print("Geopackage written to temporary file:", tmp_path)
     return _safe_finalize_gpkg(tmp_path, final_path)
 
 
 def save_image(data, output_name, size=(15, 15), dpi=300):
-    """Render an array to an image file.
-
-    matplotlib is imported HERE rather than at module scope because this is the
-    only thing in the whole compute path that needs it. An eager import made
-    matplotlib — plus its Qt/font/pillow dependency chain — a hard requirement
-    of every environment that merely imports utils.IO, including headless
-    containers that never draw anything. Importing it lazily keeps
-    `import utils.IO` working without it.
-    """
     from matplotlib import pyplot as plt
-
     fig = plt.figure()
     fig.set_size_inches(size)
     ax = plt.Axes(fig, [0., 0., 1., 1.])
@@ -903,9 +954,10 @@ def _read_gpkg_layer(gpkg_path, layer_names):
                 gdf = gpd.GeoDataFrame(geometry=[], crs=crs)
             else:
                 gdf = gpd.GeoDataFrame.from_features(feats, crs=crs)
-            Log.debug(
+            print(
                 f"MERGE READ OK | file {gpkg_path} |"
                 f" layer {ln} | rows {len(gdf)}",
+                flush=True,
             )
             return gdf
         except Exception as exc:
@@ -915,12 +967,14 @@ def _read_gpkg_layer(gpkg_path, layer_names):
         tried = ", ".join(
             f"{ln}: {type(exc).__name__}: {exc}" for ln, exc in errors
         )
-        Log.warn(
+        print(
             f"MERGE READ FAIL | file {gpkg_path} | tried [{tried}]",
+            flush=True,
         )
     else:
-        Log.warn(
+        print(
             f"MERGE READ FAIL | file {gpkg_path} | tried []",
+            flush=True,
         )
     return gpd.GeoDataFrame(geometry=[])
 
@@ -952,12 +1006,12 @@ def _ensure_crs(gdf, target_crs):
 def _raster_filter_geom(raster_path, edge_buffer_m, ortho_bounds=None):
     """Keep-region for a tile's stems during the merge.
 
-    Shrinking the tile footprint inward by edge_buffer_m dedups stems that also
-    appear in the overlapping neighbour tile. But a tile side that coincides
-    with the ortho's TRUE OUTER boundary has no neighbour, so shrinking there
-    silently drops real stems (worst at the corners, where two sides meet).
-    When ortho_bounds is known we buffer ONLY the interior-seam sides and leave
-    boundary sides at the true extent.
+    Shrinking the tile footprint inward by edge_buffer_m dedups stems that
+    also appear in the overlapping neighbour tile. But a tile side that
+    coincides with the ortho's TRUE OUTER boundary has no neighbour, so
+    shrinking there silently drops real stems (worst at the corners, where
+    two sides meet). When ortho_bounds is known we buffer ONLY the
+    interior-seam sides and leave boundary sides at the true extent.
     """
     if not raster_path:
         return None, None
@@ -970,7 +1024,7 @@ def _raster_filter_geom(raster_path, edge_buffer_m, ortho_bounds=None):
                 ob = ortho_bounds
 
                 def _side(v, o, sign):
-                    # keep true extent on the ortho boundary; else shrink inward
+                    # keep true extent on the ortho boundary; else shrink in
                     return v if abs(v - o) <= tol else v + sign * eb
                 left = _side(b.left, ob.left, +1)
                 bottom = _side(b.bottom, ob.bottom, +1)
@@ -1045,17 +1099,18 @@ def _remove_existing_output(path):
     try:
         os.remove(path)
     except PermissionError:
-        Log.warn(
+        print(
             f"MERGE OUTPUT LOCKED | keeping existing file and writing"
             f" fallback if needed: {path}",
+            flush=True,
         )
 
 
 def _globalize_stems(stems, tile_id, filter_geom):
     id_col = _pick_id_col(stems)
     if not id_col:
-        Log.warn(f"MERGE FILTER | tile {tile_id} |"
-                 f" missing stem id column")
+        print(f"MERGE FILTER | tile {tile_id} |"
+              f" missing stem id column", flush=True)
         return gpd.GeoDataFrame(), set()
 
     stems = stems.copy()
@@ -1067,16 +1122,18 @@ def _globalize_stems(stems, tile_id, filter_geom):
     if filter_geom is not None:
         kept_mask = stems.intersects(filter_geom)
         stems = stems[kept_mask].copy()
-        Log.debug(
+        print(
             f"MERGE FILTER | tile {tile_id} | before {before} |"
             f" after {len(stems)} "
             f"| filter_empty {getattr(filter_geom, 'is_empty', False)} "
             f"| filter_bounds {getattr(filter_geom, 'bounds', None)}",
+            flush=True,
         )
     else:
-        Log.debug(
+        print(
             f"MERGE FILTER | tile {tile_id} | before {before} |"
             f" after {before} | filter none",
+            flush=True,
         )
 
     kept_local = set(stems["_stem_id_local"].tolist())
@@ -1101,34 +1158,6 @@ def _select_child(gdf, tile_id, kept_local):
     return out
 
 
-def _log_merge_tile_read(tile_id, gpkg_path, stems, nodes, vectors,
-                         raster_path=None):
-    """Emit the per-tile merge counter line.
-
-    ``plugin_utils/run_progress.py`` COUNTS these lines to advance the merge
-    band of the plugin's progress bar, so the ``MERGE TILE READ | tile ...``
-    prefix has to stay visible at normal verbosity — suppressing it freezes
-    the bar with no test failure. The chatty payload (file path and per-layer
-    feature counts) is the part that was too noisy for a normal run, so that
-    stays behind ``debug``.
-    """
-    # " | vector tile" names the unit: these are the few huge vector
-    # tiles being stitched, not the hundreds of small prediction tiles.
-    # Appended AFTER the parsed prefix, which stays byte-identical.
-    head = f"MERGE TILE READ | tile {tile_id} | vector tile"
-    if not Log.is_debug():
-        Log.info(head)
-        return
-    tail = f" | raster {raster_path}" if raster_path is not None else ""
-    Log.debug(
-        f"{head} | file {gpkg_path} |"
-        f" stems {0 if stems is None else len(stems)} "
-        f"| nodes {0 if nodes is None else len(nodes)} |"
-        f" vectors {0 if vectors is None else len(vectors)}"
-        f"{tail}",
-    )
-
-
 def _process_tile(prefix, gpkg_path, raster_path, edge_buffer_m, target_crs,
                   ortho_bounds=None):
     tile_id = _tile_id_from_prefix(prefix)
@@ -1137,8 +1166,14 @@ def _process_tile(prefix, gpkg_path, raster_path, edge_buffer_m, target_crs,
         raster_path, edge_buffer_m, ortho_bounds=ortho_bounds)
 
     stems, nodes, vectors = _read_tile_gpkg(gpkg_path)
-    _log_merge_tile_read(tile_id, gpkg_path, stems, nodes, vectors,
-                         raster_path=raster_path)
+    print(
+        f"MERGE TILE READ | tile {tile_id} | file {gpkg_path} |"
+        f" stems {0 if stems is None else len(stems)} "
+        f"| nodes {0 if nodes is None else len(nodes)} |"
+        f" vectors {0 if vectors is None else len(vectors)} "
+        f"| raster {raster_path}",
+        flush=True,
+    )
     if stems is None or stems.empty:
         return None, target_crs
 
@@ -1167,7 +1202,13 @@ def _window_geom_from_profile(profile, window):
 
 def process_tile_gpkg(tile_job, gpkg_path, raster_profile, target_crs=None):
     stems, nodes, vectors = _read_tile_gpkg(gpkg_path)
-    _log_merge_tile_read(tile_job.tile_id, gpkg_path, stems, nodes, vectors)
+    print(
+        f"MERGE TILE READ | tile {tile_job.tile_id} | file {gpkg_path} |"
+        f" stems {0 if stems is None else len(stems)} "
+        f"| nodes {0 if nodes is None else len(nodes)} |"
+        f" vectors {0 if vectors is None else len(vectors)}",
+        flush=True,
+    )
     if stems is None or stems.empty:
         return None, target_crs
 
@@ -1220,12 +1261,13 @@ def merge_selected_tile_results(
     if merge_root.exists():
         recursive_candidates = \
             sorted(str(p) for p in merge_root.rglob('*.gpkg'))
-    Log.debug(
+    print(
         f"MERGE DISCOVERY | root {merge_root} |"
         f" gpkg_files {len(recursive_candidates)}",
+        flush=True,
     )
     for candidate in recursive_candidates[:5]:
-        Log.debug(f'MERGE INPUT | {candidate}')
+        print(f'MERGE INPUT | {candidate}', flush=True)
 
     for tile_job, gpkg_path in tile_records:
         out, target_crs = process_tile_gpkg(
@@ -1251,7 +1293,7 @@ def merge_selected_tile_results(
         written_gpkg = _write_merged(
             output_gpkg, merged_stems, merged_nodes, merged_vectors)
         print("")
-        print("MERGE SUMMARY (final result for this run)")
+        print("MERGE SUMMARY")
         print(f"Tiles processed:       {tile_count}")
         print(f"Total stems written:   {total_stems}")
         print(f"Total nodes written:   {total_nodes}")
@@ -1259,7 +1301,7 @@ def merge_selected_tile_results(
         print(f"Output saved to: {written_gpkg}")
     else:
         print("")
-        print("MERGE SUMMARY (final result for this run)")
+        print("MERGE SUMMARY")
         print("Tiles processed:       0")
         print("Total stems written:   0")
         print("Total nodes written:   0")
@@ -1475,9 +1517,10 @@ def _reconstruct_edge_stems_for_tiled_merge(
             idx = []
         edge_indices.update(idx)
 
-    Log.debug(
+    print(
         f"MERGE EDGE CONNECT | candidates {len(edge_indices)} |"
         f" total {len(stems_gdf)} | edge_buffer_m {edge_buffer_m}",
+        flush=True,
     )
 
     all_stems = _stems_from_gdf(stems_gdf)
@@ -1501,16 +1544,15 @@ def _reconstruct_edge_stems_for_tiled_merge(
     else:
         recon_cfg = config
 
-    connected_edge_stems = Vec.connect_stems(
-        list(original_edge_stems), recon_cfg,
-        scope="Merge edge reconnect")
+    connected_edge_stems = \
+        Vec.connect_stems(list(original_edge_stems), recon_cfg)
 
     # Quantify the direct connect_stems outputs so their lengths/volumes are
     # consistent with the merged geometry. connect_stems now merges the
-    # parents' per-node diameter lists (Vectorization._merge_diameter_lists);
-    # guard anyway: a stem whose diameter list does not match its path would
-    # crash quantify_stem with IndexError (docs/CODE_REVIEW_2.md A-1) — keep
-    # its geometry and clear the measures instead of dying at the last step.
+    # parents' per-node diameter lists (Vectorization._merge_diameter_lists),
+    # but guard anyway: a stem whose diameter list does not match its path
+    # would crash quantify_stem with an IndexError at the very last step
+    # (issue #41) -- keep its geometry and clear the measures instead of dying.
     quantified_edge_stems = []
     n_unmeasured = 0
     for stem in connected_edge_stems:
@@ -1522,14 +1564,14 @@ def _reconstruct_edge_stems_for_tiled_merge(
             n_unmeasured += 1
             quantified_edge_stems.append(stem)
     if n_unmeasured:
-        Log.warn(f"{n_unmeasured} merged stems kept without "
-                 f"re-quantified measures (diameter/path mismatch)")
+        print(f"WARNING: {n_unmeasured} merged edge stems kept without "
+              f"re-quantified measures (diameter/path mismatch)", flush=True)
 
     final_stems = inner_stems + quantified_edge_stems
     print(
         f"MERGE EDGE CONNECT | inner {len(inner_stems)} | "
         f"connected_edge {len(quantified_edge_stems)} | "
-        f"stems {len(final_stems)}",
+        f"final {len(final_stems)}",
         flush=True,
     )
     return _stems_to_layer_gdfs(final_stems, target_crs, config=recon_cfg)
@@ -1560,12 +1602,13 @@ def merge_and_filter_tiled_results(
     tiles = _detect_tiles(work_dir, output_gpkg)
     recursive_candidates = \
         sorted(str(p) for p in Path(work_dir).rglob('*.gpkg'))
-    Log.debug(
+    print(
         f"MERGE DISCOVERY | root {work_dir} |"
         f" gpkg_files {len(recursive_candidates)}",
+        flush=True,
     )
     for candidate in recursive_candidates[:5]:
-        Log.debug(f'MERGE INPUT | {candidate}')
+        print(f'MERGE INPUT | {candidate}', flush=True)
     if not tiles:
         raise FileNotFoundError(f"No .gpkg files found in: {work_dir}")
 
@@ -1628,9 +1671,10 @@ def merge_and_filter_tiled_results(
         try:
             written_layers = list(fiona.listlayers(written_gpkg))
         except Exception as exc:
-            Log.error(
+            print(
                 f"MERGE VERIFY FAIL | file {written_gpkg} "
                 f"| {type(exc).__name__}: {exc}",
+                flush=True,
             )
 
         final_stem_count = 0 if stems_gdf is None else len(stems_gdf)
@@ -1638,7 +1682,7 @@ def merge_and_filter_tiled_results(
         final_vector_count = 0 if vectors_gdf is None else len(vectors_gdf)
 
         print("")
-        print("MERGE SUMMARY (final result for this run)")
+        print("MERGE SUMMARY")
         print(f"Tiles processed:       {tile_count}")
         print(f"Total stems written:   {final_stem_count}")
         print(f"Total nodes written:   {final_node_count}")
@@ -1647,7 +1691,7 @@ def merge_and_filter_tiled_results(
         print(f"Output saved to: {written_gpkg}")
     else:
         print("")
-        print("MERGE SUMMARY (final result for this run)")
+        print("MERGE SUMMARY")
         print("Tiles processed:       0")
         print("Total stems written:   0")
         print("Total nodes written:   0")

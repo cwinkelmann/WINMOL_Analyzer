@@ -2,60 +2,30 @@ name: Create and release archive
 on:
   push:
     tags:
-      # Plugin releases only. The previous '*' trigger also fired for
-      # asset-only tags such as `models-onnx-v1`, which attached a plugin
-      # zip whose metadata.txt read `version=models-onnx-v1` — not a valid
-      # QGIS version. scripts/plugin_version.py rejects such tags too, so a
-      # stray `v`-prefixed non-version fails the build loudly rather than
-      # publishing a broken package.
-      - 'v*'
+      - '*'
 jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
-        with:
-          path: WINMOL_Analyzer
+      - uses: actions/checkout@v4
 
-      - name: Build the plugin package
-        # scripts/build_plugin_zip.sh is the single packaging path, shared
-        # with `make package`, so the local build and the released artifact
-        # cannot drift apart.
-        #
-        # Two names, one archive:
-        #   WINMOL_Analyzer-<version>.zip  — the versioned artifact, so a
-        #     download is identifiable on disk and two releases do not both
-        #     land as "...zip" and "...zip (1)".
-        #   WINMOL_Analyzer_QGIS_Plugin.zip — stable alias. The download
-        #     buttons in documentation/index.html point at
-        #     releases/latest/download/<name>, a permalink form that cannot
-        #     carry a version, so the historical name must keep resolving.
-        id: package
-        run: |
-          set -euo pipefail
-          cd WINMOL_Analyzer
-          VERSION="$(python3 scripts/plugin_version.py "$GITHUB_REF_NAME")"
-          ZIP="$(python3 scripts/plugin_version.py \
-            "$GITHUB_REF_NAME" --zip-name)"
-          bash scripts/build_plugin_zip.sh HEAD "../$ZIP" "$VERSION"
-          cp "../$ZIP" "../WINMOL_Analyzer_QGIS_Plugin.zip"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "artifacts=$ZIP,WINMOL_Analyzer_QGIS_Plugin.zip" \
-            >> "$GITHUB_OUTPUT"
+      # Same builder the "Build plugin ZIP" job runs on every PR, and the
+      # one tests/test_plugin_package.py asserts against. Releases used to
+      # do their own inline `zip -r` with a different exclude list, so what
+      # users installed was never the artifact CI validated.
+      # The version argument rewrites metadata.txt inside the archive.
+      - name: Build the plugin ZIP
+        run: >
+          bash scripts/build_plugin_zip.sh HEAD
+          WINMOL_Analyzer_QGIS_Plugin.zip "${GITHUB_REF_NAME#v}"
 
       - name: Upload Release
         uses: ncipollo/release-action@v1.12.0
         with:
-          artifacts: ${{ steps.package.outputs.artifacts }}
+          artifacts: "WINMOL_Analyzer_QGIS_Plugin.zip"
           allowUpdates: true
-          # Any hyphen-suffixed tag is a pre-release (semver: everything after
-          # the '-' is a pre-release identifier), e.g. v0.6.1-rc10. Without
-          # this the action defaults prerelease=false, so every rc grabbed the
-          # public "Latest" pointer — the download button in index.html reads
-          # releases/latest/download — until it was flipped back by hand. Final
-          # tags (v0.6.1, v0.6.0.2) have no hyphen, stay prerelease=false, and
-          # become Latest as intended.
+          # Every pre-1.0 tag so far is a candidate build (-rcN / -reimplN).
           prerelease: ${{ contains(github.ref_name, '-') }}
           token: ${{ secrets.GITHUB_TOKEN }}

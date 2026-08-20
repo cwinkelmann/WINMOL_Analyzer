@@ -4,13 +4,10 @@ from __future__ import annotations
 import os
 import sys
 
-# Determinism: the vector stage's connect_stems joins stems in an order that
-# depends on set-iteration of string-hashed Part objects (docs/CODE_REVIEW_2.md
-# A-4). Python salts string hashing per process, so WITHOUT a fixed seed the
-# SAME orthomosaic yields a slightly different number of stems on every run.
-# Pin the seed (as tests/generate_fixtures.py and tests/conftest.py already do)
-# by re-executing once with PYTHONHASHSEED=0 before anything hashes into a set.
-# '-u' is re-added so the plugin still gets unbuffered, line-streamed logs.
+# connect_stems joins stems in the set-iteration order of string-hashed Part
+# objects, which Python salts per process — so re-exec once with a pinned
+# PYTHONHASHSEED before anything hashes into a set ('-u' re-added to keep the
+# plugin's log stream unbuffered).
 if os.environ.get("PYTHONHASHSEED") != "0":
     os.environ["PYTHONHASHSEED"] = "0"
     os.execv(sys.executable, [sys.executable, "-u"] + sys.argv)
@@ -25,7 +22,6 @@ from classes.ExecutionPlan import build_execution_plan
 from classes.HardwareInfo import HardwareInfo
 from classes.Timer import Timer
 from utils import IO
-from utils import Log
 from utils import Skeletonization as Skel
 from utils import Vectorization as Vec
 from utils import Quantification as Quant
@@ -33,40 +29,30 @@ from utils.Tiling import build_tile_grid, meters_to_pixels
 
 VALID_PROCESS_TYPES = {'Stems', 'Trees', 'Nodes'}
 
-
-def _nvidia_driver_version():
-    """The installed NVIDIA driver version, or None when there is no NVIDIA
-    GPU. Absence is the normal case on macOS and CPU boxes, not an error."""
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=driver_version",
-             "--format=csv,noheader"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, check=False)
-    except Exception:
-        return None
-    if result.returncode != 0:
-        return None
-    first = result.stdout.strip().splitlines()
-    return first[0].strip() if first else None
+#: Providers that mean "a GPU/accelerator is available" — CUDA on NVIDIA,
+#: CoreML on Apple Silicon (Metal/ANE).
+_ACCELERATOR_PROVIDERS = ("CUDAExecutionProvider", "CoreMLExecutionProvider")
 
 
-def _force_cpu_only():
-    """Pin inference to the CPU for ``prediction_backend='cpu'``.
+def _cpu_stream_forces_onnx_cpu(prediction_backend, selected_providers):
+    """In cpu_stream mode, should the ONNX runtime be pinned to the CPU
+    provider?
 
-    onnxruntime reads WINMOL_ONNX_FORCE_CPU when the session is created, so
-    this MUST run before IO.load_model_from_path(). HardwareInfo.detect() has
-    already run by then, so the reported accelerator still describes the
-    machine rather than this override.
-    """
-    os.environ['WINMOL_ONNX_FORCE_CPU'] = '1'
-    print('Pinned inference to the CPU (WINMOL_ONNX_FORCE_CPU=1).')
+    cpu_stream is the single-device streaming path the planner picks when
+    there is no CUDA GPU. On Apple Silicon it is chosen for lack of CUDA,
+    but CoreML is still a real accelerator (18x faster than CPU here) and
+    must NOT be disabled. So force the CPU provider only when the user
+    explicitly asked for the ``cpu`` backend, or the machine offers no
+    accelerator at all (CUDA or CoreML)."""
+    if str(prediction_backend).lower() == "cpu":
+        return True
+    return not any(p in _ACCELERATOR_PROVIDERS for p in selected_providers)
 
 
 class ImageProcessing:
     def __init__(self, model_path, uav_path, stem_path,
                  trees_path, process_type):
-        print("Initializing WINMOL Analyzer")
+        print("Initialization")
         self.model_path = model_path
         self.uav_path = uav_path
         self.stem_path = stem_path
@@ -74,9 +60,6 @@ class ImageProcessing:
         self.process_type = process_type
         self.config = Config()
         self.apply_env_config_overrides()
-        # Resolve verbosity once the overrides are in, and export it so the
-        # spawned vector-tile workers inherit the same level.
-        Log.configure_from_config(self.config)
 
     def apply_env_config_overrides(self):
         raw = os.environ.get("WINMOL_CONFIG_OVERRIDES_JSON", "").strip()
@@ -106,29 +89,13 @@ class ImageProcessing:
 
     def detect_hardware(self):
         hardware = HardwareInfo.detect()
-        label = getattr(hardware, 'accelerator_label', None) or 'CPU'
-        if getattr(hardware, 'accelerator', 'cpu') == 'cpu':
-            label = 'CPU (no GPU acceleration available)'
         print(
-            f"Hardware detected: CPU cores={hardware.cpu_count}, "
+            f"Hardware detected: CPUs={hardware.cpu_count}, "
             f"RAM={hardware.total_ram_gb} GB, "
-            f"accelerator={label}"
+            f"GPUs={hardware.gpu_count}"
         )
-        # Only the NVIDIA path has per-device names worth listing.
-        if getattr(hardware, 'accelerator', 'cpu') == 'cuda' \
-                and hardware.gpu_names:
-            print(f"Visible GPUs: {hardware.gpu_names}")
-        # The RTX-4080 case: the GPU is right there, but the installed
-        # onnxruntime has no CUDA provider, so the run silently crawled on the
-        # CPU. Name the hardware and the remedy instead of staying quiet.
-        unusable = list(getattr(hardware, 'unusable_gpu_names', []) or [])
-        if unusable:
-            print(
-                f"WARNING: nvidia-smi reports {unusable} but this onnxruntime "
-                "build cannot use them (CPUExecutionProvider only), so "
-                "inference will run on the CPU. Install onnxruntime-gpu to "
-                "use them — see docs/GPU.md."
-            )
+        if hardware.gpu_names:
+            print("Visible GPUs:", hardware.gpu_names)
         return hardware
 
     def build_plan(self, hardware=None):
@@ -138,7 +105,7 @@ class ImageProcessing:
         plan = build_execution_plan(
             self.config, hardware, raster_info, self.process_type)
 
-        print("Execution plan:")
+        print('Execution plan:')
         print(f"  process_type     = {plan.process_type}")
         print(f"  prediction_mode  = {plan.prediction_mode}")
         print(f"  vector_mode      = {plan.vector_mode}")
@@ -154,14 +121,20 @@ class ImageProcessing:
         print(f"  producer_workers = {plan.producer_workers}")
         print(f"  progress_interval_s = {plan.progress_interval_s}")
         print(f"  est_pred_tiles   = {plan.estimated_prediction_tiles}")
+        # Say so when the planner overrode a configured value. These caps
+        # used to be silent, which is how a configured
+        # prediction_producer_workers_gpu=6 ran as 3, and the vector pool
+        # ran on 2 of 12 cores, without anyone noticing they were capped.
+        for note in getattr(plan, 'capped', None) or []:
+            print(f"  WARNING: {note}")
         self._apply_plan_to_config(plan, hardware)
         return plan
 
-    def _apply_plan_to_config(self, plan, hardware=None):
-        # Carry the detected hardware onto the config so the prediction phase
-        # can key its autotune cache on it without re-probing nvidia-smi.
-        if hardware is not None:
-            self.config.hardware = hardware
+    def _apply_plan_to_config(self, plan, hardware):
+        # Carry the detected hardware onto the config so the prediction
+        # phase can key its autotune cache on it without re-probing
+        # nvidia-smi.
+        self.config.hardware = hardware
         self.config.cpu_workers = (
             plan.vector_inner_workers
             if plan.vector_mode == 'tiled'
@@ -174,47 +147,6 @@ class ImageProcessing:
         self.config.producer_queue_batches = plan.producer_queue_batches
         self.config.prediction_producer_workers = plan.producer_workers
         self.config.progress_interval_s = plan.progress_interval_s
-
-    def _correct_accelerator_after_load(self, model):
-        """Reconcile the banner with the session that actually got built.
-
-        "Hardware detected: ..." is printed before the model is loaded, so it
-        can only state an EXPECTATION. Once onnxruntime has bound its
-        providers we know the truth; if it differs, say so and downgrade the
-        recorded hardware so nothing downstream keeps sizing a GPU run for a
-        CPU session.
-
-        When it MATCHES, say that too. The banner's "(expected; not yet
-        verified against a session)" is honest but leaves the log hedging
-        forever; one confirmation line here settles it using the observation
-        this hook already has, without a second provider check anywhere.
-        """
-        active_kind = getattr(model, 'accelerator', None)
-        if not active_kind:
-            return
-        hardware = getattr(self.config, 'hardware', None)
-        expected = getattr(hardware, 'accelerator', None) if hardware else None
-        if expected is None:
-            return
-        if active_kind == expected:
-            label = getattr(model, 'accelerator_label', active_kind)
-            print(f"Device confirmed: inference is running on {label} "
-                  "(verified against the loaded session).")
-            return
-        label = getattr(model, 'accelerator_label', active_kind)
-        expected_label = getattr(hardware, 'accelerator_label', expected)
-        print(
-            f"Correction: inference is running on {label} "
-            f"(expected {expected_label})."
-        )
-        hardware.accelerator = active_kind
-        hardware.accelerator_label = label
-        if active_kind == 'cpu':
-            if getattr(hardware, 'gpu_names', None):
-                hardware.unusable_gpu_names = list(hardware.gpu_names)
-            hardware.gpu_names = []
-            hardware.gpu_memory_gb = []
-            hardware.gpu_count = 0
 
     def run_prediction_phase(self, plan):
         if plan.prediction_mode == 'multi_gpu_stream' and plan.gpu_workers > 1:
@@ -234,14 +166,22 @@ class ImageProcessing:
         from utils import Prediction as Pred
 
         if plan.prediction_mode == 'cpu_stream':
-            # Before the model is loaded: the provider list is fixed when the
-            # onnxruntime session is created.
-            _force_cpu_only()
+            from utils.onnx_runtime import selected_providers
+            if _cpu_stream_forces_onnx_cpu(
+                    getattr(self.config, 'prediction_backend', 'auto'),
+                    selected_providers()):
+                os.environ["WINMOL_ONNX_FORCE_CPU"] = "1"
 
         print("\nLoading Model...")
-        model = IO.load_model_from_path(self.model_path)
-        self._correct_accelerator_after_load(model)
-        print("\nPerforming prediction with resampling (stream mode)...")
+        model = IO.load_model_from_path(self.model_path, self.config)
+        from utils.onnx_runtime import last_active_report
+        report = last_active_report()
+        if report:
+            print(
+                f"Execution providers (active): "
+                f"{report['active_providers']} "
+                f"(device: {report['accelerator_label']})")
+        print("\nPerforming Prediction with Resampling in stream mode...")
         profile = Pred.predict_stream_to_raster(
             self.uav_path,
             self.stem_path,
@@ -251,24 +191,18 @@ class ImageProcessing:
         return (None, profile, self.stem_path)
 
     def trees_processing(self, pred, profile):
-        print("\nFinding stem segments...")
+        print("\nFinding Stem Segments...")
         segments = Skel.find_segments(pred, self.config, profile)
-        print("\nRestoring geoinformation...")
+        print("\nRestoring Geoinformation...")
         segments = Vec.restore_geoinformation(segments, self.config, profile)
-        print("\nBuilding stem parts...")
+        print("\nBuilding Stem Parts...")
         stems = Vec.build_stem_parts(segments)
-        print("\nConnecting stem parts...")
+        print("\nConnecting Stem Parts...")
         stems = Vec.connect_stems(stems, self.config)
-        print("\nRebuilding end nodes...")
+        print("\nRebuilding End Nodes...")
         Vec.rebuild_endnodes_from_stems(stems)
-        print("\nQuantifying stems...")
+        print("\nQuantifying Stems...")
         stems = Quant.quantify_stems(stems, pred, profile, config=self.config)
-        # Un-tiled path: connect_stems ran once over the whole raster, so
-        # this count is the run's answer. The tiled path's answer is the
-        # merge stage's "Total stems written" instead.
-        print("")
-        print("STEM SUMMARY (final result for this run)")
-        print(f"Total stems:           {len(stems)}")
         return stems
 
     def run_vector_phase(self, plan, pred_path=None, pred=None, profile=None):
@@ -309,25 +243,12 @@ class ImageProcessing:
                     work_dir, f"{job.tile_id}_roi_stem_map.tif")
                 IO.write_tile_raster(pred_tile, tile_profile, tile_path)
                 tile_paths.append(tile_path)
-            vector_tile_px = int(plan.tile_inner_px) + 2 * int(halo_px)
             print(
                 f"Prepared {len(tile_paths)}/{len(jobs)} vector tiles "
                 f"with foreground | skipped_empty {skipped_tiles}"
             )
-            # A vector tile is a completely different unit from a
-            # prediction tile — inner 4096 px plus halo against ~727 px —
-            # and the log used to call both of them "tile". Standalone,
-            # unparsed line: run_progress.py keys off the "Prepared n/m"
-            # line above, which is untouched.
-            print(
-                f"VECTOR PHASE | {len(tile_paths)} vector tiles | "
-                f"~{vector_tile_px}x{vector_tile_px} px each (inner "
-                f"{int(plan.tile_inner_px)} + halo {int(halo_px)} per "
-                f"side, clipped at the raster edge)",
-                flush=True,
-            )
             if not tile_paths:
-                print("No foreground tiles found for the vector stage.")
+                print("No foreground tiles found for vector stage.")
                 return None
             from utils.VectorTilePipeline import process_prediction_tiles
 
@@ -337,7 +258,6 @@ class ImageProcessing:
                 self.process_type,
                 work_dir,
                 plan.cpu_workers,
-                tile_px=vector_tile_px,
             )
             merged = self.run_merge_phase(plan, work_dir)
             if plan.keep_temp:
@@ -346,11 +266,8 @@ class ImageProcessing:
                 shutil.rmtree(work_dir, ignore_errors=True)
             return merged
         except Exception:
-            # Never delete completed tile results on failure: they may
-            # represent hours of work and allow inspection/resume
-            # (docs/CODE_REVIEW_2.md A-15).
-            print(f"Vector phase failed; keeping tile work directory "
-                  f"for inspection: {work_dir}")
+            if not plan.keep_temp:
+                shutil.rmtree(work_dir, ignore_errors=True)
             raise
 
     def run_merge_phase(self, plan, work_dir):
@@ -361,8 +278,9 @@ class ImageProcessing:
             output_gpkg=out_path,
             edge_buffer_m=plan.tile_overlap_m,
             config=self.config,
-            # Pass the full stem-map extent so stems on the ortho's true outer
-            # boundary (corners) aren't trimmed by the interior-seam dedup.
+            # Pass the full stem-map extent so stems on the ortho's true
+            # outer boundary (corners) aren't trimmed by the interior-seam
+            # dedup.
             stem_map_path=self.stem_path,
         )
 
@@ -374,71 +292,42 @@ class ImageProcessing:
         return self.run_vector_phase(
             plan, pred_path=pred_path, pred=pred, profile=profile)
 
-    def report_runtime_env(self):
-        """Report the runtime that actually performs inference.
+    def check_DL_env(self):
+        def get_nvidia_driver_version():
+            try:
+                result = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=driver_version",
+                     "--format=csv,noheader"], stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=True)
+                if result.returncode == 0:
+                    print(
+                        f"NVIDIA GPU Driver Version: {result.stdout.strip()}")
+                else:
+                    print("Failed to retrieve NVIDIA driver version.")
+            except FileNotFoundError:
+                print("No NVIDIA GPU available or drivers not installed.")
 
-        Models are ONNX and run through onnxruntime; TensorFlow/CUDA versions
-        say nothing about that, and TensorFlow being absent is the normal,
-        expected state of the plugin environment (requirements/cpu.txt).
-        """
-        print("Environment:")
+        get_nvidia_driver_version()
         try:
-            from utils import onnx_runtime
-            report = onnx_runtime.runtime_report()
-        except Exception as exc:
-            print(f"  Inference runtime: onnxruntime unavailable ({exc})")
-            report = None
-
-        if report is not None:
-            print("  Inference runtime: onnxruntime "
-                  f"{report['onnxruntime_version']}")
-            print("  Available providers: "
-                  + ", ".join(report['available_providers']))
-            selected = "  Selected providers: " + ", ".join(
-                report['selected_providers'])
-            if report['override']:
-                selected += f" (forced by {report['override']})"
-            print(selected)
-            # Prefer the OBSERVED session over the requested list. A requested
-            # provider that failed to bind would otherwise be reported as the
-            # device, which is exactly the lie this guards against.
-            #
-            # Only trust the observation if it describes THIS provider
-            # request: a report left behind by a session built under a
-            # different configuration (batch runs load a model per image) says
-            # nothing about the run being reported now.
-            active = onnx_runtime.last_active_report()
-            if active is not None and (
-                    list(active.get('requested_providers') or [])
-                    != list(report['selected_providers'])):
-                active = None
-            if active is not None:
-                print("  Active providers: "
-                      + ", ".join(active['active_providers']))
-                print(f"  Device: {active['accelerator_label']} (verified)")
-            else:
-                print(f"  Device: {report['accelerator_label']} "
-                      "(expected; not yet verified against a session)")
-
-        driver = _nvidia_driver_version()
-        if driver:
-            print(f"  NVIDIA driver: {driver}")
+            import onnxruntime as ort
+            from utils.onnx_runtime import selected_providers
+            print("ONNX Runtime version:", ort.__version__)
+            print("Available execution providers:",
+                  ort.get_available_providers())
+            print("Selected execution providers:", selected_providers())
+        except Exception as e:
+            print("ONNX Runtime error: ", e)
 
     def display_starting_text(self, plan=None):
-        if plan is not None and plan.prediction_mode == 'multi_gpu_stream':
-            print(
-                "Skipping parent runtime initialization "
-                "for worker-local multi-GPU mode."
-            )
-        else:
-            self.report_runtime_env()
+        print("Check CUDA environment")
+        self.check_DL_env()
         print("Command-line arguments:")
-        print(f"Model path: {self.model_path}")
-        print(f"Image path: {self.uav_path}")
-        print(f"Semantic stem map path: {self.stem_path}")
-        print(f"Process type: {self.process_type}")
+        print("Model Path:", self.model_path)
+        print("Image Path:", self.uav_path)
+        print("Semantic Stem Map Path:", self.stem_path)
+        print("Process type:", self.process_type)
         if self.trees_path:
-            print(f"Detected wind-thrown trees path: {self.trees_path}")
+            print("Detected Wind-thrown Trees Path:", self.trees_path)
         self.config.display()
 
     def main(self):
@@ -451,6 +340,8 @@ class ImageProcessing:
 
 
 if __name__ == '__main__':
+    print(f"Determinism: PYTHONHASHSEED={os.environ.get('PYTHONHASHSEED')}",
+          flush=True)
     if len(sys.argv) != 6:
         print("""Usage:
             python3 -u winmol_run.py <model_path> <input_tiff> <stem_map_tiff>
@@ -460,6 +351,7 @@ if __name__ == '__main__':
 
     tt = Timer()
     tt.start()
+    print("Start timer")
     model_path = str(sys.argv[1])
     uav_path = str(sys.argv[2])
     stem_path = str(sys.argv[3])
@@ -482,4 +374,5 @@ if __name__ == '__main__':
     else:
         image_processor.run_tree_pipeline(plan)
 
-    print(f"Total runtime: {tt.stop():.1f} s")
+    print("Stop timer")
+    tt.stop()

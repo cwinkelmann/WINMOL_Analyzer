@@ -15,7 +15,6 @@ from utils.IO import (
     write_all_layers_to_gpkg,
     write_stems_to_gpkg,
 )
-from utils import Log
 import utils.Quantification as Quant
 import utils.Skeletonization as Skel
 import utils.Vectorization as Vec
@@ -78,7 +77,7 @@ def _vector_summary(
     timings,
     output_path,
 ):
-    Log.debug(
+    print(
         f'VECTOR TILE {tile_label} | fg {fg_count} | segments '
         f'{segment_count} | stems {stem_count} | skel '
         f'{timings["skel_s"]:.3f}s restore {timings["restore_s"]:.3f}s '
@@ -159,10 +158,7 @@ def _run_vector_pipeline(
         )
 
     t0 = time.perf_counter()
-    # Name the tile so connect_stems' counts read as per-tile
-    # intermediates: this runs once per tile, and the run's answer is
-    # the merge stage's "Total stems written".
-    stems = Vec.connect_stems(stems, config, scope=f'Tile {tile_label}')
+    stems = Vec.connect_stems(stems, config)
     timings['connect_s'] = time.perf_counter() - t0
     if not stems:
         timings['total_s'] = time.perf_counter() - total_t0
@@ -220,9 +216,10 @@ def _run_vector_pipeline(
     timings['write_s'] = time.perf_counter() - t0
     timings['total_s'] = time.perf_counter() - total_t0
     output_exists = bool(output_path) and os.path.exists(output_path)
-    Log.debug(
+    print(
         f'VECTOR TILE {tile_label} | output_exists {output_exists} | path '
         f'{output_path}',
+        flush=True,
     )
 
     if bool(getattr(config, 'vector_summary_log', True)):
@@ -281,7 +278,6 @@ def process_prediction_array_to_gpkg(
             pass
     config.cpu_workers = 1
     config.vector_tile_workers = 1
-    Log.configure_from_config(config)
 
     pred = np.asarray(pred_arr)
     if pred.size == 0 or not np.any(pred >= 1):
@@ -306,9 +302,6 @@ def process_prediction_tile(
     process_type: str,
     output_prefix: str,
 ):
-    # Pool workers are spawned on macOS: re-derive the level from the env
-    # (exported by Log.configure_from_config) and the tile's config copy.
-    Log.configure_from_config(config)
     pred, profile = load_stem_map(pred_tile_path)
     pred_arr = np.asarray(pred)
     if pred_arr.size == 0 or not np.any(pred_arr >= 1):
@@ -383,20 +376,7 @@ def _update_progress_totals(totals, result):
     totals['timed_tiles'] += 1
 
 
-def _vector_tile_size_text(tile_px):
-    """'vector tile 4144x4144 px' — or the bare unit when the caller did
-    not pass a size (the batch/notebook paths call this module directly).
-
-    Naming the unit matters: a run prints hundreds of 727x727 PREDICTION
-    tiles and then a handful of these, which are ~5x wider per side and
-    ~30x the area, and the old log called both of them "tile".
-    """
-    if not tile_px:
-        return 'vector tile'
-    return f'vector tile ~{int(tile_px)}x{int(tile_px)} px'
-
-
-def _print_vector_progress(done, total, start, totals, tile_px=None):
+def _print_vector_progress(done, total, start, totals):
     now = time.monotonic()
     elapsed = max(now - start, 1e-9)
     rate = done / elapsed
@@ -406,8 +386,7 @@ def _print_vector_progress(done, total, start, totals, tile_px=None):
     avg_quant = totals['quant_s'] / timed_tiles
     avg_connect = totals['connect_s'] / timed_tiles
     print(
-        f'Vector tiles {done}/{total} | {_vector_tile_size_text(tile_px)}'
-        f' | {done / total:.1%} | '
+        f'Vector tiles {done}/{total} | {done / total:.1%} | '
         f'{rate * 60:.1f} tiles/min | ETA {_format_eta(eta_s)} | wrote '
         f'{totals["written_tiles"]} | empty {totals["empty_tiles"]} | '
         f'no_output {totals["no_output_tiles"]} | avg total '
@@ -434,10 +413,8 @@ def _print_vector_summary(
     print(f'Tiles with foreground: {total - totals["empty_tiles"]}')
     print(f'Tiles written:         {totals["written_tiles"]}')
     print(f'Tiles without output:  {totals["no_output_tiles"]}')
-    print(f'Segments (all tiles):  {totals["segment_count"]}')
-    # Summed over tiles, before the merge stage dedups across seams --
-    # so this is not the run's stem count. See "Total stems written".
-    print(f'Stems before merge:    {totals["stem_count"]}')
+    print(f'Total segments:        {totals["segment_count"]}')
+    print(f'Total stems:           {totals["stem_count"]}')
     print(f'Elapsed:               {elapsed:.3f}s')
     print(
         f'Avg timed tile:        {totals["total_s"] / timed_tiles:.3f}s '
@@ -452,17 +429,7 @@ def process_prediction_tiles(
     process_type: str,
     output_dir: str,
     cpu_workers: int,
-    tile_px: int = None,
 ):
-    """Vectorize each prediction tile.
-
-    ``tile_px`` is the nominal edge length in pixels of ONE vector tile
-    (inner tile + halo on both sides), threaded down from the caller
-    purely so the progress lines can say how big these tiles are — the
-    orchestrator already knows it, and reading it back off the rasters
-    here would mean an extra open per tile. Optional: callers that do
-    not know it (notebook/batch) just get the unit name.
-    """
     os.makedirs(output_dir, exist_ok=True)
     total_workers = max(
         1,
@@ -493,15 +460,12 @@ def process_prediction_tiles(
         tasks.append((pred_tile_path, tile_cfg, process_type, output_prefix))
 
     if not tasks:
-        print('Vector tiles 0/0 | '
-              + _vector_tile_size_text(tile_px)
-              + ' | no foreground tiles queued', flush=True)
+        print('Vector tiles 0/0 | no foreground tiles queued', flush=True)
         return []
 
-    size_note = f' | ~{int(tile_px)}x{int(tile_px)} px each' if tile_px else ''
     print(
-        f'VECTOR PHASE | {len(tasks)} vector tiles{size_note} | '
-        f'tile_workers {tile_workers} | inner_workers {inner_workers}',
+        f'Running vector stage on {len(tasks)} tile(s) | tile_workers '
+        f'{tile_workers} | inner_workers {inner_workers}',
         flush=True,
     )
 
@@ -517,8 +481,7 @@ def process_prediction_tiles(
             _update_progress_totals(totals, result)
             now = time.monotonic()
             if idx == len(tasks) or (now - last_report) >= progress_interval_s:
-                _print_vector_progress(
-                    idx, len(tasks), start, totals, tile_px)
+                _print_vector_progress(idx, len(tasks), start, totals)
                 last_report = now
         _print_vector_summary(
             len(tasks),
@@ -538,8 +501,7 @@ def process_prediction_tiles(
             _update_progress_totals(totals, result)
             now = time.monotonic()
             if idx == len(tasks) or (now - last_report) >= progress_interval_s:
-                _print_vector_progress(
-                    idx, len(tasks), start, totals, tile_px)
+                _print_vector_progress(idx, len(tasks), start, totals)
                 last_report = now
 
     _print_vector_summary(

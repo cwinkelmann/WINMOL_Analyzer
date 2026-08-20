@@ -20,87 +20,38 @@ class Config(object):
     prediction_batch_cpu = 1
     prediction_batch_gpu = 4
     prediction_batch_max_gpu = 16
-    # Separate ceiling for a cpu_stream plan. It used to share
-    # prediction_batch_max_gpu, so a 4-core CPU box swept b1..b16 -- 16
-    # candidates before the first tile was written.
-    prediction_batch_max_cpu = 8
     prediction_batch_multi_gpu = 12     # local per-worker batch
-    # Manual pin, in tiles. None (or 0) = let the planner size the batch and
-    # let the autotune refine it. Any value >= 1 is used verbatim by
-    # build_execution_plan and skips the autotune completely -- the escape
-    # hatch for "just use this and start working". Exposed in the QGIS plugin
-    # as Detection -> Prediction batch size, and settable from the CLI with
-    # WINMOL_CONFIG_OVERRIDES_JSON='{"prediction_batch_override": 4}'.
-    # NOTE: prediction_batch_size below is planner-owned and overwritten on
-    # every run, so it can never serve as the pin.
-    prediction_batch_override = None
     # Tri-state, resolved by plugin_utils.autotune_cache.resolve_mode():
-    #   "auto"  -- use the persisted result if one matches this device+model,
-    #              otherwise tune ONCE and save it (the default).
-    #   False   -- never tune. Pin this for benchmarks and determinism runs.
-    #   True    -- tune on every run and refresh the cache (force a re-tune).
-    # Tuning costs real time before the first tile is written, and on
-    # Apple/CoreML each distinct batch size forces a model recompile. Worth
-    # paying once per device+model, never worth paying every run -- hence the
-    # cache. $WINMOL_BATCH_AUTOTUNE (off|auto|force) overrides this without
-    # touching config.
+    # "auto" tunes ONCE per (hardware, model, execution provider, tile
+    # geometry) and reuses the persisted answer from then on; True/"force"
+    # always re-sweeps and refreshes the cache entry; False/"off" never
+    # sweeps. $WINMOL_BATCH_AUTOTUNE overrides this attribute.
+    # Precedence in utils.Prediction._autotune_batch_size:
+    # prediction_batch_override > $WINMOL_BATCH_AUTOTUNE (or this attribute)
+    # == "off" > a cache hit in range > sweep (then persist to the cache).
     prediction_batch_autotune = "auto"
-    # --- how the sweep is bounded (safety first) ---
-    # The sweep is capped by FREE memory before anything is timed: never ask
-    # for more than this share of what is actually free right now. A user's
-    # Linux box was taken down by the old unbounded sweep marching towards
-    # b16 while six producer threads held prefetched tiles -- host RAM
-    # exhaustion raises no exception, it just swaps until the OOM killer
-    # fires. 0.6 leaves headroom for exactly those neighbours.
-    prediction_batch_autotune_memory_fraction = 0.6
-    # Device bytes per tile ~= img_h * img_w * (channels + classes) * 4 bytes
-    # * this factor. Measured with the Spruce ONNX model on the CPU EP:
-    # ~113 MB of working set per tile at b8 against a 4.19 MB raw tensor,
-    # i.e. ~28x. 32 is that, rounded up.
-    prediction_batch_autotune_activation_factor = 32
-    # Hard cap on how many candidates may be timed, whatever the memory
-    # ceiling allows.
-    prediction_batch_autotune_max_candidates = 6
-    # --- when the sweep stops ---
-    prediction_batch_autotune_patience = 2
-    prediction_batch_autotune_repeats = 3
-    # A candidate counts as an improvement only if it is faster by BOTH a
-    # relative margin and an absolute one. The absolute bar is what stops the
-    # sweep chasing 3 ms differences: 0.337 vs 0.340 s/tile is noise, not a
-    # reason to time another batch size.
-    prediction_batch_autotune_min_improve = 0.005      # fraction
-    prediction_batch_autotune_min_improve_s = 0.2      # seconds per tile
-    # Abort immediately (regardless of patience) once a candidate is this
-    # much slower than the best seen. Past the memory cliff the times explode
-    # -- b7=0.471 then b9=1.135 against a best of 0.340 -- and marching on is
-    # exactly what preceded the crash. 1.25 sits above run-to-run jitter
-    # (~3 %) and well below the first real cliff (1.4x).
-    prediction_batch_autotune_degrade_factor = 1.25
+    prediction_batch_autotune_patience = 4
+    prediction_batch_autotune_repeats = 5
+    prediction_batch_autotune_min_improve = 0.005
+    # Absolute floor a candidate must beat (in addition to the relative
+    # min_improve above) to count as progress -- kills jitter-chasing where
+    # e.g. 0.337 vs 0.340 s/tile is noise, not a real win.
+    prediction_batch_autotune_min_improve_s = 0.2
     prediction_batch_autotune_stop_on_oom = True
     prediction_batch_autotune_quiet = True
-    # Abandon the sweep as soon as a candidate is this much slower than the
-    # best seen. `patience` alone is not enough when the curve degrades
-    # monotonically: on CoreML/CPU every larger batch is worse AND costs more
-    # to measure, so patience=4 keeps timing ever more expensive losers (a
-    # user reported b4..b9 rising 0.340 -> 1.135 s/tile without stopping).
-    # 0 disables the guard.
-    prediction_batch_autotune_runaway_factor = 1.5
-    # CoreML (Apple Silicon) prices batching differently from CUDA, which
-    # scales with batch size. Re-measured 2026-07-22 on the file the plugin
-    # now actually loads there -- the fp32 Spruce_Deadwood build, since
-    # CoreML's device default was changed from fp16 to fp32 (fp16 is 14.6x
-    # slower on that provider; see plugin_utils/model_registry) -- on an M2,
-    # onnxruntime 1.27:
-    #   b1 0.184  b2 0.172  b4 0.183  s/image
-    # Per-image cost is FLAT to ~7% here, with b2 marginally best; the
-    # earlier table in this comment (b1 0.228 ... b8 0.498, rising
-    # monotonically) was taken on a different model and no longer describes
-    # the shipped path. The cap stays 2 because 2 is the measured optimum
-    # and it keeps the memory-derived default (4-8) out of the flat-to-worse
-    # regime, not because batching is inherently harmful here.
-    # Batch size does not affect output (verified: max abs diff 0.0 b1/b4/b8),
-    # so this is a pure throughput cap. Set None to disable.
-    prediction_batch_max_coreml = 2
+    # Share of FREE memory (host RAM, or free VRAM when CUDA is the active
+    # provider) the sweep is allowed to spend; the rest is headroom for
+    # everything else already resident (OS, raster reader, model runtime).
+    prediction_batch_autotune_memory_fraction = 0.6
+    # Fudge factor over the raw tensor bytes (H*W*(C+classes)*4) to account
+    # for activations/workspace the runtime allocates per tile.
+    prediction_batch_autotune_activation_factor = 32
+    # Manual escape hatch: set to an int >= 1 to pin the prediction
+    # micro-batch verbatim and skip the autotune sweep entirely (no probing,
+    # no timing). None/0 = off (the sweep runs as usual). Env-overridable
+    # via WINMOL_CONFIG_OVERRIDES_JSON, e.g.
+    # WINMOL_CONFIG_OVERRIDES_JSON='{"prediction_batch_override": 4}'.
+    prediction_batch_override = None
     progress_interval_s_cpu = 45.0
     progress_interval_s_gpu = 60.0
     progress_interval_s_multi_gpu = 20.0
@@ -108,14 +59,55 @@ class Config(object):
     multi_gpu_cpu_workers = 48
 
     # runtime state populated by planner
-    # The detected HardwareInfo, so downstream code (e.g. the autotune cache
-    # key) can see the GPUs without re-probing nvidia-smi. Not a user knob.
+    # The detected HardwareInfo, so downstream code (e.g. the autotune
+    # cache) can key on it without re-probing nvidia-smi.
     hardware = None
     cpu_workers = None
     gpu_workers = None
     vector_mode = 'none'
     vector_tile_workers = 1
-    max_vector_tile_workers = 4
+    # Ceiling on the vector-phase process pool. NOTE: on a large ortho the
+    # VECTOR phase, not prediction, is the run. Measured end-to-end on
+    # Tegel Revier_13 (392558x335327 px, 1512 vector tiles): prediction
+    # 23.5 min, vector 65.0 min -- 73% of an 88.5 min run. Barnekow: 88%.
+    #
+    # Two caps compound, both in ExecutionPlan._vector_worker_split:
+    #
+    #   tile_workers = min(max_vector_tile_workers,
+    #                      max(1, cpu_workers // 4), tiles)
+    #   return max(1, tile_workers), 1        # inner forced to 1
+    #
+    #   * `cpu_workers // 4` divides the budget by four to leave room for
+    #     inner workers -- but that same branch pins inner workers to 1,
+    #     so it reserves cores for parallelism it never creates. On a
+    #     12-core box (cpu_workers=11) the result is 2.
+    #   * this ceiling is absolute: a 64-core machine still gets 4.
+    #
+    # Scaling from the measured 65 min on 2 workers:
+    #   2 -> 65 min | 4 -> ~33 min | 8 -> ~16 min | 10 -> ~13 min
+    #
+    # Size the pool from PRIVATE memory, not RSS. Measured per worker with
+    # smaps_rollup on a live vector phase:
+    #   RSS 2734 MB | Shared_Dirty 1257 MB | Private_Dirty 1381 MB
+    # The Shared_Dirty half is copy-on-write state inherited from the
+    # parent at fork -- shared with the parent and every sibling, so it
+    # costs physical RAM ONCE, not per worker. Sizing off RSS triple-counts
+    # it and starves the pool. Real marginal cost is ~1.4 GB/worker, so a
+    # 46 GB box fits 8-11 workers comfortably.
+    #
+    # Pre-existing, not a reimplementation regression: the old formula is
+    # identical in origin/main and v0.5.0 (both from b5e98eb).
+    max_vector_tile_workers = 16
+
+    # Private resident bytes to budget per vector tile worker; the planner
+    # divides free RAM by this. Raise it if the vector phase swaps on
+    # unusually dense orthos, lower it to pack more workers in.
+    vector_worker_bytes = None      # None -> ExecutionPlan measured default
+
+    # Fraction of TOTAL RAM the vector pool may budget for itself. Used as
+    # a stable floor because the plan is built at startup, when free RAM is
+    # unrepresentative of the vector phase.
+    vector_ram_fraction = 0.4
     prediction_batch_size = None
     prediction_producer_workers = None
     progress_interval_s = 30.0
@@ -126,12 +118,6 @@ class Config(object):
     compress_output = True
 
     # logging / diagnostics
-    # log_level drives utils/Log.py: 'quiet' (warnings/errors only),
-    # 'normal' (phases, progress, summaries, results) or 'debug' (adds the
-    # per-tile MERGE/VECTOR diagnostics). Overridable per run through
-    # WINMOL_LOG_LEVEL / WINMOL_VERBOSE=1, which also survive the spawned
-    # vector-tile pool. vector_debug=True still implies 'debug'.
-    log_level = "normal"                 # quiet | normal | debug
     prediction_tile_log = True
     vector_debug = False
     vector_summary_log = True
@@ -143,13 +129,13 @@ class Config(object):
     img_bit = 8
     n_channels = 3
     num_classes = 1
-    # Replace nodata / out-of-bounds pixels with the nearest valid pixel
-    # BEFORE inference, so the U-Net never sees a hard black boundary cliff
-    # and cannot bleed spurious stems onto valid edge pixels. Output is still
-    # masked afterwards. See
-    # docs/superpowers/specs/2026-07-28-segmentation-edge-fill-design.md.
-    fill_invalid_before_prediction = True
     overlap_pred = 8
+    # Feature flag: which tile-read/resample implementation streams tiles
+    # onto the model grid. The choice changes PIXELS, not just speed —
+    # strategy semantics, measured deltas and the WINMOL_BENCH_READ
+    # override live with `_READ_STRATEGIES` in utils/Prediction.py and in
+    # docs/resize-mechanics.md. `graph` is v0.5.0-equivalent, the default.
+    prediction_read_strategy = "graph"
 
     # binary stem-map prediction
     stem_map_binary = True

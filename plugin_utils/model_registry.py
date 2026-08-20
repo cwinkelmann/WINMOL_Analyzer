@@ -1,59 +1,35 @@
-"""WINMOL model registry: load, resolve, and fetch segmentation models.
+"""WINMOL model registry: load, resolve, and fetch ONNX segmentation
+models from ``config.json``.
 
-The single source of truth is ``config.json`` (repo root; shipped inside
-the QGIS plugin). Two shapes are accepted:
+Two shapes are accepted:
 
-* **schema v2** — ``{"schema": 2, "families": {...}, "models": {...}}``.
-  Each model entry carries a stable id, a human-readable label and
-  description, its download URL, the mandatory on-disk ``file`` name
-  (always the URL basename), an optional checksum (``sha256`` for the
-  model-zoo assets, ``md5`` for the Zenodo HDF5 originals), and metadata
-  (family, backend, precision, F1, size). Families group precision
-  variants of one trained model and name the one to use per device
-  class: ``cpu`` (int8), ``gpu`` (fp16, CUDA) and ``coreml`` (fp32 —
-  fp16 is 14.6x slower on Apple's execution provider, measured; see
-  ``Registry._device_variant``). An absent key means "keep the fp32
-  reference", so ``coreml`` is optional and old registries still load.
+* **schema v2** — ``{"schema": 2, "gui_default": ..., "recommended": [...],
+  "families": {fid: {"label", "default"}}, "models": {mid: {"label",
+  "family", "precision", "url", "file", "sha256", "size_mb"}}}``. A
+  family names only its fp32 default entry; the device-appropriate
+  variant (cpu->int8, gpu->fp16, coreml->fp32) is found among the
+  family's other entries by matching ``precision``, falling back to the
+  family default when no such variant exists.
 * **legacy v1** — a flat ``{"Name": "https://...url"}`` map, normalized
-  into equivalent entries (installer-compatible ``<Name><ext>`` file
-  naming, no checksums).
+  into minimal entries (no family, no checksum).
 
-Sources of the shipped registry:
-* Model zoo: the ``models-v1`` release of cwinkelmann/WINMOL_segmentor_pt
-  (sha256-pinned ONNX). This now includes the classic four
-  (General/Beech/Spruce/Spruce_Deadwood), which were repointed from the
-  older, unchecksummed ``models-onnx-v1`` release of
-  cwinkelmann/WINMOL_Analyzer to the numerically-identical, pinned
-  conversions of the same Keras weights. ONNX contract for all of them:
-  input [batch,3,512,512] float32 in [0,1] NCHW, output
-  [batch,1,512,512], sigmoid baked in, opset 17, dynamic batch — loads
-  unchanged through utils/onnx_runtime.OnnxSegmenter.
-* Originals: Zenodo record 15907576 (DOI 10.5281/zenodo.15907576), the
-  four Keras .hdf5 (374 MB each, md5-pinned, need TensorFlow).
-
-Every shipped entry is digest-pinned (sha256, or md5 for the Zenodo
-originals); ``Registry.unpinned()`` reports any that are not and a test
-guards the property.
-
-Import-safe off QGIS: stdlib only, no Qt/QGIS imports (same contract as
-installer.py) — unit-testable and usable from the batch CLI.
+Import-safe off QGIS: stdlib only, no Qt/QGIS imports — unit-testable
+and usable from the batch CLI.
 """
 
 import hashlib
 import json
 import os
 import platform
-import subprocess
+import sys
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-#: Reserved by the GUI as the "pick your own file" escape hatch.
-RESERVED_IDS = ("Custom",)
-#: Per-model-dir memo of verified digests (avoid re-hashing 374 MB files).
-VERIFIED_CACHE = ".winmol_verified.json"
+from .gpu_probe import run_nvidia_smi_query
 
 _CHUNK_BYTES = 1024 * 1024
-_DEVICE_PROBE_CACHE = {}
+#: device -> the precision its family variant must carry.
+_DEVICE_PRECISION = {"cpu": "int8", "gpu": "fp16", "coreml": "fp32"}
 
 
 class ModelDownloadError(RuntimeError):
@@ -68,26 +44,25 @@ class ModelDownloadError(RuntimeError):
 
 @dataclass(frozen=True)
 class ModelEntry:
-    """One downloadable model. ``file`` is the on-disk filename used by
-    BOTH the QGIS plugin (<plugin>/models/) and the batch CLI
-    (--model-dir); for v2 entries it equals the URL basename."""
+    """One downloadable model; ``file`` is the shared on-disk name used
+    by both the plugin's models dir and the batch CLI's --model-dir."""
 
     id: str
     label: str
     url: str
     file: str
-    description: str = ""
     family: str = ""
-    backend: str = "any"          # "any" | "cpu" | "gpu"
-    precision: str = "fp32"       # "fp32" | "fp16" | "int8"
-    format: str = "onnx"          # "onnx" | "hdf5"
+    precision: str = "fp32"
     sha256: Optional[str] = None
-    md5: Optional[str] = None
     size_mb: Optional[float] = None
-    f1: Optional[float] = None
+    #: Certified to reproduce the fp32 reference's results. Gates the
+    #: ``variant="auto"`` (lossless-only) resolution rule; an fp32
+    #: reference is lossless by definition, quantised builds only when
+    #: the registry says so.
     lossless: bool = True
+    #: Never shown in choosers (forward-compat with registries that
+    #: carry non-runnable formats, e.g. the TensorFlow .hdf5 originals).
     hidden: bool = False
-    tile_px: int = 512
 
 
 @dataclass
@@ -96,223 +71,138 @@ class Family:
 
     id: str
     label: str
-    default: str                  # entry id (fp32 reference)
-    cpu: Optional[str] = None     # entry id of the int8/CPU variant
-    gpu: Optional[str] = None     # entry id of the fp16/GPU variant
-    #: Entry id for Apple Silicon (CoreML). A separate device class
-    #: because fp16 -- right on CUDA -- is pathological on CoreML; see
-    #: :meth:`Registry._device_variant`. Defaults to the family's fp32
-    #: reference when config.json declares none.
-    coreml: Optional[str] = None
+    default: str    # entry id of the fp32 reference
 
 
 class Registry:
     """Parsed model registry: entries, families, and resolution rules."""
 
     def __init__(self, entries, families=None, schema=1,
-                 gui_default=None, preload=None, tile_px=512,
-                 recommended=None):
+                 gui_default=None, recommended=None):
         self.entries: Dict[str, ModelEntry] = dict(entries)
         self.families: Dict[str, Family] = dict(families or {})
         self.schema = schema
         self.gui_default = gui_default
-        self.preload: List[str] = list(preload or [])
-        self.tile_px = tile_px
         #: Ranked entry ids, best first; recommended[0] == gui_default.
         self.recommended: List[str] = list(recommended or [])
         self._entry_lookup = {k.lower(): k for k in self.entries}
         self._family_lookup = {k.lower(): k for k in self.families}
+        #: family id -> {precision: entry id}, for _device_variant.
+        self._by_family_precision: Dict[str, Dict[str, str]] = {}
+        for e in self.entries.values():
+            if e.family:
+                self._by_family_precision.setdefault(
+                    e.family, {})[e.precision] = e.id
 
     def get(self, name) -> ModelEntry:
-        """Entry by id, case-insensitive. KeyError names the visible
-        ids (the lowercase-name guarantee winmol_batch relies on)."""
+        """Entry by id, case-insensitive. KeyError names the known ids."""
         key = str(name).strip().lower()
         canonical = self._entry_lookup.get(key)
         if canonical is None:
-            known = ", ".join(sorted(
-                e.id for e in self.visible()) or sorted(self.entries))
-            raise KeyError(
-                f"unknown model {name!r}; known models: {known}")
+            known = ", ".join(sorted(self.entries))
+            raise KeyError(f"unknown model {name!r}; known models: {known}")
         return self.entries[canonical]
 
-    def _device_variant(self, fam, device) -> Optional[ModelEntry]:
-        """The family's variant for ``device``, or None when the family
-        declares none (callers then keep the family's fp32 default).
+    def _family_precision_entry(self, fam, precision):
+        """``fam``'s entry carrying ``precision``, or None."""
+        eid = self._by_family_precision.get(fam.id, {}).get(precision)
+        return self.entries[eid] if eid else None
 
-        The rule, one device class per line:
+    def _device_variant(self, fam, device) -> ModelEntry:
+        """``fam``'s entry whose precision matches ``device``'s rule
+        (cpu->int8, gpu->fp16, coreml->fp32), else ``fam``'s default."""
+        precision = _DEVICE_PRECISION.get(device)
+        entry = (self._family_precision_entry(fam, precision)
+                 if precision else None)
+        return entry if entry else self.entries[fam.default]
 
-        * ``cpu``    -> int8   (small download, AVX-VNNI fast)
-        * ``gpu``    -> fp16   (CUDA tensor cores)
-        * ``coreml`` -> fp32   (Apple Silicon; the family default when
-          the family names no coreml entry)
+    def resolve(self, name, device=None, variant=None) -> ModelEntry:
+        """Resolve a model or family id to a concrete entry.
 
-        CoreML is deliberately NOT folded into "gpu". It is a GPU by
-        every other measure -- HardwareInfo reports accelerator 'coreml'
-        with gpu_count 1 -- but fp16 is pathological on that execution
-        provider: measured on an M2 (onnxruntime 1.27, Spruce_Deadwood,
-        batch 2) fp16/CoreML costs 2735 ms per image against 187 ms for
-        fp32/CoreML, a 14.6x penalty, and is even slower than the same
-        fp16 model on the CPU provider (2268 ms). It is not a silent
-        fallback either: CoreML reports 69 of 74 nodes supported and
-        still runs that slowly. End to end on a 182-tile orthomosaic the
-        same run took 429.8 s on fp16 against 61.2 s on fp32.
+        An explicit entry id is returned as-is — neither ``device`` nor
+        ``variant`` ever rewrites it. A family id resolves by
+        ``variant``:
 
-        The ONE place the device->variant rule lives: both
-        ``resolve(variant="default")`` and :meth:`default_entry` go
-        through it, so the two APIs cannot answer "what runs on this
-        machine" differently again.
-        """
-        if device == "cpu":
-            cand_id = fam.cpu
-        elif device == "coreml":
-            # ``or fam.default``: on CoreML the fp32 reference is the
-            # measured-best of the three precisions (fp32 0.172 s/image,
-            # int8 0.594, fp16 2.268), so a family that declares no
-            # coreml entry must land on fp32 -- NOT on the registry's
-            # declared int8 default, which is a CPU-size/speed decision.
-            # That makes the config.json key documentation and an
-            # override point rather than the thing holding the rule up.
-            cand_id = fam.coreml or fam.default
-        else:
-            cand_id = fam.gpu
-        return self.entries.get(cand_id) if cand_id else None
+        * ``None`` / ``"default"`` — the device rule (cpu->int8,
+          gpu->fp16, coreml->fp32, see ``_device_variant``), falling
+          back to the family default. Unchanged legacy behavior.
+        * ``"auto"`` — lossless-only: the device variant is substituted
+          ONLY when it is certified lossless (``ModelEntry.lossless``),
+          otherwise the fp32 family default — results stay identical to
+          the published reference.
+        * ``"fp32"``/``"int8"``/``"fp16"`` — that precision within the
+          family; KeyError (naming the family and what it does provide)
+          when the family lacks it.
 
-    def resolve(self, name, device="auto", variant="auto") -> ModelEntry:
-        """Resolve a model or family name to a concrete entry.
-
-        * An explicit entry id is returned as-is — never rewritten by
-          ``variant``/``device`` (so "General" always means the fp32
-          GenDS model, exactly as before the registry existed).
-        * A family id picks the family default; with ``variant="auto"``
-          the device variant (cpu->int8, gpu->fp16, coreml->fp32) is
-          substituted ONLY when that variant is certified lossless,
-          keeping results stable. ``variant="default"`` takes the
-          device variant
-          WITHOUT that gate — it is the machine's declared default, the
-          same rule :meth:`default_entry` applies, and it is what the
-          GUI opens on. A forced variant ("fp32"/"int8"/"fp16") selects
-          that variant or raises ValueError if the family lacks it.
-
-        Precedence (family ids like "unet_pt" collide case-insensitively
-        with entry ids like "UNet_PT"): exact entry id, exact family id,
-        then case-insensitive entry, then case-insensitive family.
+        ``device`` ``None``/``"auto"`` probes the machine. Lookup
+        order: exact entry id, exact family id, case-insensitive
+        entry, case-insensitive family.
         """
         name_s = str(name).strip()
         if name_s in self.entries:
             return self.entries[name_s]
-        if name_s in self.families:
-            fam = self.families[name_s]
-        else:
+        fam = self.families.get(name_s)
+        if fam is None:
             key = name_s.lower()
-            canonical = self._entry_lookup.get(key)
-            if canonical is not None:
-                return self.entries[canonical]
+            if key in self._entry_lookup:
+                return self.get(name_s)
             fam_id = self._family_lookup.get(key)
             if fam_id is None:
                 return self.get(name)   # raises the descriptive KeyError
             fam = self.families[fam_id]
-        default = self.entries[fam.default]
-        variant = str(variant or "auto").strip().lower()
-        if device == "auto":
+        if device in (None, "auto"):
             device = detect_device()
-        if variant == "auto":
-            cand = self._device_variant(fam, device)
+        v = str(variant).strip().lower() if variant is not None else "default"
+        if v in ("", "default"):
+            return self._device_variant(fam, device)
+        if v == "auto":
+            cand = self._family_precision_entry(
+                fam, _DEVICE_PRECISION.get(device))
             if cand is not None and cand.lossless:
                 return cand
-            return default
-        if variant == "default":
-            cand = self._device_variant(fam, device)
-            return cand if cand is not None else default
-        if variant == "fp32":
-            return default
-        if variant in ("int8", "cpu"):
-            if not fam.cpu:
-                raise ValueError(
-                    f"family '{fam.id}' has no int8/CPU variant")
-            return self.entries[fam.cpu]
-        if variant in ("fp16", "gpu"):
-            if not fam.gpu:
-                raise ValueError(
-                    f"family '{fam.id}' has no fp16/GPU variant")
-            return self.entries[fam.gpu]
+            return self.entries[fam.default]
+        if v in ("fp32", "int8", "fp16"):
+            entry = self._family_precision_entry(fam, v)
+            if entry is None:
+                have = sorted(self._by_family_precision.get(fam.id, {}))
+                raise KeyError(
+                    f"family '{fam.id}' has no {v} variant; "
+                    f"available precisions: {', '.join(have) or 'none'}")
+            return entry
         raise ValueError(
             f"unknown variant {variant!r} "
             "(use default/auto/fp32/int8/fp16)")
-
-    def default_entry(self, device="auto") -> ModelEntry:
-        """The EFFECTIVE default model for ``device``.
-
-        The registry declares a ranked ``recommended`` list; entry 0 is
-        also ``gui_default``. That declaration fixes the *domain* (which
-        trained model), and this method fixes the *precision* for the
-        machine at hand: the declared default's family supplies the
-        int8 variant on CPU, the fp16 variant on a CUDA GPU and the fp32
-        reference on Apple Silicon/CoreML (see
-        :meth:`_device_variant`), falling back to the declared entry
-        itself when the family has no such variant.
-
-        This deliberately does NOT go through :meth:`resolve`'s
-        lossless-only ``auto`` gate — it is ``resolve(family,
-        variant="default")`` applied to the declared default's family,
-        and shares its rule via :meth:`_device_variant`. ``auto``
-        protects users who picked a *family* from a silent,
-        results-changing precision swap; here the registry has
-        explicitly nominated an optimised entry as the default, so
-        honouring the device is the declared intent, not a substitution
-        behind the user's back. Any explicit selection (an entry id from
-        the GUI, ``winmol_batch <MODEL>``, or a forced ``--variant``)
-        bypasses this method entirely.
-
-        Never downloads and never touches the network beyond the local
-        ``detect_device()`` probe.
-        """
-        declared = None
-        for mid in list(self.recommended) + [self.gui_default]:
-            if mid and mid in self.entries:
-                declared = self.entries[mid]
-                break
-        if declared is None:
-            visible = self.visible()
-            if not visible:
-                raise KeyError("registry has no selectable model")
-            return visible[0]
-        fam = self.families.get(declared.family)
-        if fam is None:
-            return declared
-        if device == "auto":
-            device = detect_device()
-        cand = self._device_variant(fam, device)
-        return cand if cand is not None else declared
-
-    def recommended_entries(self) -> List[ModelEntry]:
-        """The declared ranked recommendations, best first."""
-        return [self.entries[mid] for mid in self.recommended
-                if mid in self.entries]
-
-    def unpinned(self) -> List[ModelEntry]:
-        """Downloadable entries with no sha256/md5 digest — i.e. whose
-        download cannot be integrity-verified. Must be empty."""
-        return [e for e in self.entries.values()
-                if e.url and not (e.sha256 or e.md5)]
-
-    def flat_map(self) -> Dict[str, str]:
-        """The legacy v1 shape {entry_id: url}, for consumers that still
-        want a flat name->url mapping."""
-        return {mid: e.url for mid, e in self.entries.items()}
 
     def visible(self) -> List[ModelEntry]:
         """Non-hidden entries in registry (curated) order."""
         return [e for e in self.entries.values() if not e.hidden]
 
+    def default_entry(self, device="auto") -> ModelEntry:
+        """The effective default entry for ``device``: the declared
+        ``recommended``/``gui_default`` model's device variant, or the
+        first entry when the registry declares no default at all."""
+        declared_id = None
+        for mid in list(self.recommended) + [self.gui_default]:
+            if mid and mid in self.entries:
+                declared_id = mid
+                break
+        if declared_id is None:
+            if not self.entries:
+                raise KeyError("registry has no models")
+            declared_id = next(iter(self.entries))
+        declared = self.entries[declared_id]
+        fam = self.families.get(declared.family)
+        if fam is None:
+            return declared
+        if device == "auto":
+            device = detect_device()
+        return self._device_variant(fam, device)
 
-# --- loading ----------------------------------------------------------------
+
+# --- loading -----------------------------------------------------------
 
 def load_registry(config_path) -> Registry:
-    """Parse config.json (schema v2 or legacy flat v1) into a Registry.
-
-    Raises FileNotFoundError / ValueError exactly like the legacy
-    winmol_batch.load_model_paths did, so callers' error handling holds.
-    """
+    """Parse config.json (schema v2 or legacy flat v1) into a Registry."""
     if not os.path.exists(config_path):
         raise FileNotFoundError(
             f"model registry (config.json) not found: {config_path}")
@@ -327,69 +217,34 @@ def load_registry(config_path) -> Registry:
 
 
 def _v1_filename(name, url):
-    """installer.py's historical dest naming: <Key><ext-from-URL>, with
-    '.onnx' preferred/fallback."""
+    """installer.py's historical dest naming: <Name><ext-from-URL>."""
     path = url.split("?")[0] if url else ""
-    if path.lower().endswith(".onnx"):
-        ext = ".onnx"
-    else:
-        ext = os.path.splitext(path)[1] or ".onnx"
-    return f"{name}{ext}"
+    ext = os.path.splitext(path)[1] if path else ""
+    return f"{name}{ext or '.onnx'}"
 
 
-def _parse_v1(raw, config_path):
+def _parse_v1(raw, config_path) -> Registry:
     entries = {}
     for name, url in raw.items():
         if not isinstance(name, str) or not name.strip():
             continue
         name = name.strip()
-        if name in RESERVED_IDS:
-            continue    # reserved for the GUI's local-file escape hatch
         u = url if isinstance(url, str) else ""
         entries[name] = ModelEntry(
             id=name, label=name, url=u, file=_v1_filename(name, u))
     if not entries:
         raise ValueError(
-            f"No model entries found in {config_path}. "
-            "Expected {name: url}.")
+            f"No model entries found in {config_path}. Expected "
+            "{name: url}.")
     return Registry(entries, schema=1)
 
 
-def _parse_recommended(raw, entries, gui_default):
-    """Validate the ranked default list. Absent -> gui_default alone."""
-    recommended = raw.get("recommended")
-    if recommended is None:
-        # Older v2 registries: the single gui_default IS the ranking.
-        return [gui_default] if gui_default else []
-    if not isinstance(recommended, list):
-        raise ValueError("'recommended' must be a list of model ids")
-    for rid in recommended:
-        if rid not in entries:
-            raise ValueError(
-                f"recommended references unknown model {rid!r}")
-    if len(set(recommended)) != len(recommended):
-        raise ValueError("'recommended' has duplicate ids")
-    # One default, declared once: the ranked head and gui_default cannot
-    # disagree about what the GUI opens on.
-    if recommended and gui_default and recommended[0] != gui_default:
-        raise ValueError(
-            f"recommended[0] ({recommended[0]!r}) must equal "
-            f"gui_default ({gui_default!r})")
-    return recommended
-
-
-def _parse_v2(raw, config_path):
-    tile_px = int(raw.get("tile_px", 512))
+def _parse_v2(raw, config_path) -> Registry:
     models = raw.get("models")
     if not isinstance(models, dict) or not models:
         raise ValueError(f"schema-2 registry without models: {config_path}")
-
     entries = {}
     for mid, spec in models.items():
-        if mid in RESERVED_IDS:
-            raise ValueError(
-                f"model id {mid!r} is reserved (GUI escape hatch): "
-                f"{config_path}")
         if not isinstance(spec, dict):
             raise ValueError(f"model {mid!r} is not an object")
         url = spec.get("url")
@@ -401,117 +256,114 @@ def _parse_v2(raw, config_path):
         entries[mid] = ModelEntry(
             id=mid,
             label=str(spec.get("label", mid)),
-            description=str(spec.get("description", "")),
             family=str(spec.get("family", "")),
-            backend=str(spec.get("backend", "any")),
             precision=str(spec.get("precision", "fp32")),
-            format=str(spec.get("format", "onnx")),
             url=url,
             file=file.strip(),
             sha256=spec.get("sha256") or None,
-            md5=spec.get("md5") or None,
             size_mb=spec.get("size_mb"),
-            f1=spec.get("f1"),
             lossless=bool(spec.get("lossless", True)),
             hidden=bool(spec.get("hidden", False)),
-            tile_px=int(spec.get("tile_px", tile_px)),
         )
 
     families = {}
     for fid, spec in (raw.get("families") or {}).items():
-        if fid in RESERVED_IDS:
-            raise ValueError(f"family id {fid!r} is reserved")
-        default = spec.get("default")
-        fam = Family(id=fid, label=str(spec.get("label", fid)),
-                     default=default, cpu=spec.get("cpu"),
-                     gpu=spec.get("gpu"), coreml=spec.get("coreml"))
-        for ref in (fam.default, fam.cpu, fam.gpu, fam.coreml):
-            if ref is not None and ref not in entries:
-                raise ValueError(
-                    f"family {fid!r} references unknown model {ref!r}")
-        if fam.default is None:
-            raise ValueError(f"family {fid!r} has no default model")
-        families[fid] = fam
-
-    preload = raw.get("preload") or []
-    for pid in preload:
-        if pid not in entries:
-            raise ValueError(f"preload references unknown model {pid!r}")
+        default = spec.get("default") if isinstance(spec, dict) else None
+        if default is None or default not in entries:
+            raise ValueError(f"family {fid!r} has no valid default model")
+        families[fid] = Family(
+            id=fid, label=str(spec.get("label", fid)), default=default)
 
     gui_default = raw.get("gui_default")
     if gui_default is not None and gui_default not in entries:
         raise ValueError(
             f"gui_default references unknown model {gui_default!r}")
-    recommended = _parse_recommended(raw, entries, gui_default)
+    recommended = raw.get("recommended") or []
+    if not isinstance(recommended, list):
+        raise ValueError("'recommended' must be a list of model ids")
+    for rid in recommended:
+        if rid not in entries:
+            raise ValueError(
+                f"recommended references unknown model {rid!r}")
 
     return Registry(entries, families, schema=int(raw["schema"]),
-                    gui_default=gui_default, preload=preload,
-                    tile_px=tile_px, recommended=recommended)
+                    gui_default=gui_default, recommended=recommended)
 
 
-# --- paths / device ---------------------------------------------------------
+# --- paths / device ------------------------------------------------------
 
 def local_path(entry, model_dir) -> str:
     """The single on-disk naming rule shared by plugin and CLI."""
     return os.path.join(model_dir, entry.file)
 
 
-def detect_device() -> str:
+def gpu_runtime_installed(venv_path=None) -> bool:
+    """Whether the interpreter that will RUN the model has a CUDA EP.
+
+    A card is not the same thing as a runtime that can use it. The
+    managed venv is built from requirements/cpu.txt (plain
+    ``onnxruntime``) unless the user opts into the GPU variant, so on
+    any NVIDIA box a default install has a GPU present and a CPU-only
+    runtime. Choosing the model by the CARD alone hands that install the
+    fp16 GPU variant instead of the int8 CPU one -- it still runs (ORT
+    converts the fp16 weights to fp32 once at session load), just as the
+    wrong, slower variant.
+
+    Two contexts, two sources of truth:
+
+    * the compute child already has onnxruntime imported -- ask it;
+    * the QGIS-side plugin must never import it, so read the venv
+      sentinel instead (``installed_variant`` is pure file I/O).
+
+    Unknown (no marker, no imported runtime) stays True so the probe
+    alone decides, exactly as before.
+    """
+    ort = sys.modules.get("onnxruntime")
+    if ort is not None:
+        try:
+            return "CUDAExecutionProvider" in ort.get_available_providers()
+        except Exception:
+            pass
+    if venv_path:
+        try:
+            from .installer import installed_variant
+            variant = installed_variant(venv_path)
+        except Exception:
+            variant = None
+        if variant is not None:
+            return variant == "gpu"
+    return True
+
+
+def detect_device(venv_path=None) -> str:
     """"gpu" (CUDA), "coreml" (Apple Silicon) or "cpu".
 
-    WINMOL_DEVICE env overrides; else Apple Silicon is recognised from
-    the platform and everything else falls back to an nvidia-smi probe
-    (same pattern as winmol_batch.detect_gpu_count). No onnxruntime
-    import — the QGIS process must not need it — so CoreML is inferred
-    from Darwin/arm64, the same gate
-    ``onnx_runtime.active_accelerator`` applies before it will call a
-    session CoreML. Apple Silicon never carries an NVIDIA GPU, so the
-    two probes cannot disagree.
+    ``WINMOL_DEVICE`` env overrides; else Apple Silicon is recognised
+    from the platform; else an ``nvidia-smi`` probe; default "cpu".
+
+    A GPU verdict additionally requires a runtime that can actually use
+    the card (``gpu_runtime_installed``) -- otherwise a CPU-only install
+    on an NVIDIA machine selects the fp16 variant it cannot accelerate.
+    Skipping the probe in that case also skips its 20 s timeout.
     """
     forced = os.environ.get("WINMOL_DEVICE", "").strip().lower()
-    if forced in ("gpu", "cuda"):
-        return "gpu"
-    if forced in ("coreml", "metal", "mps"):
+    if forced in ("cpu", "gpu", "coreml"):
+        return forced
+    if platform.system() == "Darwin" and platform.machine() == "arm64":
         return "coreml"
-    if forced == "cpu":
+    if not gpu_runtime_installed(venv_path):
         return "cpu"
-    if _is_apple_silicon():
-        return "coreml"
-    if "probe" not in _DEVICE_PROBE_CACHE:
-        _DEVICE_PROBE_CACHE["probe"] = _probe_nvidia()
-    return _DEVICE_PROBE_CACHE["probe"]
-
-
-def _is_apple_silicon() -> bool:
-    return (platform.system() == "Darwin"
-            and platform.machine() == "arm64")
+    return _probe_nvidia()
 
 
 def _probe_nvidia() -> str:
-    try:
-        out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=20)
-        if out.returncode == 0 and any(
-                ln.strip() for ln in out.stdout.splitlines()):
-            return "gpu"
-    except Exception:
-        pass
-    return "cpu"
+    """"gpu" if ``nvidia-smi`` lists at least one GPU, else "cpu"."""
+    return "gpu" if run_nvidia_smi_query("index", timeout=20) else "cpu"
 
 
-# --- integrity verification -------------------------------------------------
+# --- integrity verification -----------------------------------------------
 
-def _expected_digest(entry):
-    """(algo, lowercase hexdigest) or (None, None) when unpinned."""
-    if entry.sha256:
-        return "sha256", entry.sha256.lower()
-    if entry.md5:
-        return "md5", entry.md5.lower()
-    return None, None
-
-
-def _hash_file(path, algo) -> str:
+def _hash_file(path, algo="sha256") -> str:
     h = hashlib.new(algo)
     with open(path, "rb") as f:
         while True:
@@ -522,227 +374,26 @@ def _hash_file(path, algo) -> str:
     return h.hexdigest()
 
 
-def _cache_load(cache_dir) -> dict:
-    try:
-        with open(os.path.join(cache_dir, VERIFIED_CACHE)) as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-def _cache_write(cache_dir, data):
-    try:
-        with open(os.path.join(cache_dir, VERIFIED_CACHE), "w") as f:
-            json.dump(data, f, indent=1, sort_keys=True)
-    except OSError:
-        pass    # cache is an optimization only
-
-
-def _cache_store(cache_dir, filename, size, mtime, algo, digest, ok=True):
-    """Memoize the outcome of a digest check.
-
-    ``ok=False`` records a FAILED check, which is what lets
-    :func:`installed_state` report "corrupt" without re-hashing a 374 MB
-    file on every repaint. A failure record must never be mistaken for a
-    pass — :func:`verify_file` checks the flag.
-    """
-    data = _cache_load(cache_dir)
-    data[filename] = {"size": size, "mtime": mtime,
-                      "algo": algo, "digest": digest, "ok": bool(ok)}
-    _cache_write(cache_dir, data)
-
-
-def _cache_forget(cache_dir, filename) -> None:
-    """Drop a file's memo (it is being deleted or replaced)."""
-    data = _cache_load(cache_dir)
-    if data.pop(filename, None) is not None:
-        _cache_write(cache_dir, data)
-
-
-def verify_file(path, sha256=None, md5=None, cache_dir=None) -> bool:
-    """True when the file matches the given checksum (or none is given —
-    legacy behavior). A passing digest is memoized per (size, mtime) in
-    ``<dir>/.winmol_verified.json`` so a 374 MB model is hashed once,
-    not on every run."""
-    if sha256:
-        algo, expected = "sha256", sha256.lower()
-    elif md5:
-        algo, expected = "md5", md5.lower()
-    else:
+def verify_file(path, sha256=None) -> bool:
+    """True when ``path``'s sha256 matches, or ``sha256`` is falsy
+    (unpinned entries pass — legacy behavior)."""
+    if not sha256:
         return True
     if not os.path.exists(path):
         return False
-    st = os.stat(path)
-    cache_dir = cache_dir or os.path.dirname(path) or "."
-    rec = _cache_load(cache_dir).get(os.path.basename(path))
-    if _rec_matches(rec, st, algo, expected):
-        return bool(rec.get("ok", True))
-    ok = _hash_file(path, algo) == expected
-    if ok:
-        _cache_store(cache_dir, os.path.basename(path),
-                     st.st_size, st.st_mtime, algo, expected)
-    return ok
+    return _hash_file(path, "sha256") == sha256.lower()
 
 
-def _rec_matches(rec, st, algo, expected) -> bool:
-    """True when a cache record describes exactly this file+expectation."""
-    return bool(rec
-                and rec.get("size") == st.st_size
-                and rec.get("mtime") == st.st_mtime
-                and rec.get("algo") == algo
-                and rec.get("digest") == expected)
-
-
-# --- on-disk state (stat + memo only; never hashes) --------------------------
-
-#: The five states a registry model can be in on disk.
-STATE_MISSING = "missing"
-STATE_UNPINNED = "unpinned"
-STATE_PRESENT = "present"
-STATE_VERIFIED = "verified"
-STATE_CORRUPT = "corrupt"
-
-
-def installed_state(entry, model_dir) -> str:
-    """One of ``missing`` / ``unpinned`` / ``present`` / ``verified`` /
-    ``corrupt`` for ``entry`` in ``model_dir``.
-
-    stat() and the memo only — SAFE ON THE GUI THREAD. ``unpinned`` is
-    deliberately distinct from ``verified``: :func:`verify_file` returns
-    True unconditionally for an entry with no published digest, and
-    rendering that as a green "verified" would teach users to ignore a
-    real "corrupt".
-    """
-    path = local_path(entry, model_dir)
-    try:
-        st = os.stat(path)
-    except OSError:
-        return STATE_MISSING
-    if st.st_size <= 0:
-        return STATE_MISSING
-    algo, expected = _expected_digest(entry)
-    if expected is None:
-        return STATE_UNPINNED
-    rec = _cache_load(model_dir).get(os.path.basename(path))
-    if _rec_matches(rec, st, algo, expected):
-        return STATE_VERIFIED if rec.get("ok", True) else STATE_CORRUPT
-    return STATE_PRESENT
-
-
-def verify_entry(entry, model_dir, progress=None) -> bool:
-    """Hash the on-disk file and compare it with the entry's digest.
-
-    ``progress`` is called as ``progress(bytes_done, total)``. This reads
-    up to 374 MB and MUST NOT run on the GUI thread — the dialog drives it
-    through ModelMaintenanceWorker. The outcome (pass AND fail) is
-    memoised so :func:`installed_state` can report it without re-hashing.
-    """
-    path = local_path(entry, model_dir)
-    algo, expected = _expected_digest(entry)
-    if expected is None:
-        return True                     # nothing is published to check
-    try:
-        st = os.stat(path)
-    except OSError:
-        return False
-    hasher = hashlib.new(algo)
-    done = 0
-    with open(path, "rb") as f:
-        while True:
-            chunk = f.read(_CHUNK_BYTES)
-            if not chunk:
-                break
-            hasher.update(chunk)
-            done += len(chunk)
-            if progress is not None:
-                progress(done, st.st_size)
-    ok = hasher.hexdigest().lower() == expected
-    _cache_store(model_dir, os.path.basename(path), st.st_size,
-                 st.st_mtime, algo, expected, ok=ok)
-    return ok
-
-
-def remove_model(entry, model_dir) -> int:
-    """Delete one model file, returning the bytes freed (0 if absent).
-
-    Also removes a stale ``<file>.part`` left by an interrupted download
-    and prunes the entry from the verified-digest memo — nothing else in
-    the tree prunes that cache, so a re-download of a same-sized file
-    could otherwise inherit a stale verdict.
-    """
-    path = local_path(entry, model_dir)
-    freed = 0
-    for candidate in (path, path + ".part"):
-        try:
-            freed += os.path.getsize(candidate)
-            os.remove(candidate)
-        except OSError:
-            pass
-    # Key the memo the way verify_file() writes it — basename(local_path),
-    # not entry.file. They coincide for every entry shipped today, but an
-    # entry.file carrying a subdirectory would silently leave the stale
-    # verdict behind, and a re-download of a same-sized file would inherit
-    # it.
-    _cache_forget(model_dir, os.path.basename(path))
-    return freed
-
-
-def remove_all(registry, model_dir, dry_run=False) -> dict:
-    """Delete every registry-known model file in ``model_dir``.
-
-    Same dict shape as ``installer.remove_environment`` — and with
-    ``dry_run=True`` the same shape again, computed by this very
-    function, so the confirmation's byte figure cannot drift from what is
-    actually deleted. Files the registry does not know about (a user's
-    own .onnx dropped into the folder) are never touched.
-    """
-    result = {"planned": [], "removed": [], "failed": [], "freed_bytes": 0}
-    for entry in registry.entries.values():
-        path = local_path(entry, model_dir)
-        for candidate in (path, path + ".part"):
-            try:
-                size = os.path.getsize(candidate)
-            except OSError:
-                continue
-            result["planned"].append((candidate, size))
-            if dry_run:
-                result["freed_bytes"] += size
-                continue
-            try:
-                os.remove(candidate)
-                result["removed"].append(candidate)
-                result["freed_bytes"] += size
-            except OSError as exc:
-                result["failed"].append((candidate, str(exc)))
-        if not dry_run:
-            # basename(local_path), the key verify_file() writes — see
-            # remove_model(). (The whole cache file goes below anyway;
-            # keeping the key rule identical stops the two drifting.)
-            _cache_forget(model_dir,
-                          os.path.basename(local_path(entry, model_dir)))
-    cache = os.path.join(model_dir, VERIFIED_CACHE)
-    if not dry_run and os.path.exists(cache):
-        try:
-            os.remove(cache)
-            result["removed"].append(cache)
-        except OSError as exc:
-            result["failed"].append((cache, str(exc)))
-    return result
-
-
-# --- download ---------------------------------------------------------------
+# --- download --------------------------------------------------------------
 
 def _urllib_fetcher(url, tmp_path, progress, timeout):
-    """Stream ``url`` to ``tmp_path`` in 1 MiB chunks, hashing on the
-    fly (no second pass over a 374 MB file). Returns {algo: hexdigest}.
-    ``progress`` is called as progress(bytes_done, total_or_None). The
-    timeout applies per socket operation — a real bound, unlike the old
-    urlretrieve."""
+    """Stream ``url`` to ``tmp_path`` in 1 MiB chunks, hashing sha256 on
+    the fly. ``progress(bytes_done, total_or_None)``. Returns the hex
+    digest so callers skip a second pass over the file."""
     import urllib.request
     req = urllib.request.Request(
         url, headers={"User-Agent": "WINMOL-Analyzer"})
-    hashes = {"sha256": hashlib.sha256(), "md5": hashlib.md5()}
+    h = hashlib.sha256()
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         total = resp.headers.get("Content-Length")
         total = int(total) if total and str(total).isdigit() else None
@@ -753,15 +404,14 @@ def _urllib_fetcher(url, tmp_path, progress, timeout):
                 if not chunk:
                     break
                 out.write(chunk)
-                for h in hashes.values():
-                    h.update(chunk)
+                h.update(chunk)
                 done += len(chunk)
                 if progress is not None:
                     progress(done, total)
-    return {name: h.hexdigest() for name, h in hashes.items()}
+    return h.hexdigest()
 
 
-#: Injectable for offline tests (monkeypatch this, or pass fetcher=).
+#: Injectable for offline tests (pass fetcher= to download_model).
 _DEFAULT_FETCHER = _urllib_fetcher
 
 
@@ -775,14 +425,13 @@ def _discard(path):
 
 def download_model(entry, dest_dir, progress=None, fetcher=None,
                    timeout=30.0) -> str:
-    """Atomic verified fetch: stream to ``<file>.part``, check the
-    entry's sha256/md5, then os.replace onto the final name. A crash or
-    kill can only ever leave a ``*.part`` file — never a truncated model
-    at the final path. Raises ModelDownloadError on any failure.
+    """Atomic verified fetch: stream to ``<file>.part``, check sha256,
+    then ``os.replace`` onto the final name. A crash can only ever leave
+    a ``.part`` file, never a truncated model at the final path — and
+    ``.part`` is removed on any failure. Raises ModelDownloadError.
 
-    ``progress``: callable(bytes_done, total_or_None, entry).
-    ``fetcher``: callable(url, tmp_path, progress2, timeout) writing the
-    payload to tmp_path; may return {algo: hexdigest} to skip re-hash.
+    ``fetcher(url, tmp_path, progress2, timeout)`` writes the payload
+    to ``tmp_path``; may return a sha256 hex digest to skip a re-hash.
     """
     fetch = fetcher or _DEFAULT_FETCHER
     if not entry.url or not entry.url.lower().startswith("http"):
@@ -798,25 +447,16 @@ def download_model(entry, dest_dir, progress=None, fetcher=None,
         def inner(done, total):
             progress(done, total, entry)
     try:
-        digests = fetch(entry.url, tmp, inner, timeout)
-        algo, expected = _expected_digest(entry)
-        if expected is not None:
-            actual = None
-            if isinstance(digests, dict):
-                actual = digests.get(algo)
-            if actual is None:
-                actual = _hash_file(tmp, algo)
-            if actual.lower() != expected:
+        digest = fetch(entry.url, tmp, inner, timeout)
+        if entry.sha256:
+            actual = digest or _hash_file(tmp, "sha256")
+            if actual.lower() != entry.sha256.lower():
                 raise ModelDownloadError(
                     f"checksum mismatch for {entry.file}: expected "
-                    f"{algo} {expected}, got {actual} — corrupt or "
+                    f"sha256 {entry.sha256}, got {actual} — corrupt or "
                     "tampered download, file discarded",
                     model_id=entry.id, url=entry.url)
         os.replace(tmp, dest)
-        if expected is not None:
-            st = os.stat(dest)
-            _cache_store(dest_dir, entry.file, st.st_size, st.st_mtime,
-                         algo, expected)
         return dest
     except ModelDownloadError:
         _discard(tmp)
@@ -829,16 +469,14 @@ def download_model(entry, dest_dir, progress=None, fetcher=None,
 
 
 def ensure_model(name_or_entry, model_dir, registry=None, progress=None,
-                 fetcher=None, allow_download=True) -> str:
+                 fetcher=None, no_download=False) -> str:
     """The call-site API: return a verified local path for a model,
     downloading it if needed.
 
-    An existing file that matches its checksum (or has none — legacy) is
-    returned as-is. An existing file that FAILS its checksum is treated
-    as stale/truncated and re-downloaded — closing the old size>0-only
-    hole where a corrupt file passed forever. With
-    ``allow_download=False`` a missing/stale file raises
-    ModelDownloadError instead."""
+    An existing file that matches its checksum (or has none) short-
+    circuits. A missing or checksum-failing file is (re)downloaded,
+    unless ``no_download``, which raises ModelDownloadError instead.
+    """
     if isinstance(name_or_entry, ModelEntry):
         entry = name_or_entry
     else:
@@ -847,19 +485,13 @@ def ensure_model(name_or_entry, model_dir, registry=None, progress=None,
                 "registry is required when passing a model name")
         entry = registry.resolve(name_or_entry)
     path = local_path(entry, model_dir)
-    if os.path.exists(path) and os.path.getsize(path) > 0:
-        if verify_file(path, entry.sha256, entry.md5,
-                       cache_dir=model_dir):
-            return path
-        if not allow_download:
-            raise ModelDownloadError(
-                f"{path} exists but fails {entry.id} checksum "
-                "verification, and downloads are disabled",
-                model_id=entry.id, url=entry.url)
-    elif not allow_download:
+    if (os.path.exists(path) and os.path.getsize(path) > 0
+            and verify_file(path, entry.sha256)):
+        return path
+    if no_download:
         raise ModelDownloadError(
-            f"model file missing: {path} (downloads disabled; fetch "
-            f"{entry.url} manually)",
+            f"model file missing or stale: {path} (downloads disabled; "
+            f"fetch {entry.url} manually)",
             model_id=entry.id, url=entry.url)
     return download_model(entry, model_dir, progress=progress,
                           fetcher=fetcher)

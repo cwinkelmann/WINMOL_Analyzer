@@ -1,16 +1,19 @@
-"""Regression tests for the QGIS environment leak.
+"""Live-child regression tests for the QGIS-environment-leak fix.
 
-The plugin runs inside QGIS's Python but spawns a DIFFERENT one. Until these
-tests existed, every spawn site inherited QGIS's PYTHONHOME/PYTHONPATH, which
-on Windows killed environment creation with
+QGIS exports PYTHONHOME/PYTHONPATH describing ITS OWN interpreter.
+Handing those to a child that runs a DIFFERENT interpreter (or even the
+SAME interpreter, via a stale/foreign value) breaks it outright -- see
+plugin_utils/childenv.py's module docstring. test_child_env.py already
+checks that child_env()'s output dict has the poisoned keys stripped;
+this file goes one step further and actually SPAWNS the child, so a
+future change that stops sanitizing (or sanitizes the wrong variable)
+fails on a real process instead of merely looking correct in isolation.
 
-    Could not import runpy module
-
-and on macOS/Linux with "No module named 'encodings'". The symptom differs by
-platform only because of stdlib layout; the bug is identical. These tests
-poison os.environ the way QGIS does and assert the production helpers still
-work, so the class of bug is caught on any OS.
+POSIX only: PYTHONHOME on Windows needs a different (path-shaped) poison
+value than the bogus directory used here, and that side is already
+covered by the Windows PATH-sanitizer tests in test_child_env.py.
 """
+import os
 import subprocess
 import sys
 
@@ -19,104 +22,55 @@ import pytest
 from plugin_utils import installer
 from plugin_utils.childenv import child_env
 
-REAL_VERSION = sys.version_info[:2]
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX-specific pollution values; see test_child_env.py for "
+           "Windows PATH-sanitizer coverage")
 
 
 @pytest.fixture
-def qgis_style_pollution(monkeypatch, tmp_path):
-    """PYTHONHOME pointing at a directory that is not this interpreter's home.
+def polluted(monkeypatch, tmp_path):
+    """os.environ as QGIS leaves it: PYTHONHOME/PYTHONPATH pointing at a
+    directory that is not sys.executable's own stdlib -- poison for any
+    interpreter, per childenv.py's docstring."""
+    bogus = str(tmp_path / "winmol-bogus-stdlib")
+    os.mkdir(bogus)
+    monkeypatch.setenv("PYTHONHOME", bogus)
+    monkeypatch.setenv("PYTHONPATH", os.path.join(bogus, "lib"))
+    return bogus
 
-    This is what QGIS exports; for any interpreter but its own it is fatal.
+
+def test_anti_vacuity_polluted_child_actually_fails(polluted):
+    """Proves the pollution used below is real poison, not a no-op.
+
+    Without this, (b) and (c) passing would prove nothing -- they could
+    just as well be passing because the pollution never mattered.
     """
-    fake_home = tmp_path / "qgis_python"
-    (fake_home / "lib").mkdir(parents=True)
-    monkeypatch.setenv("PYTHONHOME", str(fake_home))
-    monkeypatch.setenv("PYTHONPATH", str(tmp_path / "qgis_site_packages"))
-    return fake_home
+    result = subprocess.run(
+        [sys.executable, "-c", "import sys"],
+        env=dict(os.environ), capture_output=True, text=True, timeout=30)
+    assert result.returncode != 0, (
+        "expected the polluted child to fail to start; it did not, so "
+        "this fixture is not valid poison and the tests below are moot")
 
 
-def test_the_pollution_really_does_break_a_child(qgis_style_pollution):
-    """Guard against a vacuous suite: if this passes, the tests below prove
-    nothing. A child spawned with the inherited environment MUST fail."""
-    proc = subprocess.run([sys.executable, "-c", "import sys"],
-                          capture_output=True, text=True, timeout=60)
-    assert proc.returncode != 0, (
-        "the poisoned environment no longer breaks a child process, so these "
-        "regression tests would pass vacuously")
+def test_child_env_recovers_a_polluted_interpreter(polluted):
+    """The actual regression guard: the same pollution, run through
+    child_env(), and the child now starts cleanly."""
+    result = subprocess.run(
+        [sys.executable, "-c", "import sys"],
+        env=child_env(), capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, (
+        f"child_env() failed to recover a polluted interpreter: "
+        f"{result.stderr}")
 
 
-def test_child_env_neutralises_the_pollution(qgis_style_pollution):
-    proc = subprocess.run([sys.executable, "-c", "import sys"],
-                          capture_output=True, text=True, timeout=60,
-                          env=child_env())
-    assert proc.returncode == 0, (
-        f"child_env() did not rescue the child: {proc.stderr[-400:]}")
-
-
-def test_python_version_probe_survives_qgis_pollution(qgis_style_pollution):
-    """installer._python_version must report the real version, not (0, 0).
-
-    Returning (0, 0) is what makes is_ready() consider a perfectly good venv
-    unusable, which sends the plugin into a rebuild loop.
-    """
-    assert installer._python_version(sys.executable) == REAL_VERSION
-
-
-def test_is_ready_does_not_reject_a_good_venv_under_pollution(
-        qgis_style_pollution, monkeypatch, tmp_path):
-    """The rebuild-loop guard: a venv that IS ready must still look ready when
-    QGIS's environment is leaking."""
-    venv_path = tmp_path / "venv"
-    venv_path.mkdir()
-    monkeypatch.setattr(installer, "get_venv_python_path",
-                        lambda _p: sys.executable)
-    monkeypatch.setattr(installer, "MIN_PY", REAL_VERSION)
-    monkeypatch.setattr(installer, "MAX_PY", REAL_VERSION)
-    monkeypatch.setattr(installer, "_requirements_hash", lambda: "deadbeef")
-    with open(installer._marker_path(str(venv_path)), "w") as fh:
-        fh.write('{"req_hash": "deadbeef"}')
-
-    assert installer.is_ready(str(venv_path)) is True
-
-
-# --- the leak class extended to PATH (Windows DLL shadowing) ----------------
-#
-# The original leak was PYTHONHOME/PYTHONPATH/GDAL_DATA. The same failure of
-# nerve — inheriting the parent's environment wholesale — also leaked QGIS's
-# program directory on PATH into the child, and on Windows PATH is the DLL
-# search path: an onnxruntime native extension then bound QGIS 3.28's 2022-era
-# MSVC/Qt runtime and died with "DLL initialization routine failed". child_env
-# must strip QGIS/OSGeo directories from PATH on Windows and leave it alone
-# everywhere else.
-
-_WIN_QGIS_PATH = (
-    r"C:\Program Files\QGIS 3.28\bin;"
-    r"C:\Program Files\QGIS 3.28\apps\qgis\bin;"
-    r"C:\OSGeo4W\bin;"
-    r"C:\Windows\System32;C:\Windows"
-)
-
-
-def test_child_env_strips_qgis_from_path_on_windows(monkeypatch):
-    monkeypatch.setattr("plugin_utils.childenv.sys.platform", "win32")
-    monkeypatch.setenv("PATH", _WIN_QGIS_PATH)
-    monkeypatch.setenv("OSGEO4W_ROOT", r"C:\OSGeo4W")
-    monkeypatch.setenv("QGIS_PREFIX_PATH",
-                       r"C:\Program Files\QGIS 3.28\apps\qgis")
-    monkeypatch.setenv("GDAL_DATA",
-                       r"C:\Program Files\QGIS 3.28\apps\gdal\share\gdal")
-    entries = child_env()["PATH"].split(";")
-    assert r"C:\OSGeo4W\bin" not in entries
-    assert r"C:\Program Files\QGIS 3.28\bin" not in entries
-    assert r"C:\Program Files\QGIS 3.28\apps\qgis\bin" not in entries
-    # System32 must survive — the child needs the core Windows runtime.
-    assert r"C:\Windows\System32" in entries
-    assert r"C:\Windows" in entries
-
-
-def test_child_env_does_not_touch_path_off_windows(monkeypatch):
-    """No-op on this macOS/Linux host: PATH comes back verbatim."""
-    assert sys.platform != "win32"
-    monkeypatch.setenv("PATH", "/usr/bin:/bin:/opt/qgis/bin")
-    monkeypatch.setenv("OSGEO4W_ROOT", "/opt/osgeo4w")
-    assert child_env()["PATH"] == "/usr/bin:/bin:/opt/qgis/bin"
+def test_python_version_survives_a_polluted_os_environ(polluted):
+    """installer._python_version() must keep working even when the
+    CALLING process's os.environ is polluted -- it is what
+    choose_base_python()/is_ready() poll repeatedly, and a version probe
+    that silently returns (0, 0) under pollution is exactly the
+    rebuild-loop bug this fix closes (setup would think no Python is
+    ever ready and reinstall on every plugin load)."""
+    major, minor = installer._python_version(sys.executable)
+    assert (major, minor) == sys.version_info[:2]

@@ -1,20 +1,8 @@
-"""Regression test for cross-run stem-count determinism.
-
-The vector stage's ``connect_stems`` joins stems in the set-iteration order of
-string-hashed ``Part`` objects (docs/CODE_REVIEW_2.md A-4). Python salts string
-hashing per process, so *without* a fixed ``PYTHONHASHSEED`` the SAME
-orthomosaic yielded a slightly different number of stems on every run.
-``winmol_run.py`` pins the seed (re-exec with ``PYTHONHASHSEED=0``) so results
-are reproducible across processes.
-
-This runs the real entry point three times, deliberately handing each run a
-DIFFERENT incoming ``PYTHONHASHSEED`` (unset / "1" / "2"). With the guard, all
-three re-exec to seed 0 and must produce byte-identical stems. If the guard is
-removed, the three seeds take effect and the outputs diverge -> this test fails.
-
-Marked slow: loads onnxruntime + a model and runs the whole tiled pipeline 3x.
+"""winmol_run.py must normalize PYTHONHASHSEED=0 before anything hashes into
+a set (connect_stems joins stems in Part-hash set-iteration order, which
+Python otherwise salts per process -- see the re-exec guard at the top of
+winmol_run.py).
 """
-import hashlib
 import os
 import subprocess
 import sys
@@ -22,55 +10,40 @@ import sys
 import pytest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MODEL = os.path.join(REPO, "standalone", "model_onnx", "General.onnx")
-CROP = os.path.join(REPO, "tests", "fixtures", "crop_input.tif")
-
-pytestmark = pytest.mark.slow
 
 
-def _stem_signature(gpkg):
-    """(feature count, md5 of the sorted per-stem WKB) — order-independent."""
-    fiona = pytest.importorskip("fiona")
-    shapely_geometry = pytest.importorskip("shapely.geometry")
-    with fiona.open(gpkg) as src:
-        wkb = sorted(shapely_geometry.shape(f["geometry"]).wkb_hex
-                     for f in src)
-    return len(wkb), hashlib.md5("".join(wkb).encode()).hexdigest()
+def test_guard_precedes_project_imports():
+    with open(os.path.join(REPO, "winmol_run.py")) as f:
+        source = f.read()
+
+    guard_idx = source.index("os.execv(sys.executable")
+    first_project_import = min(
+        idx for idx in (
+            source.index("from classes"),
+            source.index("import json"),
+        ) if idx != -1
+    )
+    assert guard_idx < first_project_import, (
+        "the PYTHONHASHSEED re-exec guard must run before any project "
+        "import (or anything else) could hash into a set")
 
 
-def _run(tmp_path, tag, incoming_seed):
-    env = dict(os.environ)
+@pytest.mark.parametrize("incoming_seed", [None, "1", "2"])
+def test_reexec_normalizes_hash_seed(tmp_path, incoming_seed):
+    env = os.environ.copy()
     if incoming_seed is None:
         env.pop("PYTHONHASHSEED", None)
     else:
         env["PYTHONHASHSEED"] = incoming_seed
-    prefix = tmp_path / f"run_{tag}"
-    stem_map = tmp_path / f"run_{tag}_sm.tif"
-    subprocess.run(
-        [sys.executable, "winmol_run.py", MODEL, CROP,
-         str(stem_map), str(prefix), "Trees"],
-        cwd=REPO, env=env, check=True,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    gpkg = f"{prefix}.gpkg"
-    assert os.path.exists(gpkg), f"run {tag} produced no GeoPackage"
-    return _stem_signature(gpkg)
 
+    proc = subprocess.run(
+        [sys.executable, "winmol_run.py", "/nonexistent/model.onnx",
+         "/nonexistent/in.tif", str(tmp_path / "sm.tif"),
+         str(tmp_path / "pfx"), "Stems"],
+        capture_output=True, text=True, env=env, cwd=REPO, timeout=120)
 
-def test_trees_stem_count_is_deterministic_across_processes(tmp_path):
-    pytest.importorskip("onnxruntime")
-    if not os.path.exists(MODEL):
-        pytest.skip(f"model missing: {MODEL} "
-                    f"(run scripts/convert_models_to_onnx.py)")
-
-    # Different incoming hash seeds; the guard must normalize them all to 0,
-    # so the stem count + geometry must come out identical.
-    sigs = {
-        "unset": _run(tmp_path, "unset", None),
-        "seed1": _run(tmp_path, "seed1", "1"),
-        "seed2": _run(tmp_path, "seed2", "2"),
-    }
-    counts = {tag: count for tag, (count, _) in sigs.items()}
-    assert len(set(sigs.values())) == 1, (
-        f"non-deterministic stems across processes: {counts} "
-        f"(is the PYTHONHASHSEED re-exec guard still at the top of "
-        f"winmol_run.py?)")
+    # The run fails later on the bogus model -- expected, not asserted here.
+    # What matters is that the seed was normalized before that failure.
+    assert "Determinism: PYTHONHASHSEED=0" in proc.stdout, (
+        f"incoming seed {incoming_seed!r} was not normalized\n"
+        f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}")

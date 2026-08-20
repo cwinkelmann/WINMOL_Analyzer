@@ -1,30 +1,28 @@
-"""Obtain a self-contained CPython 3.11 on any platform — no admin rights, no
-system Python required.
+"""Obtain a self-contained CPython 3.11 on any platform — no admin rights,
+no system Python required.
 
-The WINMOL compute environment (onnxruntime + the geo stack) must run on Python
-3.11 (the code uses PEP 604 unions and is validated only on 3.11). On a bare
-machine there may be no suitable interpreter: fresh Windows has none, macOS
-ships 3.9, QGIS's own bundled Python is built with a baked-in prefix and dies
-standalone ("No module named encodings"). So we download a *relocatable*
-python-build-standalone (PBS) 3.11 build and use it as the base interpreter for
-the venv.
+WINMOL's compute environment (onnxruntime + the geo stack) needs Python
+3.11 (validated only on 3.11). A bare machine may have none: fresh Windows
+ships none, macOS ships 3.9, and QGIS's own bundled Python has a baked-in
+prefix and dies standalone ("No module named encodings"). So this module
+downloads a *relocatable* python-build-standalone (PBS) 3.11 build and
+hands it back as the base interpreter for the venv.
 
-Pinned to one known-good PBS release with per-platform SHA-256 digests, so the
-download is reproducible and integrity-checked. Pure stdlib -> import-safe off
-QGIS and unit-testable without a network.
+Pinned to one known-good PBS release with per-platform SHA-256 digests, so
+the download is reproducible and integrity-checked. Pure stdlib -> import-
+safe off QGIS and unit-testable without a network.
 
 Reference: https://github.com/astral-sh/python-build-standalone
 """
 import hashlib
 import os
 import platform
-import subprocess
 import sys
 import tarfile
 import time
 import urllib.request
 
-from .childenv import child_env
+from .childenv import PY_VERSION_PROBE, run_isolated
 
 # Pinned PBS release (see the release assets' `digest` field on GitHub).
 PBS_TAG = "20260623"
@@ -82,12 +80,12 @@ def _interp_path(python_root):
     if sys.platform.startswith("win"):
         return os.path.join(python_root, "python.exe")
     p = os.path.join(python_root, "bin", "python3.11")
-    return p if os.path.exists(p) else os.path.join(python_root, "bin",
-                                                    "python3")
+    return p if os.path.exists(p) else os.path.join(
+        python_root, "bin", "python3")
 
 
 def existing_interpreter(dest_dir):
-    """Return a working 3.11 interpreter already extracted under dest_dir, else
+    """A working 3.11 interpreter already extracted under dest_dir, else
     None. (dest_dir/python is where the archive extracts.)"""
     exe = _interp_path(os.path.join(dest_dir, "python"))
     return exe if os.path.exists(exe) else None
@@ -102,16 +100,16 @@ def _sha256(path):
 
 
 def _download(url, dest, progress=None):
-    req = urllib.request.Request(url, headers={"User-Agent": "winmol-analyzer"})
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "winmol-analyzer"})
     # timeout bounds each socket read: a stalled/half-open connection raises
-    # instead of blocking forever (which would hang the env-build thread and
-    # leave the UI buttons permanently disabled).
+    # instead of blocking forever (which would hang the env-build thread).
     with urllib.request.urlopen(req, timeout=120) as resp, \
             open(dest, "wb") as out:
         total = int(resp.headers.get("Content-Length") or 0)
         read = 0
-        # Throttle to ~1 line/s or every 5 MB: on a fast link the 1 MB chunks
-        # would otherwise push dozens of lines per second into the log widget.
+        # Throttle to ~1 line/s or every 5 MB, else a fast link would push
+        # dozens of lines/second into the log widget.
         last_at, last_mb = 0.0, -5
         while True:
             chunk = resp.read(1 << 20)
@@ -134,11 +132,20 @@ def _download(url, dest, progress=None):
 
 
 def _safe_extract(tar, path):
-    """extractall guarding against path traversal. Uses the stdlib 'data'
+    """extractall guarding against path traversal. Uses the stdlib 'tar'
     filter where available (Py>=3.8.17/3.9.17/3.10.12/3.11.4/3.12), else a
-    manual member check."""
+    manual member check.
+
+    The 'tar' filter -- not 'data' -- is deliberate. 'data' additionally
+    rejects any symlink whose target resolves outside the destination, which
+    the relocatable Python build's terminfo tree trips (a member such as
+    share/terminfo/1/1178 -> ../a/adm1178), aborting the whole extract with
+    "'...' would link to '...', which is outside the destination" (issue #25).
+    The archive is verified by pinned SHA-256 above, so it is trusted; the
+    'tar' filter still blocks the actual traversal attack -- absolute paths and
+    '..' components in member names -- while honouring those symlinks."""
     try:
-        tar.extractall(path, filter="data")
+        tar.extractall(path, filter="tar")
         return
     except TypeError:
         pass  # old Python without the filter kwarg
@@ -153,22 +160,21 @@ def _safe_extract(tar, path):
 def _verify_runs(exe):
     """True if exe runs and reports Python 3.11."""
     try:
-        out = subprocess.run(
-            [exe, "-I", "-c",
-             "import sys;print('%d.%d' % sys.version_info[:2])"],
-            capture_output=True, text=True, timeout=60, env=child_env())
+        out = run_isolated(exe, PY_VERSION_PROBE, timeout=60)
         return out.returncode == 0 and out.stdout.strip() == "3.11"
     except Exception:
         return False
 
 
 def ensure_python311(dest_dir, progress=None):
-    """Return the path to a CPython 3.11 interpreter under dest_dir, downloading
+    """The path to a CPython 3.11 interpreter under dest_dir, downloading
     and extracting a relocatable PBS build if not already present.
 
     Idempotent: a prior successful extract is reused. Integrity is checked
-    against the pinned SHA-256. Raises RuntimeError with an actionable message
-    on any failure (unsupported platform, download/verify/extract error).
+    against the pinned SHA-256. Raises RuntimeError with an actionable
+    message on any failure (unsupported platform, download/verify/extract
+    error) — naming the manual fallback (install Python 3.11 yourself and
+    point WINMOL at it from the plugin's Setup tab).
     """
     exe = existing_interpreter(dest_dir)
     if exe and _verify_runs(exe):
@@ -178,8 +184,9 @@ def ensure_python311(dest_dir, progress=None):
     if triple is None:
         raise RuntimeError(
             "No prebuilt Python 3.11 is available for this platform "
-            f"({platform.system()}/{platform.machine()}). Install Python 3.11 "
-            "yourself and point WINMOL at it from the plugin's Setup tab.")
+            f"({platform.system()}/{platform.machine()}). Install Python "
+            "3.11 yourself and point WINMOL at it from the plugin's "
+            "Setup tab.")
 
     os.makedirs(dest_dir, exist_ok=True)
     name = asset_name(triple)
@@ -191,7 +198,10 @@ def ensure_python311(dest_dir, progress=None):
     except Exception as exc:
         if os.path.exists(archive):
             os.remove(archive)
-        raise RuntimeError(f"Could not download Python 3.11 ({name}): {exc}")
+        raise RuntimeError(
+            f"Could not download Python 3.11 ({name}): {exc}. Install "
+            "Python 3.11 yourself and point WINMOL at it from the "
+            "plugin's Setup tab.")
 
     expect = _DIGESTS.get(triple)
     if expect:
@@ -199,8 +209,8 @@ def ensure_python311(dest_dir, progress=None):
         if got != expect:
             os.remove(archive)
             raise RuntimeError(
-                f"Checksum mismatch for {name}\n  expected {expect}\n  got "
-                f"     {got}")
+                f"Checksum mismatch for {name}\n  expected {expect}\n  "
+                f"got      {got}")
 
     if progress:
         progress("Extracting Python 3.11…")
@@ -218,6 +228,6 @@ def ensure_python311(dest_dir, progress=None):
             f"under {dest_dir}/python.")
     if not _verify_runs(exe):
         raise RuntimeError(
-            f"Downloaded Python 3.11 at {exe} did not run correctly on this "
-            "machine.")
+            f"Downloaded Python 3.11 at {exe} did not run correctly on "
+            "this machine.")
     return exe

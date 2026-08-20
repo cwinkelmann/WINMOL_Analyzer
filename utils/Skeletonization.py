@@ -14,7 +14,6 @@ from skimage import morphology
 
 from classes.Part import Part
 from classes.Timer import Timer
-from utils import Log
 from utils.Geometry import ang
 
 
@@ -54,8 +53,8 @@ def find_segments(pred, config, profile) -> (List[Part], List[Tuple[int]]):
     t = Timer()
     t.start()
 
-    Log.debug("#######################################################")
-    Log.debug("Skeletonizing the stem map")
+    print("#######################################################")
+    print("Skeletonize Image")
 
     px_size = abs(profile['transform'][0])
     min_length = math.floor((config.min_length / 4) / px_size)
@@ -72,8 +71,8 @@ def find_segments(pred, config, profile) -> (List[Part], List[Tuple[int]]):
     skel = morphology.skeletonize(pred)
 
     t.stop()
-    Log.debug("#######################################################")
-    Log.debug("")
+    print("#######################################################")
+    print("")
 
     end_nodes, skel = get_nodes(skel)
     segments, skel = find_skeleton_segments(
@@ -96,12 +95,12 @@ def find_segments(pred, config, profile) -> (List[Part], List[Tuple[int]]):
 def get_nodes(skel: np.ndarray) -> Tuple[List[Tuple[int, int]], Any]:
     t = Timer()
     t.start()
-    Log.debug("#######################################################")
-    Log.debug("Splitting the skeleton into segments and detecting end nodes")
+    print("#######################################################")
+    print("Splitting the skeleton into segments and detecting endnodes")
 
     skel, dn_count = remove_dense_skeleton_nodes(skel)
 
-    Log.debug(f"Dense nodes removed: {dn_count}")
+    print("Dense nodes removed: ", dn_count)
     t.stop()
     t.start()
     end_nodes, branch_points = find_skeleton_nodes(skel)
@@ -110,12 +109,12 @@ def get_nodes(skel: np.ndarray) -> Tuple[List[Tuple[int, int]], Any]:
         skel = remove_branchpoints_from_skel(skel, branch_points)
         end_nodes, branch_points = find_skeleton_nodes(skel)
         bp_count = bp_count + len(branch_points)
-    skel = morphology.skeletonize(skel)  # TODO is this code correct?
-    Log.debug(f"Branch points removed: {bp_count}")
-    Log.debug(f"End nodes detected: {len(end_nodes)}")
+    skel = morphology.skeletonize(skel)
+    print("Branch points removed: ", bp_count)
+    print("Detected end nodes: ", len(end_nodes))
     t.stop()
-    Log.debug("#######################################################")
-    Log.debug("")
+    print("#######################################################")
+    print("")
     return end_nodes, skel
 
 
@@ -140,7 +139,7 @@ def find_skeleton_nodes(
     skel: np.ndarray
 ) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]:
 
-    Log.debug("Finding skeleton nodes")
+    print("Find skeletion nodes")
 
     # Pad the skeleton array (same as in the numpy version)
     skel = np.pad(skel, 1, mode='constant', constant_values=0)
@@ -185,7 +184,7 @@ def find_skeleton_nodes(
 
 
 def remove_branchpoints_from_skel(skel, branchpoints):
-    Log.debug("Removing branch points")
+    print("Remove branch points")
     skel_arr = np.asarray(skel, dtype=bool)
     branchpoints_arr = np.asarray(branchpoints)
 
@@ -305,11 +304,11 @@ def find_skeleton_segments(
 ) -> (List[Part], np.ndarray):
     t = Timer()
     t.start()
-    Log.debug("#######################################################")
-    Log.debug("Finding connected segments in the skeleton")
-    Log.debug(f"Initial skeleton length (px): {np.count_nonzero(skel)}")
-    Log.debug(f"End nodes: {len(end_nodes)}")
-    Log.debug(f"Minimum length (px): {min_length}")
+    print("#######################################################")
+    print("Find connected segments in the skeleton")
+    print("Initial length of skeleton: ", np.count_nonzero(skel))
+    print("Number of end nodes", len(end_nodes))
+    print("Minimum length in pixel: ", min_length)
 
     skel_bool = np.asarray(skel, dtype=bool)
     out_skel = np.zeros_like(skel_bool, dtype=bool)
@@ -348,10 +347,10 @@ def find_skeleton_segments(
                 out_skel[rr, cc] = True
 
     skeleton_parts = set(parts)
-    Log.debug(f"Skeleton segments detected: {len(skeleton_parts)}")
+    print("Detected skeleton segments: ", len(skeleton_parts))
     t.stop()
-    Log.debug("#######################################################")
-    Log.debug("")
+    print("#######################################################")
+    print("")
     return skeleton_parts, out_skel
 
 
@@ -378,12 +377,12 @@ def refine_skeleton_segments(parts: List[Part], skel: np.ndarray,
                 refined_parts.append(refined)
 
     def error_callback(error):
-        Log.error(error)
+        print(error, flush=True)
 
-    Log.debug("#######################################################")
-    Log.debug("Refining and sorting skeleton segments")
-    Log.debug(f"Initial skeleton length (px): {np.count_nonzero(skel)}")
-    Log.debug(f"Initial skeleton segments: {len(parts)}")
+    print("#######################################################")
+    print("#Refining and sorting out skeleton segments")
+    print("Initial length of skeleton: ", np.count_nonzero(skel))
+    print("Number of initial skeleton segments", len(parts))
 
     workers = min(_worker_count(config), max(len(parts), 1))
     if workers <= 1 or len(parts) <= 1:
@@ -415,13 +414,13 @@ def refine_skeleton_segments(parts: List[Part], skel: np.ndarray,
             for r_ in r:
                 r_.wait()
 
-    Log.debug(f"Split segments: {split}")
-    Log.debug(f"Removed segments: {out}")
-    Log.debug(f"Refined segments: {len(refined_parts)}")
+    print("Number of split segments:", split)
+    print("Number of removed segments:", out)
+    print("Number of refined segments:", len(refined_parts))
 
     t.stop()
-    Log.debug("#######################################################")
-    Log.debug("")
+    print("#######################################################")
+    print("")
     return refined_parts
 
 

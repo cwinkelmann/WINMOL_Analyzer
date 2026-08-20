@@ -25,34 +25,26 @@
 """
 import os
 
+from .plugin_utils.installer import resolve_environment
+
 
 # noinspection PyPep8Naming
 def classFactory(iface):  # pylint: disable=invalid-name
-    """Load the WINMOLAnalyzer plugin.
-
-    The compute environment (onnxruntime + geo stack; NO TensorFlow) is
-    resolved/created here, but NEVER fatally: a declined or failed setup logs
-    a message and still loads the plugin, so QGIS is never left with a "broken
-    plugin". The dialog re-checks readiness before running and offers a retry.
+    """Load WINMOLAnalyzer
+ class from file WINMOLAnalyzer
+.
 
     :param iface: A QGIS interface instance.
+    :type iface: QgsInterface
     """
-    # Imported here (not at module top) so the package stays importable outside
-    # QGIS -- e.g. under pytest -- where the QGIS-only deps are unavailable.
-    from .plugin_utils.installer import resolve_environment
-
     plugin_dir = os.path.dirname(__file__)
-    # build=False: never download Python / build the venv on the QGIS load
-    # thread (that could take minutes and freeze startup). Just report
-    # readiness; the dialog builds the environment asynchronously if needed.
-    env = resolve_environment(plugin_dir, prompt=False, build=False)
 
-    try:
-        from qgis.core import Qgis, QgsMessageLog
-        level = Qgis.Info if env.get("python") else Qgis.Warning
-        QgsMessageLog.logMessage(env.get("message", ""), "WINMOL", level)
-    except Exception:
-        pass
+    # Never builds/blocks at QGIS load: a missing environment comes back
+    # as status 'needs_setup' and is built off the GUI thread on first
+    # Run (see tasks_threads.EnvSetupWorker). The compute env runs as a
+    # separate child process (see plugin_utils/childenv.py), so nothing
+    # from it is ever imported into QGIS' own interpreter.
+    env = resolve_environment(plugin_dir)
 
     from .winmol_analyzer import WINMOLAnalyzer
     return WINMOLAnalyzer(iface, env)

@@ -1,892 +1,415 @@
-"""Contract tests for plugin_utils/model_registry.py — the model-zoo
-registry (schema v2 config.json), the resolver (family/variant/device),
-and the verified atomic downloader.
-
-Entirely offline: every download goes through an injected fake fetcher;
-no test constructs a socket. The shipped repo config.json is validated
-against the ground-truth checksums of the models-v1 zoo release
-(github.com/cwinkelmann/WINMOL_segmentor_pt) and Zenodo record 15907576.
+"""Off-QGIS tests for plugin_utils.model_registry: schema-2 parsing,
+device->variant resolution, checksum-verified atomic downloads, and the
+v1-flat fallback. Mostly in-test fixtures — no network — plus a section
+pinning the real, shipped config.json (schema-2, models-v1 release).
 """
-
 import hashlib
 import json
 import os
-import subprocess
-import sys
 
 import pytest
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if REPO not in sys.path:
-    sys.path.insert(0, REPO)
+from plugin_utils import model_registry as mr
 
-from plugin_utils import model_registry as mr   # noqa: E402
-import plugin_utils.installer as inst           # noqa: E402
-import winmol_batch as wb                       # noqa: E402
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SHIPPED_CONFIG = os.path.join(REPO_ROOT, "config.json")
 
-SHIPPED_CONFIG = os.path.join(REPO, "config.json")
-
-# Ground truth: SHA256SUMS of the models-v1 release of
-# github.com/cwinkelmann/WINMOL_segmentor_pt (22 assets), vendored
-# verbatim at tests/fixtures/models_v1_SHA256SUMS so this file never
-# drifts from the release again (the 2026-07-21 asset rename made every
-# hardcoded name here stale while the digests stayed valid).
-ZOO_SUMS_FIXTURE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "fixtures", "models_v1_SHA256SUMS")
-
-
-def _parse_sha256sums(path):
-    """Parse a coreutils SHA256SUMS file -> {filename: sha256}."""
-    out = {}
-    with open(path) as fh:
-        for line in fh:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            digest, name = line.split(None, 1)
-            out[name.strip().lstrip("*")] = digest
-    return out
-
-
-ZOO_SHA256 = _parse_sha256sums(ZOO_SUMS_FIXTURE)
-
-# Ground truth: md5 of the four original Keras models, Zenodo record
-# 15907576 (DOI 10.5281/zenodo.15907576).
-ZENODO_MD5 = {
-    "model_UNet_GenDS_512_2023-02-27_211141.hdf5":
-        "19dd5cdd00f4ea47cddfee5fba3f55ba",
-    "model_UNet_SpecDS_Beech_512_2023-02-28_042751.hdf5":
-        "6684ca1ab0663ff388fc441fe70b820a",
-    "model_UNet_SpecDS_Spruce_512_2023-02-27_061925.hdf5":
-        "f44d26b6a4181d0853e48907703a1926",
-    "model_UNet_SpecDS_Spruce_Deadwood_512_2024-12-19_194758.hdf5":
-        "64998766801caac8ad560b5bba547e93",
+FIXTURE_V2 = {
+    "schema": 2,
+    "gui_default": "spruce_int8",
+    "recommended": ["spruce_int8", "spruce_fp32"],
+    "families": {
+        "spruce": {"label": "Spruce", "default": "spruce_fp32"},
+        "beech": {"label": "Beech", "default": "beech_fp32"},
+    },
+    "models": {
+        "spruce_fp32": {
+            "label": "Spruce (fp32)", "family": "spruce",
+            "precision": "fp32",
+            "url": "https://example.com/spruce_fp32.onnx",
+            "file": "spruce_fp32.onnx", "sha256": "a" * 64,
+            "size_mb": 12.3,
+        },
+        # int8: quantised, NOT certified lossless (like the shipped
+        # Keras-family int8 builds) -> variant="auto" must refuse it.
+        "spruce_int8": {
+            "label": "Spruce (int8)", "family": "spruce",
+            "precision": "int8",
+            "url": "https://example.com/spruce_int8.onnx",
+            "file": "spruce_int8.onnx", "sha256": "b" * 64,
+            "size_mb": 3.1, "lossless": False,
+        },
+        # fp16: certified lossless -> variant="auto" may substitute it.
+        "spruce_fp16": {
+            "label": "Spruce (fp16)", "family": "spruce",
+            "precision": "fp16",
+            "url": "https://example.com/spruce_fp16.onnx",
+            "file": "spruce_fp16.onnx", "sha256": "c" * 64,
+            "size_mb": 6.2, "lossless": True,
+        },
+        # beech has ONLY the fp32 default -> cpu/gpu must fall back to it.
+        "beech_fp32": {
+            "label": "Beech (fp32)", "family": "beech",
+            "precision": "fp32",
+            "url": "https://example.com/beech_fp32.onnx",
+            "file": "beech_fp32.onnx", "sha256": "d" * 64,
+            "size_mb": 12.3,
+        },
+    },
 }
 
-CLASSIC = ("General", "Beech", "Spruce", "Spruce_Deadwood")
 
-#: models-v1 assets the classic ids were repointed onto, same order.
-CLASSIC_ASSETS = (
-    "model_UNet_GenDS_512_2023-02-27_211141.onnx",
-    "model_UNet_SpecDS_Beech_512_2023-02-28_042751.onnx",
-    "model_UNet_SpecDS_Spruce_512_2023-02-27_061925.onnx",
-    "model_UNet_SpecDS_Spruce_Deadwood_512_2024-12-19_194758.onnx",
-)
+def _registry():
+    return mr._parse_v2(FIXTURE_V2, "<fixture>")
 
 
-def _entry(tmp_path, data=b"DATA", checksum=True, **kw):
-    """A minimal ModelEntry whose sha256 matches `data` (or has none)."""
-    kw.setdefault("id", "X")
-    kw.setdefault("label", "X test model")
-    kw.setdefault("url", "https://example.invalid/x.onnx")
-    kw.setdefault("file", "x.onnx")
-    if checksum:
-        kw.setdefault("sha256", hashlib.sha256(data).hexdigest())
-    return mr.ModelEntry(**kw)
+def assert_all_pinned(registry):
+    """No-unverifiable-download property: every entry carries a sha256.
+    Task 2 points this same helper at the real config.json."""
+    unpinned = [e.id for e in registry.entries.values() if not e.sha256]
+    assert not unpinned, f"unpinned (unverifiable) entries: {unpinned}"
 
 
-def _writer(data):
-    """A fake fetcher that writes `data` to the tmp path."""
-    def fetch(url, tmp, progress, timeout):
-        with open(tmp, "wb") as f:
-            f.write(data)
-        if progress is not None:
-            progress(len(data), len(data))
-    return fetch
+# --- device -> variant -------------------------------------------------
+
+def test_device_variant_mapping():
+    reg = _registry()
+    assert reg.resolve("spruce", device="cpu").id == "spruce_int8"
+    assert reg.resolve("spruce", device="gpu").id == "spruce_fp16"
+    assert reg.resolve("spruce", device="coreml").id == "spruce_fp32"
 
 
-def _boom(*_a, **_k):
-    raise AssertionError("fetcher must not be called")
+def test_device_variant_falls_back_to_family_default():
+    reg = _registry()
+    # beech declares no int8/fp16 variant -> every device lands on fp32.
+    assert reg.resolve("beech", device="cpu").id == "beech_fp32"
+    assert reg.resolve("beech", device="gpu").id == "beech_fp32"
+    assert reg.resolve("beech", device="coreml").id == "beech_fp32"
 
 
-# --- shipped registry --------------------------------------------------------
-
-def test_load_registry_v2_shipped():
-    reg = mr.load_registry(SHIPPED_CONFIG)
-    assert reg.schema == 2
-    assert len(reg.entries) == 26
-    assert reg.preload == []
-    assert "Custom" not in reg.entries
-    assert reg.gui_default == "Spruce_Deadwood_int8"
-
-    # The four classic public IDS are unchanged (stable API), but their
-    # assets were repointed from the unchecksummed models-onnx-v1
-    # release to the sha256-pinned, numerically-identical models-v1
-    # conversions of the same Keras weights.
-    for name, asset in zip(CLASSIC, CLASSIC_ASSETS):
-        e = reg.entries[name]
-        assert e.file == asset
-        assert "models-v1" in e.url and "models-onnx-v1" not in e.url
-        assert e.url.endswith(f"/{asset}")
-        assert e.sha256 == ZOO_SHA256[asset]
-
-    # Every family reference resolves to a real entry.
-    for fam in reg.families.values():
-        assert fam.default in reg.entries
-        for ref in (fam.cpu, fam.gpu):
-            assert ref is None or ref in reg.entries
-
-    # Zoo assets carry the ground-truth sha256 from SHA256SUMS.
-    zoo = [e for e in reg.entries.values()
-           if "WINMOL_segmentor_pt" in e.url]
-    assert len(zoo) == 22
-    for e in zoo:
-        assert e.sha256 == ZOO_SHA256[e.file], e.id
-
-    # The hdf5 originals point at Zenodo record 15907576 with known md5.
-    hdf5 = [e for e in reg.entries.values() if e.format == "hdf5"]
-    assert len(hdf5) == 4
-    for e in hdf5:
-        assert "records/15907576" in e.url
-        assert e.md5 == ZENODO_MD5[e.file], e.id
-        assert e.hidden          # plugin venv is ONNX-only
-
-    # Labels/descriptions tell the user which model is which.
-    for e in reg.entries.values():
-        assert e.label and e.label != e.id
-        assert e.description
+def test_explicit_model_id_never_rewritten_by_device():
+    reg = _registry()
+    for device in ("cpu", "gpu", "coreml"):
+        assert reg.resolve("spruce_fp32", device=device).id == "spruce_fp32"
+    # case-insensitive entry lookup is still an explicit id, not a family.
+    assert reg.resolve("SPRUCE_FP32", device="cpu").id == "spruce_fp32"
 
 
-def test_load_registry_v1_flat(tmp_path):
-    cfg = tmp_path / "config.json"
-    flat = {
-        "Have": "https://example.invalid/some-other-name.onnx",
-        "Legacy": "https://example.invalid/model.hdf5?download=1",
+def test_default_entry_uses_gui_default_and_device():
+    reg = _registry()
+    assert reg.default_entry(device="cpu").id == "spruce_int8"
+    assert reg.default_entry(device="gpu").id == "spruce_fp16"
+    assert reg.default_entry(device="coreml").id == "spruce_fp32"
+
+
+def test_unknown_name_raises_key_error():
+    reg = _registry()
+    with pytest.raises(KeyError):
+        reg.resolve("no-such-model")
+
+
+# --- the variant kwarg ---------------------------------------------------
+
+def test_variant_explicit_precision_ignores_device():
+    reg = _registry()
+    for device in ("cpu", "gpu", "coreml"):
+        assert reg.resolve("spruce", device=device,
+                           variant="int8").id == "spruce_int8"
+        assert reg.resolve("spruce", device=device,
+                           variant="fp16").id == "spruce_fp16"
+        assert reg.resolve("spruce", device=device,
+                           variant="fp32").id == "spruce_fp32"
+
+
+def test_variant_explicit_precision_missing_raises_clear_key_error():
+    reg = _registry()
+    # beech ships only the fp32 default.
+    for missing in ("int8", "fp16"):
+        with pytest.raises(KeyError, match="beech.*has no"):
+            reg.resolve("beech", device="cpu", variant=missing)
+    assert reg.resolve("beech", device="cpu", variant="fp32").id \
+        == "beech_fp32"
+
+
+def test_variant_default_and_none_keep_device_rule():
+    reg = _registry()
+    for variant in (None, "default"):
+        assert reg.resolve("spruce", device="cpu",
+                           variant=variant).id == "spruce_int8"
+        assert reg.resolve("spruce", device="gpu",
+                           variant=variant).id == "spruce_fp16"
+        # missing device precision falls back to the family default.
+        assert reg.resolve("beech", device="cpu",
+                           variant=variant).id == "beech_fp32"
+
+
+def test_variant_auto_is_lossless_only():
+    reg = _registry()
+    # cpu wants int8, which is NOT lossless -> stay on the fp32 default.
+    assert reg.resolve("spruce", device="cpu",
+                       variant="auto").id == "spruce_fp32"
+    # gpu wants fp16, which IS lossless -> substituted.
+    assert reg.resolve("spruce", device="gpu",
+                       variant="auto").id == "spruce_fp16"
+    assert reg.resolve("spruce", device="coreml",
+                       variant="auto").id == "spruce_fp32"
+    # no variants at all -> the default, on every device.
+    assert reg.resolve("beech", device="cpu",
+                       variant="auto").id == "beech_fp32"
+
+
+def test_variant_never_rewrites_explicit_entry_id():
+    reg = _registry()
+    assert reg.resolve("spruce_int8", device="gpu",
+                       variant="fp32").id == "spruce_int8"
+
+
+def test_variant_unknown_value_raises_value_error():
+    reg = _registry()
+    with pytest.raises(ValueError, match="unknown variant"):
+        reg.resolve("spruce", device="cpu", variant="int4")
+
+
+def test_lossless_defaults_true_and_hidden_defaults_false():
+    reg = _registry()
+    # fixture fp32 entries carry no flags at all.
+    assert reg.entries["spruce_fp32"].lossless is True
+    assert reg.entries["spruce_fp32"].hidden is False
+    assert reg.entries["spruce_int8"].lossless is False
+
+
+def test_hidden_entries_dropped_from_visible():
+    raw = json.loads(json.dumps(FIXTURE_V2))   # deep copy
+    raw["models"]["spruce_fp16"]["hidden"] = True
+    reg = mr._parse_v2(raw, "<fixture>")
+    ids = [e.id for e in reg.visible()]
+    assert "spruce_fp16" not in ids
+    assert "spruce_fp32" in ids
+    # hidden filters choosers, never resolution.
+    assert reg.resolve("spruce", device="gpu").id == "spruce_fp16"
+
+
+# --- fixture-registry pinning property ----------------------------------
+
+def test_fixture_registry_every_entry_has_sha256():
+    assert_all_pinned(_registry())
+
+
+def test_assert_all_pinned_catches_unpinned_entry():
+    raw = json.loads(json.dumps(FIXTURE_V2))   # deep copy
+    raw["models"]["spruce_fp32"]["sha256"] = None
+    reg = mr._parse_v2(raw, "<fixture>")
+    with pytest.raises(AssertionError):
+        assert_all_pinned(reg)
+
+
+# --- download atomicity -------------------------------------------------
+
+_PAYLOAD = b"totally-a-model-payload"
+_DIGEST = hashlib.sha256(_PAYLOAD).hexdigest()
+
+
+def _entry(sha256=_DIGEST, file="m.onnx"):
+    return mr.ModelEntry(id="m", label="M", family="", precision="fp32",
+                         url="https://example.com/m.onnx", file=file,
+                         sha256=sha256)
+
+
+def test_download_success_writes_final_file_and_no_part(tmp_path):
+    def fetcher(url, tmp_path_, progress, timeout):
+        with open(tmp_path_, "wb") as f:
+            f.write(_PAYLOAD)
+        return None   # exercise the re-hash fallback path too
+
+    dest = mr.download_model(_entry(), str(tmp_path), fetcher=fetcher)
+    assert dest == str(tmp_path / "m.onnx")
+    assert (tmp_path / "m.onnx").read_bytes() == _PAYLOAD
+    assert not (tmp_path / "m.onnx.part").exists()
+
+
+def test_download_checksum_mismatch_leaves_no_files(tmp_path):
+    def fetcher(url, tmp_path_, progress, timeout):
+        with open(tmp_path_, "wb") as f:
+            f.write(b"wrong bytes entirely")
+
+    with pytest.raises(mr.ModelDownloadError):
+        mr.download_model(_entry(), str(tmp_path), fetcher=fetcher)
+    assert not (tmp_path / "m.onnx").exists()
+    assert not (tmp_path / "m.onnx.part").exists()
+
+
+def test_download_fetcher_failure_leaves_no_files(tmp_path):
+    def fetcher(url, tmp_path_, progress, timeout):
+        with open(tmp_path_, "wb") as f:
+            f.write(b"partial")
+        raise OSError("connection reset")
+
+    with pytest.raises(mr.ModelDownloadError):
+        mr.download_model(_entry(), str(tmp_path), fetcher=fetcher)
+    assert not (tmp_path / "m.onnx").exists()
+    assert not (tmp_path / "m.onnx.part").exists()
+
+
+# --- ensure_model ---------------------------------------------------------
+
+def test_ensure_model_short_circuits_on_verified_existing(tmp_path):
+    (tmp_path / "m.onnx").write_bytes(_PAYLOAD)
+    calls = []
+
+    def fetcher(url, tmp_path_, progress, timeout):
+        calls.append(url)
+
+    path = mr.ensure_model(_entry(), str(tmp_path), fetcher=fetcher)
+    assert path == str(tmp_path / "m.onnx")
+    assert calls == []   # fetcher must not run
+
+
+def test_ensure_model_refetches_stale_file(tmp_path):
+    (tmp_path / "m.onnx").write_bytes(b"stale garbage")
+
+    def fetcher(url, tmp_path_, progress, timeout):
+        with open(tmp_path_, "wb") as f:
+            f.write(_PAYLOAD)
+
+    path = mr.ensure_model(_entry(), str(tmp_path), fetcher=fetcher)
+    assert (tmp_path / "m.onnx").read_bytes() == _PAYLOAD
+    assert path == str(tmp_path / "m.onnx")
+
+
+def test_ensure_model_no_download_refuses_with_clear_error(tmp_path):
+    calls = []
+
+    def fetcher(url, tmp_path_, progress, timeout):
+        calls.append(url)
+
+    with pytest.raises(mr.ModelDownloadError, match="downloads disabled"):
+        mr.ensure_model(_entry(), str(tmp_path), fetcher=fetcher,
+                        no_download=True)
+    assert calls == []
+
+
+# --- v1-flat fallback -----------------------------------------------------
+
+def test_v1_flat_fallback_maps_names_to_entries(tmp_path):
+    raw = {
+        "Spruce": "https://example.com/spruce.onnx",
+        "Beech": "https://example.com/beech.onnx?token=abc",
     }
-    cfg.write_text(json.dumps(flat))
-    reg = mr.load_registry(str(cfg))
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(raw))
+
+    reg = mr.load_registry(str(config_path))
     assert reg.schema == 1
-    # v1 keeps installer's key-based dest naming (<Key><ext-from-url>),
-    # even when the URL basename differs.
-    assert reg.entries["Have"].file == "Have.onnx"
-    assert reg.entries["Legacy"].file == "Legacy.hdf5"
-    # flat_map round-trips the original mapping.
-    assert reg.flat_map() == flat
+    spruce = reg.get("Spruce")
+    assert spruce.url == "https://example.com/spruce.onnx"
+    assert spruce.file == "Spruce.onnx"
+    # case-insensitive resolve, and no crash on a querystring URL.
+    assert reg.resolve("spruce").id == "Spruce"
+    assert reg.resolve("beech").file == "Beech.onnx"
 
 
-def test_load_registry_raises_like_legacy(tmp_path):
+def test_load_registry_v2_from_file(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(FIXTURE_V2))
+    reg = mr.load_registry(str(config_path))
+    assert reg.schema == 2
+    assert reg.default_entry(device="cpu").id == "spruce_int8"
+
+
+def test_load_registry_missing_file_raises(tmp_path):
     with pytest.raises(FileNotFoundError):
         mr.load_registry(str(tmp_path / "nope.json"))
-    empty = tmp_path / "config.json"
-    empty.write_text("{}")
-    with pytest.raises(ValueError):
-        mr.load_registry(str(empty))
 
 
-def test_reserved_custom(tmp_path):
-    cfg = tmp_path / "config.json"
-    cfg.write_text(json.dumps({
-        "schema": 2,
-        "models": {"Custom": {
-            "url": "https://example.invalid/x.onnx", "file": "x.onnx"}},
-    }))
-    with pytest.raises(ValueError):
-        mr.load_registry(str(cfg))
+# --- real, shipped config.json (schema-2, pinned to the models-v1 release) -
+
+CLASSIC_FAMILIES = ("Spruce", "Beech", "Spruce_Deadwood", "General")
 
 
-# --- integrity: no unverifiable download ------------------------------------
-
-def test_every_entry_has_a_digest():
-    """REGRESSION GUARD. Every downloadable entry in the shipped
-    registry must carry a sha256 (zoo assets) or md5 (Zenodo hdf5), so
-    no model can ever be installed without integrity verification.
-    Adding an entry without one fails here."""
-    reg = mr.load_registry(SHIPPED_CONFIG)
-    unpinned = reg.unpinned()
-    assert unpinned == [], (
-        "unverifiable model download(s): "
-        + ", ".join(f"{e.id} ({e.url})" for e in unpinned))
-    # and the digests are real hex of the right width
-    for e in reg.entries.values():
-        algo, digest = mr._expected_digest(e)
-        assert algo in ("sha256", "md5"), e.id
-        assert len(digest) == (64 if algo == "sha256" else 32), e.id
-        int(digest, 16)          # raises unless pure hex
+def _shipped_registry():
+    return mr.load_registry(SHIPPED_CONFIG)
 
 
-def test_digest_is_actually_enforced_for_md5_entries(tmp_path):
-    """md5 (not just sha256) must really be verified — the Zenodo
-    originals are md5-only."""
-    entry = mr.ModelEntry(
-        id="H", label="hdf5", url="https://example.invalid/m.hdf5",
-        file="m.hdf5", md5=hashlib.md5(b"GOOD").hexdigest())
-    path = mr.ensure_model(entry, str(tmp_path), fetcher=_writer(b"GOOD"))
-    assert open(path, "rb").read() == b"GOOD"
-    os.remove(path)
-    with pytest.raises(mr.ModelDownloadError) as exc:
-        mr.ensure_model(entry, str(tmp_path), fetcher=_writer(b"BAD"))
-    assert "checksum mismatch" in str(exc.value)
-    assert "md5" in str(exc.value)
-    assert not os.path.exists(path)          # nothing left behind
+def test_shipped_config_parses_as_schema_2():
+    reg = _shipped_registry()
+    assert reg.schema == 2
+    assert reg.entries
 
 
-# --- recommended ranking / device-aware default ------------------------------
+def test_shipped_config_every_entry_has_sha256():
+    assert_all_pinned(_shipped_registry())
 
-def test_recommended_ranking_shipped():
-    """The default and its runner-up are explicit and ordered, not
-    implied by dict order."""
-    reg = mr.load_registry(SHIPPED_CONFIG)
-    assert reg.recommended == ["Spruce_Deadwood_int8", "UNet_PT_int8"]
+
+def test_shipped_config_every_entry_has_a_downloadable_url():
+    reg = _shipped_registry()
+    bad = [e.id for e in reg.entries.values()
+           if not e.url or not e.url.lower().startswith("http")]
+    assert not bad, f"entries without an http(s) url: {bad}"
+
+
+def test_shipped_config_gui_default_resolves():
+    reg = _shipped_registry()
+    assert reg.gui_default is not None
+    assert reg.gui_default in reg.entries
+    assert reg.get(reg.gui_default).sha256
+
+
+def test_shipped_config_recommended_all_resolve():
+    reg = _shipped_registry()
+    assert reg.recommended, "expected a non-empty recommended list"
+    for mid in reg.recommended:
+        assert mid in reg.entries
+    # design decision: recommended[0] is the gui_default.
     assert reg.recommended[0] == reg.gui_default
-    first, second = reg.recommended_entries()
-    # 1st: INT8 Spruce + deadwood (SpecDS), from the models-v1 release
-    assert first.id == "Spruce_Deadwood_int8"
-    assert first.file == ("model_UNet_SpecDS_Spruce_Deadwood_512"
-                          "_2024-12-19_194758_int8.onnx")
-    assert first.precision == "int8"
-    assert first.size_mb == 31.4
-    assert first.sha256 == ZOO_SHA256[first.file]
-    # 2nd: the PyTorch UNet w05 int8 — the real asset behind the
-    # "SpecDS INT8 W05" shorthand; label/description must be explicit
-    # that w05 is the PyTorch retrain, not a classic Keras variant.
-    assert second.id == "UNet_PT_int8"
-    assert second.file == ("model_UNet_SpecDS_Beech_512"
-                           "_pytorch_w05_int8.onnx")
-    assert second.size_mb == 7.9
-    assert second.f1 == 0.76
-    assert "w05" in second.label.lower()
-    assert "specds" in second.description.lower()   # names the confusion
-    assert second.family == "unet_pt" and first.family != second.family
 
 
-def test_default_entry_is_device_aware(monkeypatch):
-    """int8 on CPU, fp16 on GPU — the Spruce+Deadwood domain (the
-    user's declared first choice) is preserved either way."""
-    reg = mr.load_registry(SHIPPED_CONFIG)
-
-    monkeypatch.setattr(mr, "detect_device", lambda: "cpu")
-    e = reg.default_entry()                  # device="auto" -> stub
-    assert e.id == "Spruce_Deadwood_int8"
-    assert e.precision == "int8"
-    assert e.family == "classic_spruce_deadwood"
-
-    monkeypatch.setattr(mr, "detect_device", lambda: "gpu")
-    e = reg.default_entry()
-    assert e.id == "Spruce_Deadwood_fp16"
-    assert e.precision == "fp16"
-    assert e.family == "classic_spruce_deadwood"
-
-    monkeypatch.setattr(mr, "detect_device", lambda: "coreml")
-    e = reg.default_entry()
-    assert e.id == "Spruce_Deadwood"
-    assert e.precision == "fp32"
-    assert e.family == "classic_spruce_deadwood"
-
-    # explicit device argument wins over detection
-    monkeypatch.setattr(mr, "detect_device", _boom)
-    assert reg.default_entry(device="cpu").id == "Spruce_Deadwood_int8"
-    assert reg.default_entry(device="gpu").id == "Spruce_Deadwood_fp16"
-    assert reg.default_entry(device="coreml").id == "Spruce_Deadwood"
-
-
-# --- CoreML is its own device class -----------------------------------------
-#
-# Measured on an M2 (onnxruntime 1.27, Spruce_Deadwood, batch 2):
-#   fp32 CoreML 0.172 s/image | int8 CoreML 0.594 | fp16 CoreML 2.268
-#   fp32 CPU    2.237         | int8 CPU    0.547 | fp16 CPU    2.282
-# fp16 -- the right GPU precision on CUDA -- is 13x the fp32 cost on
-# CoreML and no faster than the CPU provider, with 69 of 74 nodes
-# reported supported (so: not a fallback, fp16 itself). End to end on a
-# 182-tile orthomosaic: 429.8 s fp16 vs 61.2 s fp32.
-
-def test_coreml_prefers_fp32_and_cuda_still_prefers_fp16():
-    """The regression this device class exists for: an Apple machine
-    must not be handed the fp16 build, and a CUDA one must still get
-    it."""
-    reg = mr.load_registry(SHIPPED_CONFIG)
-    assert reg.default_entry(device="coreml").precision == "fp32"
-    assert reg.default_entry(device="gpu").precision == "fp16"
-    assert reg.default_entry(device="cpu").precision == "int8"
-    # ...for every family, not just the shipped default's
-    for fam in reg.families.values():
-        entry = reg.resolve(fam.id, device="coreml", variant="default")
-        assert entry.precision == "fp32", fam.id
-        assert entry.id == fam.default, fam.id
-
-
-def test_detect_device_reports_coreml_on_apple_silicon(monkeypatch):
-    """Darwin/arm64 is its own answer -- it used to fall through the
-    nvidia-smi probe to 'cpu', while HardwareInfo called the same
-    machine a GPU. WINMOL_DEVICE still overrides, and neither path
-    shells out."""
-    monkeypatch.delenv("WINMOL_DEVICE", raising=False)
-    monkeypatch.setattr(subprocess, "run", _boom)
-    monkeypatch.setattr(mr.platform, "system", lambda: "Darwin")
-    monkeypatch.setattr(mr.platform, "machine", lambda: "arm64")
-    mr._DEVICE_PROBE_CACHE.pop("probe", None)
-    assert mr.detect_device() == "coreml"
-
-    for forced, want in (("coreml", "coreml"), ("metal", "coreml"),
-                         ("mps", "coreml"), ("cpu", "cpu"),
-                         ("cuda", "gpu"), ("gpu", "gpu")):
-        monkeypatch.setenv("WINMOL_DEVICE", forced)
-        assert mr.detect_device() == want
-
-    # an Intel Mac / Linux box is unaffected: still the nvidia-smi probe
-    monkeypatch.delenv("WINMOL_DEVICE", raising=False)
-    monkeypatch.setattr(mr.platform, "machine", lambda: "x86_64")
-    mr._DEVICE_PROBE_CACHE["probe"] = "gpu"
-    assert mr.detect_device() == "gpu"
-    mr._DEVICE_PROBE_CACHE.pop("probe", None)
-
-
-def test_coreml_key_is_optional_and_defaults_to_fp32(tmp_path):
-    """A registry that predates the third device class still loads, and
-    a family with no ``coreml`` key still lands on its fp32 reference —
-    not on the fp16 (GPU) build, and not on the declared int8 default,
-    which is a CPU size/speed decision and 3.5x slower on CoreML."""
-    base = json.load(open(SHIPPED_CONFIG))
-    for fam in base["families"].values():
-        fam.pop("coreml", None)
-    cfg = tmp_path / "no_coreml.json"
-    cfg.write_text(json.dumps(base))
-    reg = mr.load_registry(str(cfg))
-    assert reg.families["classic_spruce_deadwood"].coreml is None
-    assert reg.default_entry(device="coreml").id == "Spruce_Deadwood"
-    assert (reg.resolve("classic_general", device="coreml",
-                        variant="default").id == "General")
-    # and an unknown reference is still rejected
-    base["families"]["classic_general"]["coreml"] = "NoSuchModel"
-    bad = tmp_path / "bad_coreml.json"
-    bad.write_text(json.dumps(base))
-    with pytest.raises(ValueError) as exc:
-        mr.load_registry(str(bad))
-    assert "NoSuchModel" in str(exc.value)
-
-
-def test_coreml_does_not_disturb_the_registry_invariants():
-    """gui_default, the ranking and the digest invariant are properties
-    of ENTRIES; adding a device key to families must not touch them."""
-    reg = mr.load_registry(SHIPPED_CONFIG)
-    assert reg.gui_default == "Spruce_Deadwood_int8"
-    assert reg.recommended[0] == reg.gui_default
-    assert reg.unpinned() == []
-    # every coreml target is a real, downloadable, visible entry
-    for fam in reg.families.values():
-        if fam.coreml is None:
-            continue
-        entry = reg.entries[fam.coreml]
-        assert entry.url and (entry.sha256 or entry.md5)
-        assert not entry.hidden
-
-
-def test_default_entry_never_downloads_or_hits_network(monkeypatch,
-                                                       tmp_path):
-    """Resolving the default must not fetch anything, and must not
-    shell out to nvidia-smi when the device is given."""
-    reg = mr.load_registry(SHIPPED_CONFIG)
-    monkeypatch.setattr(mr, "_DEFAULT_FETCHER", _boom)
-    monkeypatch.setattr(subprocess, "run", _boom)
-    for device in ("cpu", "gpu"):
-        e = reg.default_entry(device=device)
-        assert not os.path.exists(mr.local_path(e, str(tmp_path)))
-    # WINMOL_DEVICE short-circuits the probe too (still no subprocess)
-    monkeypatch.setenv("WINMOL_DEVICE", "gpu")
-    mr._DEVICE_PROBE_CACHE.pop("probe", None)
-    assert reg.default_entry().id == "Spruce_Deadwood_fp16"
-    monkeypatch.setenv("WINMOL_DEVICE", "cpu")
-    assert reg.default_entry().id == "Spruce_Deadwood_int8"
-
-
-def test_explicit_selection_overrides_device_default(monkeypatch):
-    """The device rule applies to the DEFAULT only: an explicit entry
-    id or a forced variant is never rewritten."""
-    reg = mr.load_registry(SHIPPED_CONFIG)
-    monkeypatch.setattr(mr, "detect_device", lambda: "gpu")
-    assert reg.default_entry().id == "Spruce_Deadwood_fp16"
-    # user explicitly asks for the fp32 classic -> untouched
-    assert reg.resolve("Spruce_Deadwood").id == "Spruce_Deadwood"
-    # ...or for int8 on that GPU box -> honoured
-    assert (reg.resolve("classic_spruce_deadwood", device="gpu",
-                        variant="int8").id == "Spruce_Deadwood_int8")
-    # ...or a different family entirely
-    assert reg.resolve("HRNet_Beech").id == "HRNet_Beech"
-
-
-def test_recommended_validation(tmp_path):
-    """A registry whose ranking disagrees with gui_default, or names an
-    unknown id, is rejected at load time."""
-    base = json.load(open(SHIPPED_CONFIG))
-
-    bad = dict(base, recommended=["UNet_PT_int8", "Spruce_Deadwood_int8"])
-    cfg = tmp_path / "disagree.json"
-    cfg.write_text(json.dumps(bad))
-    with pytest.raises(ValueError) as exc:
-        mr.load_registry(str(cfg))
-    assert "gui_default" in str(exc.value)
-
-    bad = dict(base, recommended=["NoSuchModel"], gui_default="NoSuchModel")
-    cfg = tmp_path / "unknown.json"
-    cfg.write_text(json.dumps(bad))
-    with pytest.raises(ValueError):
-        mr.load_registry(str(cfg))
-
-    # absent 'recommended' -> gui_default is the ranking (back-compat)
-    ok = {k: v for k, v in base.items() if k != "recommended"}
-    cfg = tmp_path / "norec.json"
-    cfg.write_text(json.dumps(ok))
-    reg = mr.load_registry(str(cfg))
-    assert reg.recommended == ["Spruce_Deadwood_int8"]
-    assert reg.default_entry(device="cpu").id == "Spruce_Deadwood_int8"
-
-
-# --- resolution --------------------------------------------------------------
-
-def test_resolve_explicit_id_never_rewritten():
-    reg = mr.load_registry(SHIPPED_CONFIG)
-    for device in ("cpu", "gpu"):
-        e = reg.resolve("General", device=device)
-        assert e.id == "General"
-        assert e.file == CLASSIC_ASSETS[0]
-    # explicit variant ids resolve to themselves too
-    assert reg.resolve("UNet_PT_int8", device="gpu").id == "UNet_PT_int8"
-
-
-def test_resolve_family_auto_substitutes_only_lossless():
-    reg = mr.load_registry(SHIPPED_CONFIG)
-    # classic int8 is domain-calibrated (lossless: false) -> stays fp32
-    assert reg.resolve("classic_general", device="cpu").id == "General"
-    # classic fp16 is lossless -> substituted on gpu
-    assert (reg.resolve("classic_general", device="gpu").id
-            == "General_fp16")
-    # PyTorch UNet int8 is certified lossless -> substituted on cpu
-    assert reg.resolve("unet_pt", device="cpu").id == "UNet_PT_int8"
-    assert reg.resolve("unet_pt", device="gpu").id == "UNet_PT_fp16"
-    # deeplab has no cpu variant -> family default
-    assert reg.resolve("deeplab", device="cpu").id == "DeepLab_Beech"
-    assert reg.resolve("hrnet", device="gpu").id == "HRNet_Beech_fp16"
-
-
-def test_resolve_default_variant_is_the_device_default():
-    """``variant="default"`` is the machine's declared default — the
-    device variant WITHOUT auto's lossless gate.
-
-    This is the regression guard for the bug a CPU-only Windows machine
-    hit: ``auto`` refuses the domain-calibrated Spruce_Deadwood_int8
-    (lossless: false) and falls back to the 124.6 MB fp32 reference,
-    while ``default_entry()`` says int8. The registry must not answer
-    "what runs on this machine" two different ways.
-    """
-    reg = mr.load_registry(SHIPPED_CONFIG)
-    fam = reg.entries[reg.gui_default].family
-
-    cpu = reg.resolve(fam, device="cpu", variant="default")
-    assert cpu.id == "Spruce_Deadwood_int8"
-    assert cpu.size_mb == 31.4
-    assert cpu.id == reg.default_entry(device="cpu").id
-
-    gpu = reg.resolve(fam, device="gpu", variant="default")
-    assert gpu.id == "Spruce_Deadwood_fp16"
-    assert gpu.id == reg.default_entry(device="gpu").id
-
-    # auto keeps its gate: unchanged, and demonstrably different on CPU
-    assert reg.resolve(fam, device="cpu", variant="auto").id == \
-        "Spruce_Deadwood"
-
-
-def test_default_variant_agrees_with_default_entry_for_every_family():
-    """The two APIs share ``_device_variant``; assert the equality that
-    made them diverge is now impossible to reintroduce family-wise."""
-    reg = mr.load_registry(SHIPPED_CONFIG)
-    for fam in reg.families.values():
-        for device in ("cpu", "gpu", "coreml"):
-            entry = reg.resolve(fam.id, device=device, variant="default")
-            want = {"cpu": fam.cpu, "gpu": fam.gpu,
-                    "coreml": fam.coreml or fam.default}[device]
-            assert entry.id == (want or fam.default)
-
-
-def test_resolve_forced_variant():
-    reg = mr.load_registry(SHIPPED_CONFIG)
-    assert (reg.resolve("classic_spruce", device="gpu", variant="fp32").id
-            == "Spruce")
-    assert (reg.resolve("classic_spruce", device="gpu", variant="int8").id
-            == "Spruce_int8")
-    with pytest.raises(ValueError):
-        reg.resolve("deeplab", device="cpu", variant="int8")
-
-
-def test_resolve_case_insensitive_and_errors():
-    reg = mr.load_registry(SHIPPED_CONFIG)
-    assert reg.get("spruce_deadwood").id == "Spruce_Deadwood"
-    assert reg.get("unet_pt_int8").id == "UNet_PT_int8"
-    # "unet_pt" (exact family id) auto-picks; a case-insensitive match
-    # of the ENTRY id "UNet_PT" wins over the family and stays fp32.
-    assert reg.resolve("unet_pt", device="cpu").id == "UNet_PT_int8"
-    assert reg.resolve("UNET_PT", device="cpu").id == "UNet_PT"
-    with pytest.raises(KeyError) as exc:
-        reg.get("NoSuchModel")
-    assert "UNet_PT" in str(exc.value)   # error names the visible ids
-
-
-# --- download / verify -------------------------------------------------------
-
-def test_download_atomic_and_verified(tmp_path):
-    entry = _entry(tmp_path)
-    seen = {}
-
-    def fetch(url, tmp, progress, timeout):
-        assert tmp.endswith(".part")
-        seen["final_during_fetch"] = os.path.exists(tmp[:-5])
-        with open(tmp, "wb") as f:
-            f.write(b"DATA")
-
-    path = mr.download_model(entry, str(tmp_path), fetcher=fetch)
-    assert path == os.path.join(str(tmp_path), "x.onnx")
-    with open(path, "rb") as f:
-        assert f.read() == b"DATA"
-    # never visible at the final name mid-fetch; no .part left behind
-    assert seen["final_during_fetch"] is False
-    assert not os.path.exists(path + ".part")
-    # digest recorded in the verification cache
-    with open(os.path.join(str(tmp_path), mr.VERIFIED_CACHE)) as f:
-        cache = json.load(f)
-    assert cache["x.onnx"]["digest"] == entry.sha256
-
-
-def test_download_checksum_mismatch(tmp_path):
-    entry = _entry(tmp_path, data=b"GOOD")
-    with pytest.raises(mr.ModelDownloadError) as exc:
-        mr.download_model(entry, str(tmp_path), fetcher=_writer(b"BAD"))
-    assert "checksum mismatch" in str(exc.value)
-    assert exc.value.model_id == "X"
-    assert not os.path.exists(tmp_path / "x.onnx")
-    assert not os.path.exists(tmp_path / "x.onnx.part")
-
-
-def test_ensure_model_heals_stale_file(tmp_path):
-    entry = _entry(tmp_path, data=b"FRESH")
-    dest = tmp_path / "x.onnx"
-    dest.write_bytes(b"stale-or-truncated")
-    path = mr.ensure_model(entry, str(tmp_path), fetcher=_writer(b"FRESH"))
-    assert path == str(dest)
-    assert dest.read_bytes() == b"FRESH"    # size>0 hole is closed
-
-
-def test_ensure_model_no_checksum_keeps_existing(tmp_path):
-    entry = _entry(tmp_path, checksum=False)
-    dest = tmp_path / "x.onnx"
-    dest.write_bytes(b"whatever")
-    # legacy behavior: no checksum -> any non-empty file is accepted
-    path = mr.ensure_model(entry, str(tmp_path), fetcher=_boom)
-    assert path == str(dest)
-    assert dest.read_bytes() == b"whatever"
-
-
-def test_ensure_model_no_download(tmp_path):
-    entry = _entry(tmp_path, data=b"DATA")
-    with pytest.raises(mr.ModelDownloadError):
-        mr.ensure_model(entry, str(tmp_path), fetcher=_boom,
-                        allow_download=False)
-    # present + verified file returns immediately, fetcher never called
-    (tmp_path / "x.onnx").write_bytes(b"DATA")
-    path = mr.ensure_model(entry, str(tmp_path), fetcher=_boom,
-                           allow_download=False)
-    assert path == str(tmp_path / "x.onnx")
-
-
-def test_verify_cache_avoids_rehashing(tmp_path, monkeypatch):
-    entry = _entry(tmp_path, data=b"DATA")
-    calls = []
-    real = mr._hash_file
-
-    def counting(path, algo):
-        calls.append(os.path.basename(path))
-        return real(path, algo)
-
-    monkeypatch.setattr(mr, "_hash_file", counting)
-    mr.ensure_model(entry, str(tmp_path), fetcher=_writer(b"DATA"))
-    n_after_download = len(calls)
-    assert n_after_download >= 1
-    # second call: stat + cache lookup, no re-hash
-    mr.ensure_model(entry, str(tmp_path), fetcher=_boom)
-    assert len(calls) == n_after_download
-
-
-def test_progress_callback(tmp_path):
-    entry = _entry(tmp_path, checksum=False)
-    got = []
-
-    def fetch(url, tmp, progress, timeout):
-        chunk = b"abc" * 100
-        with open(tmp, "wb") as f:
-            for i in range(3):
-                f.write(chunk)
-                progress((i + 1) * len(chunk), 3 * len(chunk))
-
-    mr.download_model(entry, str(tmp_path), fetcher=fetch,
-                      progress=lambda d, t, e: got.append((d, t, e)))
-    assert len(got) == 3
-    assert [d for d, _t, _e in got] == sorted(d for d, _t, _e in got)
-    assert all(e is entry for _d, _t, e in got)
-    assert all(t == 900 for _d, t, _e in got)
-    # the CLI stderr printer copes with a missing total
-    wb._stderr_progress(500, None, entry)
-    wb._stderr_progress(500, 1000, entry)
-    print(file=sys.stderr)
-
-
-# --- installer integration ---------------------------------------------------
-
-def test_installer_v2_no_startup_network(tmp_path, monkeypatch):
-    monkeypatch.setattr(mr, "_DEFAULT_FETCHER", _boom)
-    cfg = tmp_path / "config.json"
-    cfg.write_text(json.dumps({
-        "schema": 2,
-        "preload": [],
-        "models": {"UNet_PT_int8": {
-            "label": "UNet PT int8",
-            "url": "https://example.invalid/uw05_int8.onnx",
-            "file": "uw05_int8.onnx",
-        }},
-    }))
-    # preload=[] -> zero network I/O at startup, nothing missing
-    assert inst.download_models(str(tmp_path), str(cfg)) == []
-
-    cfg.write_text(json.dumps({
-        "schema": 2,
-        "preload": ["UNet_PT_int8"],
-        "models": {"UNet_PT_int8": {
-            "label": "UNet PT int8",
-            "url": "https://example.invalid/uw05_int8.onnx",
-            "file": "uw05_int8.onnx",
-        }},
-    }))
-    # a failing fetch is reported, not raised (tolerant contract, v2 too)
-    assert inst.download_models(str(tmp_path), str(cfg)) == ["UNet_PT_int8"]
-
-
-# --- batch CLI ---------------------------------------------------------------
-
-def test_batch_resolution_shipped_v2(tmp_path):
-    paths = wb.load_model_paths(config_path=SHIPPED_CONFIG,
-                                model_dir=str(tmp_path))
-    # classic ids keep working; they now resolve to the models-v1
-    # asset basenames they were repointed onto
-    for name, asset in zip(CLASSIC, CLASSIC_ASSETS):
-        assert paths[name] == str(tmp_path / asset)
-    # zoo ids resolve to the release asset basenames
-    assert (paths["UNet_PT_int8"]
-            == str(tmp_path / "model_UNet_SpecDS_Beech_512"
-                              "_pytorch_w05_int8.onnx"))
-    # hdf5 originals are addressable from the CLI (TF users)
-    assert (paths["Spruce_Deadwood_hdf5"]
-            == str(tmp_path
-                   / "model_UNet_SpecDS_Spruce_Deadwood_512"
-                     "_2024-12-19_194758.hdf5"))
-
-
-def test_batch_resolution_v1_byte_identical(tmp_path):
-    cfg = tmp_path / "config.json"
-    cfg.write_text(json.dumps({
-        "A": "https://h.invalid/some_asset.onnx?download=1",
-        "B": "https://h.invalid/sub/B.onnx",
-    }))
-    paths = wb.load_model_paths(config_path=str(cfg),
-                                model_dir="/m")
-    # v1 keeps the legacy URL-basename naming (url_to_filename)
-    assert paths == {"A": os.path.join("/m", "some_asset.onnx"),
-                     "B": os.path.join("/m", "B.onnx")}
-
-
-def test_batch_no_download_missing_exits_2(tmp_path, capsys):
-    rc = wb.main(["UNet_PT_int8", "--no-download",
-                  "--model-dir", str(tmp_path),
-                  "--input", str(tmp_path)])
-    assert rc == 2
-    out = capsys.readouterr().out
-    # source-specific manual hint for a zoo asset
-    assert "WINMOL_segmentor_pt" in out
-    assert "model_UNet_SpecDS_Beech_512_pytorch_w05_int8.onnx" in out
-
-
-def test_batch_lowercase_general_still_resolves(tmp_path, capsys):
-    # Dockerfile compat: lowercase names resolve to the canonical id.
-    rc = wb.main(["general", "--no-download",
-                  "--model-dir", str(tmp_path),
-                  "--input", str(tmp_path)])
-    assert rc == 2          # file missing, but the NAME resolved
-    out = capsys.readouterr().out
-    assert "model_UNet_GenDS_512_2023-02-27_211141.onnx" in out
-    assert "WINMOL_segmentor_pt" in out   # repointed onto the zoo release
-
-
-def test_batch_download_on_demand(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(mr, "_DEFAULT_FETCHER", _writer(b"not-a-model"))
-    # checksum mismatch from the stub -> clean exit 2 with the cause
-    rc = wb.main(["UNet_PT_int8",
-                  "--model-dir", str(tmp_path),
-                  "--input", str(tmp_path)])
-    assert rc == 2
-    assert "checksum mismatch" in capsys.readouterr().out
-
-
-def test_batch_list_models(capsys):
-    rc = wb.main(["--list-models"])
-    assert rc == 0
-    out = capsys.readouterr().out
-    assert "UNet_PT_int8" in out
-    assert "unet_pt" in out          # family ids listed too
-    assert "General" in out
-
-
-def test_batch_variant_forced_unavailable_exits_2(tmp_path, capsys):
-    rc = wb.main(["deeplab", "--variant", "int8", "--no-download",
-                  "--model-dir", str(tmp_path),
-                  "--input", str(tmp_path)])
-    assert rc == 2
-    assert "int8" in capsys.readouterr().out
-
-
-# --- import safety -----------------------------------------------------------
-
-def test_registry_import_safety():
-    code = (
-        "import sys; sys.path.insert(0, {repo!r})\n"
-        "import plugin_utils.model_registry\n"
-        "bad = [m for m in sys.modules\n"
-        "       if m.split('.')[0] in ('qgis', 'PyQt5', 'PyQt6')]\n"
-        "print(','.join(bad))\n"
-    ).format(repo=REPO)
-    out = subprocess.run([sys.executable, "-c", code],
-                         capture_output=True, text=True, timeout=60)
-    assert out.returncode == 0, out.stderr
-    assert out.stdout.strip() == ""
-
-
-# --- on-disk state, verification, removal (the Setup tab's model half) -------
-
-def test_installed_state_missing_and_zero_byte(tmp_path):
-    entry = _entry(tmp_path)
-    assert mr.installed_state(entry, str(tmp_path)) == "missing"
-    (tmp_path / entry.file).write_bytes(b"")
-    assert mr.installed_state(entry, str(tmp_path)) == "missing"
-
-
-def test_installed_state_present_then_verified(tmp_path):
-    entry = _entry(tmp_path, data=b"DATA")
-    (tmp_path / entry.file).write_bytes(b"DATA")
-    # stat-only: a file nobody has hashed yet is 'present', never
-    # 'verified' — the tree must not claim a guarantee it has not checked
-    assert mr.installed_state(entry, str(tmp_path)) == "present"
-    assert mr.verify_entry(entry, str(tmp_path)) is True
-    assert mr.installed_state(entry, str(tmp_path)) == "verified"
-
-
-def test_installed_state_unpinned_is_not_verified(tmp_path):
-    entry = _entry(tmp_path, checksum=False)
-    (tmp_path / entry.file).write_bytes(b"whatever")
-    assert mr.installed_state(entry, str(tmp_path)) == "unpinned"
-    # verify_file() would say True for it; the state must not
-    assert mr.verify_file(str(tmp_path / entry.file)) is True
-
-
-def test_installed_state_corrupt_after_a_failed_verify(tmp_path):
-    entry = _entry(tmp_path, data=b"DATA")
-    (tmp_path / entry.file).write_bytes(b"TRUNCATED")
-    assert mr.verify_entry(entry, str(tmp_path)) is False
-    assert mr.installed_state(entry, str(tmp_path)) == "corrupt"
-    # and a failure memo can never be mistaken for a pass
-    assert mr.verify_file(str(tmp_path / entry.file),
-                          sha256=entry.sha256,
-                          cache_dir=str(tmp_path)) is False
-
-
-def test_installed_state_forgets_a_replaced_file(tmp_path):
-    entry = _entry(tmp_path, data=b"DATA")
-    (tmp_path / entry.file).write_bytes(b"TRUNCATED")
-    mr.verify_entry(entry, str(tmp_path))
-    assert mr.installed_state(entry, str(tmp_path)) == "corrupt"
-    os.utime(str(tmp_path / entry.file), (1, 1))
-    (tmp_path / entry.file).write_bytes(b"DATA")
-    # different size/mtime -> the stale verdict must not stick
-    assert mr.installed_state(entry, str(tmp_path)) == "present"
-
-
-def test_verify_entry_reports_byte_progress(tmp_path):
-    data = b"D" * (3 * mr._CHUNK_BYTES + 17)
-    entry = _entry(tmp_path, data=data)
-    (tmp_path / entry.file).write_bytes(data)
-    seen = []
-    assert mr.verify_entry(entry, str(tmp_path),
-                           progress=lambda d, t: seen.append((d, t))) is True
-    assert seen[-1] == (len(data), len(data))
-    assert len(seen) >= 4 and all(t == len(data) for _d, t in seen)
-
-
-def test_verify_entry_without_a_digest_is_vacuously_true(tmp_path):
-    entry = _entry(tmp_path, checksum=False)
-    (tmp_path / entry.file).write_bytes(b"x")
-    assert mr.verify_entry(entry, str(tmp_path)) is True
-    # ...and writes no memo that could later read as 'verified'
-    assert mr.installed_state(entry, str(tmp_path)) == "unpinned"
-
-
-def test_verify_entry_on_a_missing_file(tmp_path):
-    assert mr.verify_entry(_entry(tmp_path), str(tmp_path)) is False
-
-
-def test_remove_model_takes_the_part_file_and_the_memo(tmp_path):
-    entry = _entry(tmp_path, data=b"DATA")
-    (tmp_path / entry.file).write_bytes(b"DATA")
-    (tmp_path / (entry.file + ".part")).write_bytes(b"XX")
-    mr.verify_entry(entry, str(tmp_path))
-    assert entry.file in mr._cache_load(str(tmp_path))
-
-    freed = mr.remove_model(entry, str(tmp_path))
-    assert freed == 6
-    assert not (tmp_path / entry.file).exists()
-    assert not (tmp_path / (entry.file + ".part")).exists()
-    # nothing else in the tree prunes this cache; a re-download of a
-    # same-sized file would otherwise inherit the old verdict
-    assert entry.file not in mr._cache_load(str(tmp_path))
-    assert mr.installed_state(entry, str(tmp_path)) == "missing"
-
-
-def test_remove_model_prunes_the_memo_under_the_key_verify_file_wrote(
-        tmp_path):
-    """verify_file() keys the memo by basename(local_path); remove_model()
-    keyed it by entry.file. Those coincide for every entry shipped today
-    and diverge silently the moment an entry.file carries a subdirectory —
-    leaving a stale "verified" verdict behind for the next download."""
-    entry = _entry(tmp_path, data=b"DATA", file=os.path.join("sub",
-                                                             "x.onnx"))
-    (tmp_path / "sub").mkdir()
-    (tmp_path / entry.file).write_bytes(b"DATA")
-    mr.verify_entry(entry, str(tmp_path))
-    assert "x.onnx" in mr._cache_load(str(tmp_path))
-
-    mr.remove_model(entry, str(tmp_path))
-    assert "x.onnx" not in mr._cache_load(str(tmp_path)), (
-        "the memo survived the deletion under its real key")
-
-
-def test_remove_model_absent_is_zero_not_an_error(tmp_path):
-    assert mr.remove_model(_entry(tmp_path), str(tmp_path)) == 0
-
-
-def test_remove_all(tmp_path):
-    reg = mr.load_registry(SHIPPED_CONFIG)
-    models = tmp_path / "models"
-    models.mkdir()
-    first, second = list(reg.entries.values())[:2]
-    (models / first.file).write_bytes(b"a" * 100)
-    (models / second.file).write_bytes(b"b" * 50)
-    (models / (second.file + ".part")).write_bytes(b"b" * 5)
-    stranger = models / "my_own_model.onnx"
-    stranger.write_bytes(b"keep me")
-
-    dry = mr.remove_all(reg, str(models), dry_run=True)
-    assert dry["freed_bytes"] == 155
-    assert dry["removed"] == []
-    assert (models / first.file).exists()
-
-    done = mr.remove_all(reg, str(models))
-    assert done["freed_bytes"] == 155
-    assert not (models / first.file).exists()
-    assert not (models / (second.file + ".part")).exists()
-    assert done["failed"] == []
-    # a file the registry does not know about is never touched
-    assert stranger.exists()
-    assert not (models / mr.VERIFIED_CACHE).exists()
+def test_shipped_config_classic_family_names_present():
+    reg = _shipped_registry()
+    assert set(CLASSIC_FAMILIES) <= set(reg.families)
+
+
+@pytest.mark.parametrize("family", CLASSIC_FAMILIES)
+@pytest.mark.parametrize("device", ["cpu", "gpu", "coreml"])
+def test_shipped_config_classic_families_resolve_on_every_device(
+        family, device):
+    reg = _shipped_registry()
+    entry = reg.resolve(family, device=device)
+    assert entry.sha256
+    assert entry.url.lower().startswith("http")
+
+
+def test_shipped_config_default_entry_resolves_on_cpu():
+    reg = _shipped_registry()
+    entry = reg.default_entry(device="cpu")
+    assert entry.id == reg.gui_default
+    assert entry.sha256
+
+
+def test_shipped_config_lossless_flags_match_release_metadata():
+    """fp32 references and the fp16 builds are certified lossless; the
+    Keras-family int8 builds are not; the PyTorch w05 int8 build is the
+    one certified int8 (mirrors the models-v1 release metadata)."""
+    reg = _shipped_registry()
+    for entry in reg.entries.values():
+        if entry.precision in ("fp32", "fp16"):
+            assert entry.lossless, entry.id
+        elif entry.id == "beech_pytorch_int8":
+            assert entry.lossless, entry.id
+        else:
+            assert not entry.lossless, entry.id
+
+
+@pytest.mark.parametrize("family", CLASSIC_FAMILIES)
+def test_shipped_config_auto_variant_refuses_uncertified_int8(family):
+    reg = _shipped_registry()
+    # cpu device rule wants int8, which is not certified -> fp32.
+    assert reg.resolve(family, device="cpu",
+                       variant="auto").precision == "fp32"
+    # gpu wants fp16, which is certified -> substituted.
+    assert reg.resolve(family, device="gpu",
+                       variant="auto").precision == "fp16"
+
+
+def test_shipped_config_has_no_hidden_entries():
+    reg = _shipped_registry()
+    assert [e.id for e in reg.visible()] == list(reg.entries)

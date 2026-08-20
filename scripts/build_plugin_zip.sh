@@ -1,18 +1,22 @@
 #!/usr/bin/env bash
 # Build the installable QGIS plugin zip.
 #
-# Single source of truth for what ships to end users. Used by `make package`
-# and by .github/workflows/on-push-tags.yml, so the local build and the
-# released artifact can never drift apart.
+# Single source of truth for what ships to end users ("Install from ZIP").
+# The runtime is TensorFlow-free (ONNX via onnxruntime); this script packages
+# exactly the CLI/plugin code paths winmol_run.py needs, stripping dev-only
+# tooling (tests, docs, CI config, benchmark/convert scripts, docker files).
 #
 # Why not .gitattributes export-ignore? Because it is not scoped to packaging:
 # `git archive` also backs GitHub's tarball API, which actions/checkout falls
-# back to whenever git is absent (our CI container). Marking tests/ export-ignore
-# therefore deleted tests/ from CI's own checkout. Pruning here keeps the
-# repository intact for every consumer and confines the exclusion to the one
-# place that wants it.
+# back to whenever git is absent. Marking tests/ export-ignore would delete
+# tests/ from CI's own checkout too. Pruning here keeps the repository intact
+# for every consumer and confines the exclusion to the one place that wants it.
 #
 # Usage: scripts/build_plugin_zip.sh <git-ref> <output.zip> [version]
+#
+# Resolves the repo from the script's own location rather than the caller's
+# cwd, so it can be invoked from anywhere (Makefile, CI, or a clean tmp dir
+# in the test suite) — only the output path is relative to the caller.
 set -euo pipefail
 
 REF="${1:-HEAD}"
@@ -20,13 +24,15 @@ OUT="${2:-WINMOL_Analyzer.zip}"
 VERSION="${3:-}"
 PLUGINNAME=WINMOL_Analyzer
 
-# Development-only paths. Verified by an AST scan that no runtime module
-# imports anything under them.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
+
+# Development-only paths, tracked but never imported by the runtime.
 EXCLUDE=(
-  .github .gitignore .gitattributes CLAUDE.md
-  Makefile pb_tool.cfg setup.cfg
-  docker startDocker.sh scripts
-  tests benchmark
+  .github .gitignore
+  Makefile setup.cfg
+  startDocker.sh scripts
+  tests benchmark docker
   docs documentation standalone
   resources.qrc
 )
@@ -38,7 +44,7 @@ OUT_ABS="$(cd "$(dirname "$OUT")" && pwd)/$(basename "$OUT")"
 BUILD="$(mktemp -d)"
 trap 'rm -rf "$BUILD"' EXIT
 
-git archive --prefix="$PLUGINNAME/" "$REF" | tar -x -C "$BUILD"
+git -C "$REPO_ROOT" archive --prefix="$PLUGINNAME/" "$REF" | tar -x -C "$BUILD"
 
 cd "$BUILD/$PLUGINNAME"
 rm -rf "${EXCLUDE[@]}"
@@ -56,8 +62,15 @@ if [ -n "$VERSION" ]; then
 fi
 
 # Fail loudly rather than shipping a package missing its entry point.
-for required in __init__.py metadata.txt winmol_run.py plugin_utils utils classes \
-                requirements resources.py; do
+for required in __init__.py metadata.txt config.json \
+                winmol_run.py winmol_batch.py \
+                winmol_analyzer.py winmol_analyzer_dialog.py \
+                winmol_analyzer_dialog_base.ui tasks_threads.py \
+                plugin_utils utils classes requirements \
+                resources.py icon.png \
+                requirements/cpu.txt requirements/gpu.txt \
+                plugin_utils/model_registry.py plugin_utils/childenv.py \
+                plugin_utils/gpu_probe.py; do
   [ -e "$required" ] || { echo "FATAL: $required missing from package" >&2; exit 1; }
 done
 

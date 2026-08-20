@@ -11,7 +11,7 @@ from rasterio.windows import Window
 
 from classes.Config import Config
 from utils import IO
-from utils.edge_fill import fill_invalid_with_nearest
+from utils.Prediction import _prepare_inference_batch
 
 
 def _config_from_dict(config_dict: dict) -> Config:
@@ -22,42 +22,6 @@ def _config_from_dict(config_dict: dict) -> Config:
         except Exception:
             pass
     return cfg
-
-
-def _to_float32_image(arr):
-    if arr.dtype == np.float32:
-        return arr
-    if np.issubdtype(arr.dtype, np.integer):
-        return (arr / 255.0).astype(np.float32, copy=False)
-    return arr.astype(np.float32, copy=False)
-
-
-def _raw_tile_to_batchable(tile_img):
-    tile_img = _to_float32_image(tile_img)
-    if tile_img.ndim == 2:
-        tile_img = tile_img[:, :, None]
-    if tile_img.shape[2] < 3:
-        pad = np.zeros(
-            (tile_img.shape[0], tile_img.shape[1], 3 - tile_img.shape[2]),
-            dtype=np.float32,
-        )
-        tile_img = np.concatenate([tile_img, pad], axis=2)
-    return tile_img[:, :, :3]
-
-
-def _prepare_inference_batch(raw_tiles, raw_masks, config):
-    """Delegate to the migrated implementation in utils.Prediction.
-
-    This module once carried its own copy of the batch-prep resize, so the
-    MULTI-GPU path could diverge from the single-GPU one (it only surfaces with
-    more than one GPU, which is why a single-GPU machine never hit it).
-    Delegating rather than porting the code a second time keeps the single-GPU
-    and multi-GPU paths bit-identical by construction — the golden fixtures pin
-    the Prediction version, and a divergent copy here could drift from them
-    unnoticed.
-    """
-    from utils.Prediction import _prepare_inference_batch as _prepare
-    return _prepare(raw_tiles, raw_masks, config)
 
 
 def _resampling_layout(shape, profile, config):
@@ -133,8 +97,13 @@ def _format_eta(seconds: float) -> str:
 
 
 def _predict_batch(raw_tiles, raw_masks, model, config):
+    # This path loads the RAW model (wrap_preprocess=False) and supplies
+    # tiles already on the model grid, so batch preparation must take the
+    # float path regardless of the session-wide read-strategy flag --
+    # under the `graph` default it would otherwise feed uint8 to a model
+    # without the in-graph preprocessing.
     tile_tensor, mask_resized = _prepare_inference_batch(
-        raw_tiles, raw_masks, config)
+        raw_tiles, raw_masks, config, read_strategy="native")
     pred = model.predict_on_batch(tile_tensor)
     crop = config.overlap_pred // 2
     threshold = float(getattr(config, 'stem_binary_threshold', 0.5))
@@ -160,7 +129,7 @@ def _group_jobs(jobs, batch_size):
         yield batch
 
 
-def _read_batch_jobs(src, indexes, batch_jobs, fill_invalid=True):
+def _read_batch_jobs(src, indexes, batch_jobs):
     raw_tiles = []
     raw_masks = []
     stats = {
@@ -197,9 +166,6 @@ def _read_batch_jobs(src, indexes, batch_jobs, fill_invalid=True):
             pixel_mask if np.all(gdal_mask) else (gdal_mask & pixel_mask)
         stats['prep_s'] += time.perf_counter() - t0
 
-        if fill_invalid:
-            tile = fill_invalid_with_nearest(tile, valid_mask)
-
         raw_tiles.append(tile)
         raw_masks.append(valid_mask)
     stats['read_s'] = \
@@ -215,13 +181,11 @@ def prediction_worker(
     results,
     config_dict: dict,
 ):
-    # Pins this worker to one GPU. onnxruntime honours CUDA_VISIBLE_DEVICES,
-    # so the device is selected before any provider is created.
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
     from utils.IO import load_model_from_path
 
     cfg = _config_from_dict(config_dict)
-    model = load_model_from_path(model_path)
+    model = load_model_from_path(model_path, cfg, wrap_preprocess=False)
     batch_size = max(1, int(getattr(cfg, 'prediction_batch_size', None)
                             or getattr(cfg, 'prediction_batch_gpu', 4)))
 
@@ -229,10 +193,7 @@ def prediction_worker(
         indexes = list(range(1, min(cfg.n_channels, src.count) + 1))
         for batch_jobs in _group_jobs(jobs, batch_size):
             raw_tiles, raw_masks, read_stats = \
-                _read_batch_jobs(
-                    src, indexes, batch_jobs,
-                    fill_invalid=bool(getattr(
-                        cfg, "fill_invalid_before_prediction", True)))
+                _read_batch_jobs(src, indexes, batch_jobs)
             infer0 = time.perf_counter()
             pred_cores = _predict_batch(raw_tiles, raw_masks, model, cfg)
             infer_s = time.perf_counter() - infer0
@@ -255,13 +216,11 @@ def prediction_service_worker(
     results,
     config_dict: dict,
 ):
-    # Pins this worker to one GPU. onnxruntime honours CUDA_VISIBLE_DEVICES,
-    # so the device is selected before any provider is created.
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
     from utils.IO import load_model_from_path
 
     cfg = _config_from_dict(config_dict)
-    model = load_model_from_path(model_path)
+    model = load_model_from_path(model_path, cfg, wrap_preprocess=False)
     batch_size = max(1, int(getattr(cfg, 'prediction_batch_size', None)
                             or getattr(cfg, 'prediction_batch_gpu', 4)))
 
@@ -286,10 +245,7 @@ def prediction_service_worker(
 
             for batch_jobs in _group_jobs(jobs, batch_size):
                 raw_tiles, raw_masks, read_stats = \
-                    _read_batch_jobs(
-                        src, indexes, batch_jobs,
-                        fill_invalid=bool(getattr(
-                            cfg, "fill_invalid_before_prediction", True)))
+                    _read_batch_jobs(src, indexes, batch_jobs)
                 infer0 = time.perf_counter()
                 pred_cores = _predict_batch(raw_tiles, raw_masks, model, cfg)
                 stats['infer_s'] += time.perf_counter() - infer0
@@ -530,7 +486,6 @@ def run_multi_gpu_prediction(
                     (total_tiles - done) / rate if rate > 0 else float('inf')
                 print(
                     f"Multi-GPU prediction {done}/{total_tiles} | "
-                    f"prediction tile | "
                     f"{done / total_tiles:.1%} | {rate * 60:.1f} tiles/min"
                     f" | ETA {_format_eta(eta_s)} | avg read "
                     f"{total_read_s / max(done, 1):.3f}s infer "

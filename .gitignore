@@ -1,6 +1,3 @@
-# Local Claude Code settings (machine-local, not shared)
-.claude/
-
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -29,6 +26,11 @@ share/python-wheels/
 *.egg
 MANIFEST
 models/
+
+# Packaged plugin zips built by scripts/build_plugin_zip.sh (make package,
+# CI release, or a local proof build) — never a source artifact.
+WINMOL_Analyzer-*.zip
+WINMOL_Analyzer_QGIS_Plugin.zip
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -167,8 +169,3 @@ cython_debug/
 # venv created by plugin
 winmol_venv
 venv
-__autograph_generated_file*.py
-pytest-of-*/
-winmol_fixture_tiles_*/
-winmol_test_tiles_*/
-benchmark/out/

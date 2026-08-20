@@ -1,50 +1,5 @@
-# SHARED FRAGMENT — NOBODY INSTALLS THIS DIRECTLY.
-#
-# The geo/raster stack the compute pipeline actually imports, and NO inference
-# runtime. Every installable file starts with `-r core.txt` and then adds
-# exactly one runtime:
-#
-#   cpu.txt = core.txt + onnxruntime      (CLI, QGIS plugin venv, any OS)
-#   gpu.txt = core.txt + onnxruntime-gpu  (NVIDIA CUDA)
-#   ci.txt  = cpu.txt  + pytest           (the CI test image)
-#
-# ci.txt hangs off cpu.txt, NOT off this file, and that is the point: CI must
-# install exactly what a user installs, or it validates an environment nobody
-# runs. See "The four environments" in requirements/README.md, and
-# tests/test_ci_parity.py, which fails the build if the two ever diverge.
-#
-# That split is not cosmetic. `onnxruntime` and `onnxruntime-gpu` both provide
-# the `onnxruntime` module and must never be co-installed, so the file the CPU
-# and GPU environments share must not name either of them. Keeping this file
-# runtime-free is what makes the mistake structurally impossible instead of a
-# thing a comment asks you not to make.
-#
-# See requirements/README.md for the "which file do I install" table.
-#
-# WHY THESE ARE PINNED, AND WHY THE PINS LIVE HERE RATHER THAN IN ci.txt.
-#
-# tests/generate_fixtures.py records the versions that produced the golden
-# fixtures into tests/fixtures/manifest.json. That list is the definition of
-# "fixture-relevant", and it is exactly: python, numpy, shapely, rasterio,
-# scikit-image, scipy. Every one of them is pinned below, so the environment
-# users install is the environment the fixtures were generated under — which
-# is what makes a green CI run evidence about a real user's machine.
-#
-# numpy used to be pinned in ci.txt alone. That was the bug: the golden
-# fixtures were declared reproducible under numpy 1.26.4 while every shipped
-# environment floated to whatever the resolver picked.
-#
-# NOT pinned here, deliberately: pandas, fiona and pyproj. They were pinned in
-# ci.txt (2.2.3 / 1.10.1 / 3.6.1) under a reproducibility rationale that does
-# not survive checking — none of the three appears in manifest.json, and the
-# development machine that regenerates the fixtures runs pandas 3.0.3 and
-# pyproj 3.7.2 with a green suite. fiona is not imported anywhere in this repo
-# at all (geopandas pulls it in; the suite READS GeoPackages through pyogrio).
-# Pinning them would have forced users onto versions nothing verifies.
-#
-# Pillow is not imported anywhere in this repo either; it is a hard dependency
-# of scikit-image, pinned only so fixture reproducibility does not hinge on
-# whichever Pillow the resolver happens to pick.
+# Shared geo/science stack, runtime-free: names NO onnxruntime variant.
+# Include from cpu.txt (or a future gpu.txt) — never install alone.
 Pillow==10.1.0
 Shapely==2.0.2
 geopandas==0.14.0
@@ -53,3 +8,12 @@ rasterio>=1.4,<1.5
 scikit-image==0.22.0
 scipy==1.11.3
 pyogrio>=0.9
+
+# The ONNX *authoring* library, not the runtime (that is onnxruntime,
+# in cpu.txt/gpu.txt, because the two variants must never mix).
+# utils/onnx_preprocess.py imports it at module scope to prepend the
+# normalize + Resize nodes that make prediction_read_strategy=graph --
+# the default -- v0.5-equivalent. Unpinned so it can track protobuf; the
+# numpy pin above is the guard, so an onnx release that demands numpy 2
+# fails the resolve loudly instead of swapping the geo stack's ABI.
+onnx>=1.15

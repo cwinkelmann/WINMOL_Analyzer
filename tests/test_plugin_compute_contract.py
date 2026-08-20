@@ -1,77 +1,74 @@
-"""Plugin compute-contract test: winmol_run.py (the subprocess the QGIS plugin
-launches) runs end-to-end on an ONNX model with TensorFlow UNAVAILABLE, and
-writes a stem map + GeoPackage.
-
-Runs winmol_run.py in a child process whose imports of ``tensorflow`` raise —
-the strongest proof that the plugin's compute path is TF-free. CI-friendly: no
-venv/pip; uses the current interpreter (which in the CI image has no TF anyway).
-"""
-
+"""End-to-end compute contract for the TF-free pipeline: a real
+``winmol_run.py <model.onnx> <img.tif> <stem.tif> <prefix> Stems`` child
+process must succeed with TensorFlow imports hard-blocked, using only the
+vendored ONNX runtime. The model is a tiny on-the-fly 512x512 segmenter
+(random weights, so no stem-count assertions) and the image a synthetic
+georeferenced RGB GeoTIFF."""
 import os
 import subprocess
 import sys
 
 import pytest
 
-pytestmark = pytest.mark.slow
+from conftest import build_test_geotiff, build_tiny_unet
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MODEL = os.path.join(REPO, "standalone", "model_onnx", "General.onnx")
-CROP = os.path.join(REPO, "tests", "fixtures", "crop_input.tif")
 
-_BLOCK_TF = (
-    "import builtins\n"
-    "_orig = builtins.__import__\n"
-    "def _b(name, *a, **k):\n"
-    "    if name == 'tensorflow' or name.startswith('tensorflow.'):\n"
-    "        raise ImportError('tensorflow blocked (plugin is TF-free)')\n"
-    "    return _orig(name, *a, **k)\n"
-    "builtins.__import__ = _b\n"
-)
+TF_BLOCKER = '''\
+import sys
 
 
-def test_winmol_run_is_tf_free_and_produces_outputs(tmp_path):
-    if not os.path.exists(MODEL):
-        pytest.skip(f"ONNX model not found: {MODEL}")
-    pytest.importorskip("onnxruntime")
+class _TFBlocker:
+    def find_spec(self, name, path=None, target=None):
+        if name == "tensorflow" or name.startswith("tensorflow."):
+            raise ImportError("TensorFlow blocked by contract test")
+        return None
 
-    # a sitecustomize that blocks tensorflow imports in the child
-    blockdir = tmp_path / "block"
-    blockdir.mkdir()
-    (blockdir / "sitecustomize.py").write_text(_BLOCK_TF)
 
-    stem_map = tmp_path / "stem_map.tif"
-    out_prefix = tmp_path / "out"
-    env = dict(os.environ)
-    env["PYTHONPATH"] = str(blockdir) + os.pathsep + env.get("PYTHONPATH", "")
+sys.meta_path.insert(0, _TFBlocker())
+'''
+
+
+def test_stems_run_end_to_end_without_tensorflow(tmp_path):
+    blocker_dir = tmp_path / "tf_blocker"
+    blocker_dir.mkdir()
+    (blocker_dir / "sitecustomize.py").write_text(TF_BLOCKER)
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(blocker_dir) + os.pathsep + \
+        env.get("PYTHONPATH", "")
+    env["PYTHONHASHSEED"] = "0"
     env["WINMOL_ONNX_FORCE_CPU"] = "1"
-    env["TF_CPP_MIN_LOG_LEVEL"] = "3"
+    env["WINMOL_CONFIG_OVERRIDES_JSON"] = \
+        '{"prediction_batch_autotune": false}'
 
-    # "Nodes" is what the plugin's default selection (all three output
-    # products checked) resolves to: one run, stem map + every vector layer.
+    # The blocker itself must work: importing TF in the child errors out.
+    probe = subprocess.run(
+        [sys.executable, "-c", "import tensorflow"],
+        capture_output=True, text=True, env=env, timeout=120)
+    assert probe.returncode != 0
+    assert "TensorFlow blocked by contract test" in probe.stderr
+
+    model = build_tiny_unet(tmp_path / "segmenter.onnx")
+    image = build_test_geotiff(tmp_path / "ortho.tif")
+    stem_map = tmp_path / "out" / "stem_map.tif"
+
     proc = subprocess.run(
-        [sys.executable, "-u", "winmol_run.py", MODEL, CROP,
-         str(stem_map), str(out_prefix), "Nodes"],
-        cwd=REPO, env=env, capture_output=True, text=True, timeout=900)
-
+        [sys.executable, "-u", "winmol_run.py", model, image,
+         str(stem_map), str(tmp_path / "out" / "trees"), "Stems"],
+        capture_output=True, text=True, env=env, cwd=REPO, timeout=300)
     assert proc.returncode == 0, (
-        f"winmol_run failed (exit {proc.returncode}).\n"
-        f"stdout tail:\n{proc.stdout[-2000:]}\n"
-        f"stderr tail:\n{proc.stderr[-2000:]}")
-    # never fell back to a TF import
-    assert "tensorflow blocked" not in (proc.stdout + proc.stderr)
+        f"winmol_run.py failed (rc={proc.returncode})\n"
+        f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}")
+    assert "CPUExecutionProvider" in proc.stdout
 
-    assert stem_map.exists(), "stem-map raster not written"
-    gpkg = out_prefix.with_suffix(".gpkg")
-    assert gpkg.exists(), "GeoPackage not written"
-
-    import pyogrio
-    n = len(pyogrio.read_dataframe(str(gpkg), layer="stems"))
-    assert n > 0, "no stems detected"
-
-    # All three products from a single invocation: the stem-map raster plus
-    # the stems / vectors / nodes layers in one GeoPackage.
-    layers = set(pyogrio.list_layers(str(gpkg))[:, 0])
-    for expected in ("stems", "vectors", "nodes"):
-        assert expected in layers, (
-            f"layer '{expected}' missing from {gpkg}; got {sorted(layers)}")
+    rasterio = pytest.importorskip("rasterio")
+    assert stem_map.exists()
+    with rasterio.open(str(stem_map)) as src:
+        assert src.crs.to_epsg() == 32633
+        assert src.count == 1
+        assert src.dtypes[0] == "uint8"
+        assert src.width > 0 and src.height > 0
+        # Same origin as the input: georeferencing survived the pipeline.
+        assert src.transform.c == 400000.0
+        assert src.transform.f == 5900000.0

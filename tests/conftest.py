@@ -1,118 +1,91 @@
-import json
-import os
+"""Make the repo root importable no matter where pytest is invoked
+from (repo root or tests/). Several test modules also do this insert
+themselves; this covers the ones that import winmol_batch / utils /
+plugin_utils directly."""
 import sys
+from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# Determinism guard (MUST run before anything hashes strings into sets).
-#
-# The pipeline's output depends on set-iteration order because Part.__hash__
-# hashes a tuple containing strings (docs/CODE_REVIEW_2.md A-4). String hashes
-# are salted per process unless PYTHONHASHSEED is fixed, so golden-master
-# comparisons are only meaningful under one specific seed. The fixtures are
-# generated with PYTHONHASHSEED=0; enforce the same here by re-executing
-# pytest when the seed differs. Children spawned by multiprocessing inherit
-# the environment, so pool workers are covered too.
-# ---------------------------------------------------------------------------
-if os.environ.get("PYTHONHASHSEED") != "0":
-    os.environ["PYTHONHASHSEED"] = "0"
-    # pytest's fd-capture is already active while conftest loads, so the
-    # re-exec'd child would write into the (now orphaned) capture pipe and
-    # appear silent. Re-attach stdio to the terminal first; without a tty
-    # (CI, pipes) the run stays silent but the exit code is still correct.
-    try:
-        tty = os.open("/dev/tty", os.O_WRONLY)
-        os.dup2(tty, 1)
-        os.dup2(tty, 2)
-    except OSError:
-        pass
-    os.execv(sys.executable, [sys.executable, "-m", "pytest"] + sys.argv[1:])
+import pytest
 
-# The pretrained WINMOL models are Keras 2 HDF5 artifacts and fail to load under
-# the Keras 3 bundled with TensorFlow >= 2.16. Route tf.keras to the legacy
-# Keras 2 shim (tf-keras). This runs at collection time, before any test module
-# imports TensorFlow.
-os.environ.setdefault("TF_USE_LEGACY_KERAS", "1")
-
-# The prediction batch-size autotune defaults to "auto" (tune once per
-# device+model, then reuse a persisted result). Tests must be hermetic and
-# their outputs machine-independent: the micro-batch changes float
-# accumulation order in the ONNX session, so an autotuned batch would make the
-# golden fixtures depend on which machine ran them. Pin it off for the whole
-# suite -- including the subprocesses that inherit this environment. The tests
-# that exercise the autotune itself set the variable explicitly.
-os.environ.setdefault("WINMOL_BATCH_AUTOTUNE", "off")
-
-import pytest  # noqa: E402
-
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
-for _p in (REPO_ROOT, TESTS_DIR):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-
-FIXTURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "fixtures")
+REPO = Path(__file__).resolve().parent.parent
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
 
 
-def _fixture(name):
-    path = os.path.join(FIXTURES_DIR, name)
-    if not os.path.exists(path):
-        pytest.skip(
-            f"fixture {name} missing — run "
-            f"PYTHONHASHSEED=0 python tests/generate_fixtures.py")
-    return path
+@pytest.fixture(autouse=True)
+def _isolated_autotune_cache(tmp_path, monkeypatch):
+    """Give every test its own throwaway autotune cache file.
 
-
-@pytest.fixture(scope="session")
-def fixtures_dir():
-    if not os.path.isdir(FIXTURES_DIR):
-        pytest.skip("tests/fixtures/ missing — run generate_fixtures.py")
-    return FIXTURES_DIR
-
-
-@pytest.fixture(scope="session")
-def pipeline_config():
-    """Config built from the snapshot the fixtures were generated with.
-
-    Never use bare Config() in golden tests: a future default change would
-    silently invalidate the comparison instead of failing loudly here.
+    Without this, ``_autotune_batch_size`` (utils/Prediction.py) resolves
+    ``plugin_utils.autotune_cache.cache_path()`` to the SAME per-user
+    location a real WINMOL run uses (e.g. ``~/Library/Caches/winmol`` on
+    macOS) whenever a test does not set ``$WINMOL_AUTOTUNE_CACHE`` itself.
+    That would (a) leave real files behind on the machine running the
+    suite, and (b) let two unrelated tests whose (fake model, Config) hash
+    to the same cache key leak a batch size between them. A test that
+    wants a specific cache file (or wants to assert the real per-user
+    default) still wins by setting ``WINMOL_AUTOTUNE_CACHE`` itself after
+    this fixture runs -- monkeypatch layers cleanly.
     """
-    from classes.Config import Config
-    path = _fixture("config_snapshot.json")
-    with open(path) as f:
-        snapshot = json.load(f)
-    config = Config()
-    for key, value in snapshot.items():
-        setattr(config, key, value)
-    return config
+    monkeypatch.setenv(
+        "WINMOL_AUTOTUNE_CACHE", str(tmp_path / "autotune-test-cache.json"))
+
+
+def build_tiny_unet(path):
+    """1-conv sigmoid segmenter, NHWC [b,512,512,3] -> [b,512,512,1].
+    Shared by the compute-contract and read-strategy tests."""
+    onnx = pytest.importorskip("onnx")
+    import numpy as np
+    from onnx import TensorProto, helper
+    s = 512
+    rng = np.random.default_rng(0)
+    w = helper.make_tensor("w", TensorProto.FLOAT, [1, 3, 1, 1],
+                           rng.normal(size=3).astype(np.float32))
+    nodes = [
+        helper.make_node("Transpose", ["input"], ["nchw"], perm=[0, 3, 1, 2]),
+        helper.make_node("Conv", ["nchw", "w"], ["c"]),
+        helper.make_node("Sigmoid", ["c"], ["nchw_out"]),
+        helper.make_node("Transpose", ["nchw_out"], ["output"],
+                         perm=[0, 2, 3, 1]),
+    ]
+    graph = helper.make_graph(
+        nodes, "segmenter",
+        [helper.make_tensor_value_info(
+            "input", TensorProto.FLOAT, ["b", s, s, 3])],
+        [helper.make_tensor_value_info(
+            "output", TensorProto.FLOAT, ["b", s, s, 1])],
+        [w])
+    model = helper.make_model(
+        graph, opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 9
+    onnx.save(model, str(path))
+    return str(path)
+
+
+def build_test_geotiff(path):
+    """600x600 px, 3-band uint8, EPSG:32633, 5 cm pixels."""
+    rasterio = pytest.importorskip("rasterio")
+    import numpy as np
+    from rasterio.transform import from_origin
+    rng = np.random.default_rng(42)
+    data = rng.integers(1, 255, size=(3, 600, 600), dtype=np.uint8)
+    profile = {
+        "driver": "GTiff", "width": 600, "height": 600, "count": 3,
+        "dtype": "uint8", "crs": rasterio.crs.CRS.from_epsg(32633),
+        "transform": from_origin(400000.0, 5900000.0, 0.05, 0.05),
+    }
+    with rasterio.open(str(path), "w", **profile) as dst:
+        dst.write(data)
+    return str(path)
 
 
 @pytest.fixture(scope="session")
-def stem_map():
-    """(pred array uint8, profile dict) from the golden stem-map raster.
-
-    This is the resampled prediction grid — its transform is the one
-    predict_with_resampling_per_tile produced, which all downstream stages
-    consume.
-    """
-    import rasterio
-    path = _fixture("stem_map.tif")
-    with rasterio.open(path) as src:
-        pred = src.read(1)
-        profile = dict(src.profile)
-    return pred, profile
+def tiny_unet_file(tmp_path_factory):
+    """One model build per session; build_preprocessed_model's mtime-keyed
+    wrap cache then hits across tests instead of re-wrapping per test."""
+    return build_tiny_unet(tmp_path_factory.mktemp("model") / "m.onnx")
 
 
 @pytest.fixture(scope="session")
-def crop_input_path():
-    return _fixture("crop_input.tif")
-
-
-@pytest.fixture(scope="session")
-def golden(fixtures_dir):
-    """Loader for stage fixtures: golden('stage_find_segments')."""
-    from helpers import read_json_gz
-
-    def _load(stage_name):
-        return read_json_gz(_fixture(stage_name + ".json.gz"))
-    return _load
+def test_geotiff_file(tmp_path_factory):
+    return build_test_geotiff(tmp_path_factory.mktemp("raster") / "ortho.tif")

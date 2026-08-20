@@ -5,21 +5,13 @@
 [general]
 name=WINMOL Analyzer
 
-qgisMinimumVersion=3.22
-description=Plugin to detect stems from UAV
-version=0.6.1
-# NOT Qt6-ready, and saying so is the honest default. The dialog uses ~22
-# UNSCOPED Qt enums (Qt.Checked, Qt.UserRole, QMessageBox.Yes, ...) which
-# PyQt6 removed; qgis.PyQt's Qt6 branch restores classes but NOT enum
-# members, so the dialog raises AttributeError on construction under Qt6 —
-# the icon appears, clicking it fails. Flip to True only after qualifying
-# those enums (Qt.CheckState.Checked etc., which also work on PyQt5) AND
-# exercising the plugin on a real Qt6 QGIS build.
-supportsQt6=False
+qgisMinimumVersion=3.0
+description=Plugin to detect stems from UAV orthomosaics using a TensorFlow-free, ONNX-runtime U-Net pipeline
+version=0.7.0-reimpl1
 author=Hochschule für nachhaltige Entwicklung Eberswalde | mundialis GmbH & Co. KG | terrestris GmbH & Co. KG
 email=Stefan.Reder@hnee.de
 
-about=Detects and quantifies windthrown (storm-felled) tree stems on UAV orthomosaics using a U-Net segmentation model plus a heuristic stem-reconstruction pipeline. Runs ONNX models via onnxruntime (no TensorFlow required).
+about=Provide a brief description of the plugin and its purpose.
 
 tracker=https://github.com/StefanReder/WINMOL_Analyzer/issues
 repository=https://github.com/StefanReder/WINMOL_Analyzer
@@ -28,9 +20,8 @@ repository=https://github.com/StefanReder/WINMOL_Analyzer
 # Recommended items:
 
 hasProcessingProvider=no
-changelog=0.6.0 - ONNX inference (no TensorFlow); reliable cross-platform install
-    (small onnxruntime environment or bring-your-own interpreter); Qt6/QGIS 4
-    ready; error reporting and working Cancel; runnable packaging.
+# Uncomment the following line and add your changelog:
+# changelog=
 
 # Tags are comma separated with spaces allowed
 tags=analysis, remote sensing, raster, python

@@ -1,15 +1,10 @@
 """Building ``$WINMOL_CONFIG_OVERRIDES_JSON`` for the child process.
 
-The QGIS dialog and the child run in different interpreters, and the run
-command is five positional arguments -- the ONLY channel that carries a
-config value across is this environment variable (``winmol_run.py`` applies
-it to ``Config`` before the execution plan is built).
-
-A user may already have set the variable in their own shell before starting
-QGIS, so values are **merged**, never clobbered: what the dialog sets wins for
-its own keys and everything else survives.
-
-Pure stdlib, no Qt and no QGIS imports, so it is unit-testable off QGIS.
+The dialog and the child run in different interpreters; this env var is
+the only channel that carries a config value across the five positional
+run args. A user may already have set it in their own shell, so values
+are merged, never clobbered: the dialog's own keys win, everything else
+survives. Pure stdlib, no Qt and no QGIS imports.
 """
 
 import json
@@ -21,10 +16,8 @@ ENV_VAR = "WINMOL_CONFIG_OVERRIDES_JSON"
 def merge(updates, existing=None):
     """Return the JSON object string for :data:`ENV_VAR`.
 
-    ``existing`` is the current value of the variable (or None). Anything
-    unparsable is discarded rather than propagated -- the child exits with
-    status 2 on invalid JSON, and inheriting a broken value would turn a
-    typo in the user's shell profile into a failed run.
+    Anything unparsable in ``existing`` is discarded rather than
+    propagated -- the child exits with status 2 on invalid JSON.
     """
     base = {}
     if existing:
@@ -38,12 +31,33 @@ def merge(updates, existing=None):
     return json.dumps(base, sort_keys=True)
 
 
+def set_default(existing, key, value) -> str:
+    """Return the :data:`ENV_VAR` JSON with ``key`` set only if absent.
+
+    An explicit user-set ``key`` always wins. Deliberately different
+    from :func:`merge` on bad input: unparsable ``existing`` is
+    returned UNCHANGED (not discarded), so the child reports the real
+    JSON error itself.
+    """
+    raw = (existing or "").strip()
+    overrides = {}
+    if raw:
+        try:
+            overrides = json.loads(raw)
+        except Exception:
+            return existing
+        if not isinstance(overrides, dict):
+            return existing
+    if key not in overrides:
+        overrides[key] = value
+    return json.dumps(overrides)
+
+
 def batch_override_env(batch, existing=None):
     """``{ENV_VAR: ...}`` pinning the prediction batch size, or ``{}``.
 
-    ``batch`` of 0/None means "Auto" -- the planner sizes the batch and the
-    autotune may refine it, so nothing is injected and any value the user set
-    themselves is left exactly as it was.
+    ``batch`` of 0/None means "Auto": nothing is injected and any value
+    the user set themselves is left exactly as it was.
     """
     try:
         value = int(batch)

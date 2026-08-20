@@ -1,35 +1,5 @@
-# INSTALL THIS ONE unless you know you need something else.
-#
-# WHO: anyone running the analyzer — the CLI (winmol_run.py / winmol_batch.py),
-#      the standalone scripts, and the venv the QGIS plugin builds for itself.
-# WHEN: always, on macOS / Linux / Windows, with or without a GPU. Every wheel
-#      here is a pure binary install: no CUDA toolkit, no Metal toolchain, no
-#      compiler, NO TensorFlow.
-#
-#     pip install -r requirements/cpu.txt
-#
-# MUTUALLY EXCLUSIVE with gpu.txt: that installs onnxruntime-gpu, which
-# provides the same `onnxruntime` module as the wheel below. Exactly one of the
-# two may be present in an environment.
-#
-# THIS FILE DEFINES THE SHIPPED ENVIRONMENT. ci.txt is `-r cpu.txt` + pytest,
-# so whatever is written here is what CI tests — including the version range
-# below. Widening or moving it changes what users get AND what CI validates,
-# together and on purpose; tests/test_ci_parity.py fails if they come apart.
+# CPU compute environment: core stack + the CPU onnxruntime build.
+# This is the file the QGIS plugin installer builds the venv from.
 -r core.txt
-
-# Inference runtime. The models are ONNX and are loaded through
-# utils/onnx_runtime.py; TensorFlow is needed only to CONVERT them
-# (requirements/convert.txt), never to run them.
-#
-# A RANGE, not a pin: this file installs on macOS/Linux/Windows and on x86_64
-# and arm64, and a hard pin would strand whichever platform onnxruntime drops
-# a wheel for first. Reproducibility of the golden fixtures does not depend on
-# it — see the second numbered note in ci.txt.
 onnxruntime>=1.17
-
-# Reports free RAM to the autotune batch-size sweep (utils/Prediction.py) and
-# to the setup dialog. Optional at import time — both call sites degrade — but
-# without it the run logs "RAM=0.0 GB" and autotune falls back to a blind
-# headroom guess.
 psutil>=5.9

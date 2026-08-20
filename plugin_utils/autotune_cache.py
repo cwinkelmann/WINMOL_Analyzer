@@ -2,40 +2,35 @@
 
 Why
 ---
-``_autotune_batch_size`` (utils/Prediction.py) times every candidate micro-batch
-before the first tile is written. Measured on an M2 / CoreML with the 9-tile
-crop fixture: **11.0 s without the autotune, 73.5 s with it** — ~62 s of silent
-stall — to move from 0.169 to 0.159 s/tile (5.9 %). On Apple/CoreML every
-distinct batch size forces a model recompile, which is where the time goes.
-That is why ``prediction_batch_autotune`` shipped as ``False``: paying 62 s on
-*every* run for a 6 % gain is a bad trade.
-
-Cached, the trade flips. On the documented 580-tile ortho the 6 % is ~18 s per
-run, so the one-off 62 s pays for itself after ~4 runs and every run after
-that is free. This module is the cache: run ONCE, keyed by
-(hardware + model + execution provider + tile geometry), reuse forever, and
-re-tune automatically when any of those change.
+``_autotune_batch_size`` (utils/Prediction.py) times every candidate
+micro-batch before the first tile is written. On hardware where a distinct
+batch size forces a session/kernel recompile (notably Apple/CoreML), that
+sweep is a real, user-visible stall on every single run for a few percent of
+steady-state throughput. Cached, the trade flips: the sweep runs ONCE per
+(hardware, model, execution provider, tile geometry), the answer is
+persisted, and every run after that is free. This module is the cache.
 
 Design constraints
-------------------
-* **Stdlib only, no Qt/QGIS** — it must import inside the TensorFlow-free
+-------------------
+* **Stdlib only, no Qt/QGIS** -- it must import inside the TensorFlow-free
   compute venv (``requirements/cpu.txt``) *and* inside QGIS's own Python,
   the same contract as ``installer.py`` / ``model_registry.py``.
 * **Never fatal.** A missing, truncated, wrong-version or hostile cache file
-  degrades to "no cached entry" and a failed write degrades to a logged no-op.
-  A cache is an optimisation; it may never break a run.
-* **Atomic writes** (tmp + ``os.replace``) because ``winmol_batch.py --jobs``
-  runs several prediction processes concurrently. Concurrent writers are
-  last-writer-wins on a per-file basis; the file is never left half-written.
+  degrades to "no cached entry" and a failed write degrades to a logged
+  no-op. A cache is an optimisation; it may never break a run.
+* **Atomic writes** (tmp + ``os.replace``) because ``winmol_batch.py
+  --jobs`` runs several prediction processes concurrently. Concurrent
+  writers are last-writer-wins on a per-file basis; the file is never left
+  half-written.
 
 Location
 --------
-``$WINMOL_AUTOTUNE_CACHE`` when set — the QGIS plugin sets it to
-``<managed_root>/autotune.json`` so the cache lives with the rest of WINMOL's
-managed state and is removed together with the environment. Otherwise a
-per-user cache dir (``~/Library/Caches/winmol`` on macOS,
-``%LOCALAPPDATA%\\winmol`` on Windows, ``$XDG_CACHE_HOME/winmol`` elsewhere).
-Deleting the file is always safe and simply forces a re-tune.
+``$WINMOL_AUTOTUNE_CACHE`` when set -- the QGIS plugin sets it to
+``<managed_root>/autotune.json`` (see ``plugin_utils.installer
+.autotune_cache_location``) so the cache lives with the rest of WINMOL's
+managed state. Otherwise a per-user cache dir (``~/Library/Caches/winmol``
+on macOS, ``%LOCALAPPDATA%\\winmol`` on Windows, ``$XDG_CACHE_HOME/winmol``
+elsewhere). Deleting the file is always safe and simply forces a re-tune.
 """
 
 import hashlib
@@ -46,11 +41,12 @@ import sys
 import tempfile
 import time
 
-#: Bumped when the stored payload shape changes -- or when the *meaning* of a
-#: stored batch size changes; older files are ignored either way. v2: the
-#: sweep is bounded by free memory and stops on an absolute 0.2 s/tile bar, so
-#: entries measured under the old unbounded rule name a batch this build would
-#: never have chosen.
+#: Bumped when the stored payload shape changes -- or when the *meaning* of
+#: a stored batch size changes; older files are ignored either way. Kept in
+#: step with the rr6 lineage's cache format so a pre-existing
+#: ``autotune.json`` (same $WINMOL_AUTOTUNE_CACHE location, an rr6-based
+#: install) stays valid rather than being silently invalidated by this
+#: reimplementation.
 SCHEMA_VERSION = 2
 
 #: Overrides the cache location for both the plugin and the batch CLI.
@@ -69,7 +65,7 @@ _FORCE = ("force", "true", "1", "yes", "on", "always", "retune")
 _AUTO = ("auto", "cached", "once")
 
 
-# --- mode resolution --------------------------------------------------------
+# --- mode resolution ---------------------------------------------------
 
 def resolve_mode(config=None):
     """Return ``"off" | "auto" | "force"``.
@@ -96,7 +92,7 @@ def resolve_mode(config=None):
     return "auto"          # unknown value: the safe, self-healing default
 
 
-# --- location ---------------------------------------------------------------
+# --- location ------------------------------------------------------------
 
 def default_cache_dir():
     if sys.platform == "darwin":
@@ -119,16 +115,17 @@ def cache_path():
     return os.path.join(default_cache_dir(), CACHE_FILENAME)
 
 
-# --- key --------------------------------------------------------------------
+# --- key -------------------------------------------------------------------
 
 def _model_identity(model):
     """Cheap identity for the model file: name + size + mtime.
 
-    Deliberately NOT a content hash — the ONNX models are 100-400 MB and
-    hashing one costs more than the autotune it would save. Size is paired
-    with mtime so a re-download or a different model of the same length still
-    changes the key; the failure mode of the pair (an in-place edit that
-    preserves both) does not occur for downloaded artifacts.
+    Deliberately NOT a content hash -- the ONNX models are large enough
+    that hashing one costs more than the autotune it would save. Size is
+    paired with mtime so a re-download or a different model of the same
+    length still changes the key; the failure mode of the pair (an
+    in-place edit that preserves both) does not occur for downloaded
+    artifacts.
     """
     path = getattr(model, "model_path", None) or getattr(model, "path", None)
     if not path:
@@ -174,7 +171,7 @@ def cache_key(model, config, hardware=None):
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:32]
 
 
-# --- io ---------------------------------------------------------------------
+# --- io ----------------------------------------------------------------
 
 def _read_all(path):
     """The whole cache as a dict of entries; ``{}`` for anything unusable."""
@@ -196,9 +193,9 @@ def _read_all(path):
 def load(key, path=None):
     """The cached batch size for ``key``, or ``None``.
 
-    Returns ``None`` — never raises — for a missing file, unparseable JSON, a
-    schema-version mismatch, a non-dict payload, or a batch that is not a
-    plain positive int within :data:`MAX_SANE_BATCH`.
+    Returns ``None`` -- never raises -- for a missing file, unparseable
+    JSON, a schema-version mismatch, a non-dict payload, or a batch that is
+    not a plain positive int within :data:`MAX_SANE_BATCH`.
     """
     entry = _read_all(path or cache_path()).get(key)
     if not isinstance(entry, dict):
@@ -215,14 +212,20 @@ def store(key, batch, meta=None, path=None):
     """Persist ``batch`` for ``key``. Returns True on success, else False.
 
     A failure to write (read-only home, container without a writable HOME,
-    a race with another process) is a no-op, not an error: the next run simply
-    re-tunes.
+    a race with another process) is a no-op, not an error: the next run
+    simply re-tunes.
     """
+    if isinstance(batch, bool):
+        # Checked BEFORE the int() coercion below: int(True) == 1 is a
+        # plain int, so this guard would never fire afterwards -- bool is
+        # a subclass of int in Python and a stray True/False must still be
+        # rejected, not silently stored as batch 1/0.
+        return False
     try:
         batch = int(batch)
     except (TypeError, ValueError):
         return False
-    if isinstance(batch, bool) or not (1 <= batch <= MAX_SANE_BATCH):
+    if not (1 <= batch <= MAX_SANE_BATCH):
         return False
 
     path = path or cache_path()
