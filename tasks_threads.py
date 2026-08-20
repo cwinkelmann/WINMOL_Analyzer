@@ -14,8 +14,8 @@ from PyQt5.QtCore import (
 from .plugin_utils.childenv import child_env, safe_child_cwd
 from .plugin_utils.installer import (
     gpu_requested,
-    path_is_inside,
     remove_environment,
+    remove_model_files,
     setup_environment,
     venv_location,
 )
@@ -69,7 +69,7 @@ class Worker(QObject):
                 text=True,
                 bufsize=1,
                 startupinfo=startupinfo,
-                env=child_env(self.env_extra or None,
+                env=child_env(self.env_extra,
                               python_exe=self.command[0]),
                 cwd=safe_child_cwd(self.command[0]),
             )
@@ -284,18 +284,18 @@ class ModelMaintenanceWorker(QObject):
         return self._summary(ok, failed)
 
     def _delete(self, registry):
+        # installer.remove_model_files owns the deletion, including the
+        # containment refusal for a registry ``file`` that escapes the
+        # models directory — one owner, shared with remove_environment.
         ok, failed = [], []
         for eid in self.entry_ids:
             try:
-                path = local_path(registry.get(eid), self.models_dir)
-                if not path_is_inside(path, self.models_dir):
-                    failed.append(
-                        (eid, "refused: outside the models directory"))
-                    continue
-                for victim in (path, path + ".part"):
-                    if os.path.exists(victim):
-                        os.remove(victim)
-                ok.append(eid)
+                result = remove_model_files(
+                    registry.get(eid), self.models_dir)
+                if result["failed"]:
+                    failed.append((eid, result["failed"][0][1]))
+                else:
+                    ok.append(eid)
             except Exception as exc:
                 failed.append((eid, str(exc)))
         return self._summary(ok, failed)

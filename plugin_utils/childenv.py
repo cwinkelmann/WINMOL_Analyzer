@@ -20,8 +20,13 @@ Pure stdlib, no QGIS imports -- unit-testable off QGIS.
 """
 import ntpath
 import os
+import subprocess
 import sys
 import tempfile
+
+#: The one-line version probe several callers feed to
+#: :func:`run_isolated` ("3.11" on stdout when the interpreter runs).
+PY_VERSION_PROBE = "import sys;print('%d.%d' % sys.version_info[:2])"
 
 # Variables that tell a Python interpreter where it lives. Poison for any
 # interpreter other than the one QGIS is running.
@@ -177,6 +182,18 @@ def safe_child_cwd(python_exe=None):
         if os.path.isdir(root):
             return root
     return tempfile.gettempdir()
+
+
+def run_isolated(python_exe, code, timeout, args=()):
+    """Run ``code`` in ``python_exe`` isolated (``-I``) under
+    :func:`child_env`, returning the ``CompletedProcess`` (text mode,
+    output captured, exit code never checked). ``args`` become the
+    child's ``sys.argv[1:]``. Exceptions (missing executable,
+    ``TimeoutExpired``) propagate — callers own their fallbacks."""
+    return subprocess.run(
+        [python_exe, "-I", "-c", code, *args],
+        capture_output=True, text=True, timeout=timeout,
+        env=child_env(python_exe=python_exe))
 
 
 def child_env(extra=None, python_exe=None):

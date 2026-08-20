@@ -40,6 +40,9 @@ REQUIRED = [
     "WINMOL_Analyzer/plugin_utils/model_status.py",
     "WINMOL_Analyzer/plugin_utils/output_selection.py",
     "WINMOL_Analyzer/plugin_utils/config_overrides.py",
+    # rc11-parity modules
+    "WINMOL_Analyzer/plugin_utils/py311.py",
+    "WINMOL_Analyzer/plugin_utils/autotune_cache.py",
 ]
 
 EXCLUDED_DIR_PREFIXES = [

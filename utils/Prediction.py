@@ -4,7 +4,6 @@
 """Imports"""
 import os
 import queue
-import subprocess
 import threading
 import time
 import contextlib
@@ -18,6 +17,8 @@ from rasterio.windows import Window
 from skimage.transform import resize
 
 from classes.Timer import Timer
+from plugin_utils import autotune_cache
+from plugin_utils.gpu_probe import run_nvidia_smi_query
 from utils import IO
 
 
@@ -255,34 +256,18 @@ def _available_ram_bytes():
 
 def _free_gpu_memory_gb():
     """Free VRAM per visible GPU in GiB via ``nvidia-smi``, or ``[]`` when
-    it is unavailable or fails. Never raises."""
-    try:
-        result = subprocess.run(
-            ['nvidia-smi', '--query-gpu=memory.free',
-             '--format=csv,noheader,nounits'],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False,
-            # A driver stuck in an uninterruptible ioctl used to hang this
-            # call forever (rr NVIDIA_SMI_TIMEOUT); the except catches
-            # TimeoutExpired and falls back to the host-RAM bound.
-            timeout=8.0,
-        )
-        if result.returncode != 0:
-            return []
-        values = []
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                values.append(float(line) / 1024.0)
-            except ValueError:
-                continue
-        return values
-    except Exception:
-        return []
+    it is unavailable or fails. Never raises. The query is bounded: a
+    driver stuck in an uninterruptible ioctl used to hang this call
+    forever (rr NVIDIA_SMI_TIMEOUT); on timeout the caller falls back
+    to the host-RAM bound."""
+    lines = run_nvidia_smi_query("memory.free", timeout=8.0, nounits=True)
+    values = []
+    for line in lines or []:
+        try:
+            values.append(float(line) / 1024.0)
+        except ValueError:
+            continue
+    return values
 
 
 def _free_memory_bytes(model, config):
@@ -577,6 +562,79 @@ def _time_batch_candidate(
     return warm_used, per_tile, oomed
 
 
+def _autotune_cache_key(model, config, label):
+    """``(key, cache_file)`` for the sweep's persistent cache, or
+    ``(None, None)`` when the key cannot be derived -- never fatal, a miss
+    just means the sweep below runs. See plugin_utils/autotune_cache.py.
+    """
+    try:
+        key = autotune_cache.cache_key(
+            model, config, getattr(config, 'hardware', None))
+        return key, autotune_cache.cache_path()
+    except Exception as exc:                                # pragma: no cover
+        print(f"{label} autotune: cache key unavailable ({exc}); tuning.",
+              flush=True)
+        return None, None
+
+
+def _autotune_cache_lookup(
+    mode, key, cache_file, initial, max_reachable, label,
+):
+    """The cached batch to reuse, or ``None`` to fall through to the sweep.
+
+    "auto" tunes ONCE per (hardware, model, execution provider, tile
+    geometry) and reuses the persisted answer forever after; "force" never
+    looks here, it always re-sweeps and refreshes the entry (see the
+    caller). A cached value outside ``[initial, max_reachable]`` -- what
+    THIS run can actually try, given the sample and the memory ceiling --
+    is re-tuned rather than clamped: it was never measured under the
+    current constraint.
+    """
+    if mode != 'auto' or key is None:
+        return None
+    cached = autotune_cache.load(key, path=cache_file)
+    if cached is None:
+        return None
+    if initial <= cached <= max_reachable:
+        print(
+            f"{label} autotune: using cached batch {cached} "
+            f"(key {key[:8]}, {cache_file})",
+            flush=True,
+        )
+        return cached
+    print(
+        f"{label} autotune: ignoring out-of-range cached batch "
+        f"{cached} (valid {initial}-{max_reachable}); re-tuning.",
+        flush=True,
+    )
+    return None
+
+
+def _autotune_cache_persist(
+    key, cache_file, best_batch, best_per_tile, candidates, label,
+):
+    if key is None:
+        return
+    meta = {
+        'per_tile_s': (None if not np.isfinite(best_per_tile)
+                       else round(float(best_per_tile), 6)),
+        'candidates': [int(c) for c in candidates],
+        'label': str(label),
+    }
+    if autotune_cache.store(key, best_batch, meta=meta, path=cache_file):
+        print(
+            f"{label} autotune: cached batch {best_batch} "
+            f"(key {key[:8]}, {cache_file})",
+            flush=True,
+        )
+    else:
+        print(
+            f"{label} autotune: could not write {cache_file}; "
+            "the result will be re-measured next run.",
+            flush=True,
+        )
+
+
 def _autotune_batch_size(
     sample_tiles,
     sample_masks,
@@ -599,8 +657,11 @@ def _autotune_batch_size(
         )
         return override
 
-    autotune = bool(getattr(config, 'prediction_batch_autotune', True))
-    if not autotune:
+    # "off": never sweep, never touch the cache (no read, no write) -- the
+    # $WINMOL_BATCH_AUTOTUNE env var wins over Config.prediction_batch_autotune,
+    # see plugin_utils.autotune_cache.resolve_mode.
+    mode = autotune_cache.resolve_mode(config)
+    if mode == 'off':
         return initial
     if len(sample_tiles) < 2:
         return initial
@@ -645,6 +706,17 @@ def _autotune_batch_size(
         c for c in _prediction_batch_candidates(config, initial)
         if c <= len(sample_tiles) and c <= ceiling
     ]
+
+    # Tune once, reuse forever (mode 'auto'); mode 'force' skips straight
+    # to the sweep and refreshes the entry afterwards. See
+    # _autotune_cache_key / _autotune_cache_lookup above.
+    key, cache_file = _autotune_cache_key(model, config, label)
+    max_reachable = candidates[-1] if candidates else initial
+    cached = _autotune_cache_lookup(
+        mode, key, cache_file, initial, max_reachable, label)
+    if cached is not None:
+        return cached
+
     if len(candidates) <= 1:
         return initial
 
@@ -725,6 +797,9 @@ def _autotune_batch_size(
         if stop_reason is not None:
             msg = f"{msg} ({stop_reason})"
         print(msg, flush=True)
+
+    _autotune_cache_persist(
+        key, cache_file, best_batch, best_per_tile, candidates, label)
 
     return best_batch
 
@@ -941,30 +1016,6 @@ def predict_stream_to_raster(
     print("#######################################################")
     print("")
     return out_profile
-
-
-def predict_stream_single_gpu(
-    uav_path: str,
-    output_stem_map: str,
-    model,
-    config,
-):
-    return predict_stream_to_raster(uav_path, output_stem_map, model, config)
-
-
-def predict_stream_cpu(
-    uav_path: str,
-    output_stem_map: str,
-    model,
-    config,
-):
-    return predict_stream_to_raster(uav_path, output_stem_map, model, config)
-
-
-def predict_with_resampling_stream_to_raster(
-    uav_path, output_stem_path, model, config
-):
-    return predict_stream_to_raster(uav_path, output_stem_path, model, config)
 
 
 def predict_with_resampling_per_tile(img, profile, model, config):

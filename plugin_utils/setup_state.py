@@ -61,7 +61,7 @@ class EnvInfo:
     """A snapshot of the compute environment, as the Setup tab needs it.
 
     ``status`` is ``installer.resolve_environment``'s verdict —
-    ``byo`` | ``ready`` | ``installed`` | ``needs_setup`` | ``error``.
+    ``byo`` | ``ready`` | ``needs_setup`` | ``error``.
     """
 
     status: str
@@ -102,7 +102,7 @@ def env_info(plugin_dir, configured_exe=None, resolve_fn=None) -> EnvInfo:
     measured in seconds. ``resolve_fn`` is injectable so tests can
     describe a machine instead of owning one."""
     resolve_fn = resolve_fn or installer.resolve_environment
-    env = resolve_fn(plugin_dir, build=False) or {}
+    env = resolve_fn(plugin_dir) or {}
     venv_path = env.get("venv_path") or installer.venv_location(plugin_dir)
     exe = env.get("python") or (configured_exe or "").strip() or None
     return EnvInfo(
@@ -118,7 +118,7 @@ def env_info(plugin_dir, configured_exe=None, resolve_fn=None) -> EnvInfo:
 
 def env_ready(info) -> bool:
     """True when a detection could run right now."""
-    return info.status in ("byo", "ready", "installed")
+    return info.status in ("byo", "ready")
 
 
 def env_state_text(info) -> str:

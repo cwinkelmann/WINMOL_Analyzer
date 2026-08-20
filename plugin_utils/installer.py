@@ -22,7 +22,13 @@ import threading
 import time
 from pathlib import Path
 
-from .childenv import child_env, safe_child_cwd
+from .childenv import (
+    PY_VERSION_PROBE,
+    child_env,
+    run_isolated,
+    safe_child_cwd,
+)
+from .gpu_probe import verify_gpu_providers
 
 WINMOL_VENV_NAME = "winmol_venv"
 MODELS_DIR_NAME = "models"
@@ -103,6 +109,17 @@ def models_location(plugin_dir) -> str:
     return os.path.join(managed_root(plugin_dir), MODELS_DIR_NAME)
 
 
+def autotune_cache_location(plugin_dir) -> str:
+    """Absolute path of the prediction batch-size autotune cache.
+
+    Lives beside the venv under ``managed_root`` so it is part of WINMOL's
+    managed state: the dialog hands it to the compute child through
+    ``$WINMOL_AUTOTUNE_CACHE``. See plugin_utils/autotune_cache.py.
+    """
+    from .autotune_cache import CACHE_FILENAME
+    return os.path.join(managed_root(plugin_dir), CACHE_FILENAME)
+
+
 def get_venv_python_path(venv_path) -> str:
     if sys.platform == "win32":
         return os.path.join(venv_path, "Scripts", "python.exe")
@@ -114,15 +131,31 @@ def get_venv_python_path(venv_path) -> str:
 
 # --- base interpreter selection ---------------------------------------------
 
+def managed_base_python(plugin_dir, progress=None) -> str:
+    """A Python 3.11 interpreter to build the venv from.
+
+    Prefer a 3.11 already on PATH (no download); otherwise download a
+    relocatable python-build-standalone 3.11 into ``managed_root/py311`` —
+    so a bare machine with only QGIS (fresh Windows, macOS system 3.9, no
+    conda) still gets a working 3.11. Raises RuntimeError only if no 3.11
+    is on PATH AND the download/extract fails.
+    """
+    for name in ("python3.11", "python3.11.exe", "python3", "python"):
+        exe = shutil.which(name)
+        if exe and _python_version(exe) == MIN_PY:
+            return exe
+    from . import py311
+    dest = os.path.join(managed_root(plugin_dir), "py311")
+    return py311.ensure_python311(dest, progress=progress)
+
+
 def _python_version(executable) -> tuple:
     """(major, minor) of ``executable``, or (0, 0) when unusable.
-    ``-I`` + ``child_env()``: QGIS's PYTHONHOME/PYTHONPATH would point
-    the child at QGIS's stdlib and stop it starting at all."""
+    ``run_isolated`` (``-I`` + ``child_env()``): QGIS's PYTHONHOME/
+    PYTHONPATH would point the child at QGIS's stdlib and stop it
+    starting at all."""
     try:
-        out = subprocess.run(
-            [executable, "-I", "-c",
-             "import sys;print('%d.%d' % sys.version_info[:2])"],
-            capture_output=True, text=True, timeout=30, env=child_env())
+        out = run_isolated(executable, PY_VERSION_PROBE, timeout=30)
         if out.returncode == 0:
             major, minor = out.stdout.strip().split(".")
             return (int(major), int(minor))
@@ -131,9 +164,18 @@ def _python_version(executable) -> tuple:
     return (0, 0)
 
 
-def choose_base_python() -> str:
-    """A system python (3.11) to build the venv from, or RuntimeError
-    with an actionable message."""
+def choose_base_python(progress=None) -> str:
+    """A system python (3.11) to build the venv from.
+
+    Prefers PATH, but never dead-ends there: with none found it falls back
+    to :func:`managed_base_python`, which downloads a relocatable Python
+    3.11 (see plugin_utils/py311.py) — so a bare machine with only QGIS
+    (fresh Windows, macOS system 3.9, no terminal) still gets a working
+    venv. ``progress`` is forwarded to that download so its "Downloading
+    Python 3.11 …" lines reach the caller's log. Only raises RuntimeError
+    when even the download fails (unsupported platform or network error);
+    that error names the manual fallback.
+    """
     candidates = []
     for name in ("python3.11", "python3", "python"):
         exe = shutil.which(name)
@@ -142,19 +184,14 @@ def choose_base_python() -> str:
     for exe in candidates:
         if MIN_PY <= _python_version(exe) <= MAX_PY:
             return exe
-    raise RuntimeError(
-        "No suitable Python found to build the WINMOL environment "
-        f"(need {MIN_PY[0]}.{MIN_PY[1]}). Install one, or set an "
-        "existing interpreter in the plugin settings "
-        f"({QSETTINGS_PYTHON_KEY}).")
+    return managed_base_python(_PLUGIN_DIR, progress=progress)
 
 
 def _has_compute_deps(executable) -> bool:
     try:
-        out = subprocess.run(
-            [executable, "-I", "-c",
-             "import onnxruntime, rasterio, geopandas"],
-            capture_output=True, timeout=60, env=child_env())
+        out = run_isolated(
+            executable, "import onnxruntime, rasterio, geopandas",
+            timeout=60)
         return out.returncode == 0
     except Exception:
         return False
@@ -232,24 +269,50 @@ def marker_matches(venv_path, gpu=None) -> bool:
     return marker.get("req_hash") == _file_hash(req)
 
 
+def _marker_python_version(venv_path):
+    """(major, minor) as recorded by :func:`_write_marker`, or None
+    when the marker predates the field or it is unreadable."""
+    recorded = _read_marker(venv_path).get("python_version")
+    if isinstance(recorded, (list, tuple)) and len(recorded) == 2:
+        try:
+            return (int(recorded[0]), int(recorded[1]))
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
 def is_ready(venv_path, gpu=None) -> bool:
     """The venv exists, runs a supported Python, and matches the
     current requirements (of the required variant when ``gpu`` is a
-    bool; of whichever variant it was built as when None)."""
+    bool; of whichever variant it was built as when None). The Python
+    version recorded in the marker is trusted when present — one
+    subprocess saved on every QGIS start — with a live probe as the
+    back-compat fallback for markers from older builds."""
     py = get_venv_python_path(venv_path)
     if not os.path.exists(py):
         return False
-    if not (MIN_PY <= _python_version(py) <= MAX_PY):
+    version = _marker_python_version(venv_path)
+    if version is None:
+        version = _python_version(py)
+    if not (MIN_PY <= version <= MAX_PY):
         return False
     return marker_matches(venv_path, gpu=gpu)
 
 
 def _write_marker(venv_path, gpu=False) -> None:
+    """Bless the venv, recording the venv python's version so the
+    ready-path never has to spawn it again (see :func:`is_ready`). An
+    unusable probe result is simply not recorded — is_ready then falls
+    back to probing live."""
     req = plugin_requirements_path(gpu=gpu)
+    data = {"req_hash": _file_hash(req),
+            "variant": "gpu" if gpu else "cpu",
+            "requirements": str(req)}
+    version = _python_version(get_venv_python_path(venv_path))
+    if version > (0, 0):
+        data["python_version"] = list(version)
     with open(_marker_path(venv_path), "w") as f:
-        json.dump({"req_hash": _file_hash(req),
-                   "variant": "gpu" if gpu else "cpu",
-                   "requirements": str(req)}, f)
+        json.dump(data, f)
 
 
 def invalidate_marker(venv_path) -> bool:
@@ -297,6 +360,20 @@ def _is_managed_path(path, plugin_dir) -> bool:
         if path_is_inside(path, root) and not path_is_inside(root, path):
             return True
     return False
+
+
+def _removal_refusal(path, plugin_dir):
+    """The shared refusal rule for anything remove_environment would
+    delete: the ``(path, message)`` failure tuple, or None when the
+    path may be removed. Two refusals exist. A symlink — deleting
+    through one reaches (and, via the chmod-retry handler, could
+    mutate) the TARGET, so the link itself must survive. And a path
+    outside the managed tree (:func:`_is_managed_path`)."""
+    if os.path.islink(path):
+        return (path, "refused: the path is a symlink")
+    if not _is_managed_path(path, plugin_dir):
+        return (path, "refused: outside the managed tree")
+    return None
 
 
 def _chmod_retry(func, path):
@@ -361,30 +438,18 @@ def remove_environment(plugin_dir, remove_venv=True, remove_runtime=False,
     if remove_runtime:
         trees.append(runtime)
     for path in trees:
-        if os.path.islink(path):
-            # rmtree on a symlink would at best fail and at worst (via
-            # the chmod-retry handler) mutate the TARGET; refuse it the
-            # same way as an outside path. The link itself survives.
-            result["failed"].append(
-                (path, "refused: the path is a symlink"))
-            continue
-        if not _is_managed_path(path, plugin_dir):
-            result["failed"].append(
-                (path, "refused: outside the managed tree"))
+        refusal = _removal_refusal(path, plugin_dir)
+        if refusal is not None:
+            result["failed"].append(refusal)
             continue
         if os.path.isdir(path):
             result["planned"].append((path, directory_size(path)))
 
     model_plan = None
     if remove_models:
-        if os.path.islink(models_dir):
-            # Same rule as the trees above: deleting THROUGH a
-            # symlinked models dir reaches whatever it points at.
-            result["failed"].append(
-                (models_dir, "refused: the path is a symlink"))
-        elif not _is_managed_path(models_dir, plugin_dir):
-            result["failed"].append(
-                (models_dir, "refused: outside the managed tree"))
+        refusal = _removal_refusal(models_dir, plugin_dir)
+        if refusal is not None:
+            result["failed"].append(refusal)
         else:
             model_plan = _plan_models(plugin_dir, models_dir, dry_run=True)
             if model_plan["freed_bytes"] or model_plan["planned"]:
@@ -424,10 +489,50 @@ def remove_environment(plugin_dir, remove_venv=True, remove_runtime=False,
     return result
 
 
+def remove_model_files(entry, models_dir, dry_run=False) -> dict:
+    """Delete (or, with ``dry_run``, price) ONE registry entry's model
+    file and its ``.part`` leftover under ``models_dir``. THE single
+    owner of model-file deletion — :func:`remove_environment`'s model
+    phase and the Setup tab's per-model delete
+    (tasks_threads.ModelMaintenanceWorker) both go through it, so the
+    safety rule cannot drift: a path that resolves outside the models
+    directory (an entry ``file`` of "../x", or an absolute path) is
+    refused per victim, never removed.
+
+    Returns ``{'planned': [(path, bytes)], 'removed': [path],
+    'failed': [(path, message)], 'freed_bytes': int}``.
+    """
+    from . import model_registry
+    result = {"planned": [], "removed": [], "failed": [], "freed_bytes": 0}
+    base = model_registry.local_path(entry, models_dir)
+    for victim in (base, base + ".part"):
+        if not path_is_inside(victim, models_dir):
+            result["failed"].append(
+                (victim, "refused: outside the models directory"))
+            continue
+        try:
+            size = os.path.getsize(victim)
+        except OSError:
+            continue
+        result["planned"].append((victim, size))
+        if dry_run:
+            result["freed_bytes"] += size
+            continue
+        try:
+            os.remove(victim)
+            result["removed"].append(victim)
+            result["freed_bytes"] += size
+        except OSError as exc:
+            result["failed"].append((victim, str(exc)))
+    return result
+
+
 def _plan_models(plugin_dir, models_dir, dry_run, progress=None):
     """Price/remove registry-known model files (and their ``.part``
     leftovers) under ``models_dir`` — the registry owns the on-disk
-    naming rule, so unknown files are never touched."""
+    naming rule, so unknown files are never touched. Both phases run
+    through :func:`remove_model_files`, the one owner of the deletion
+    (and its containment refusal)."""
     result = {"planned": [], "removed": [], "failed": [], "freed_bytes": 0}
     try:
         from . import model_registry
@@ -437,32 +542,11 @@ def _plan_models(plugin_dir, models_dir, dry_run, progress=None):
         if not dry_run and progress is not None:
             progress(f"Could not read the model registry: {exc}")
         return result
-    victims = []
     for entry in registry.entries.values():
-        base = model_registry.local_path(entry, models_dir)
-        victims.extend((base, base + ".part"))
-    for path in victims:
-        if not path_is_inside(path, models_dir):
-            # A registry entry whose ``file`` traverses out of the
-            # models dir ("../x", absolute) must never delete outside
-            # the managed tree; mirror ModelMaintenanceWorker._delete.
-            result["failed"].append(
-                (path, "refused: outside the models directory"))
-            continue
-        try:
-            size = os.path.getsize(path)
-        except OSError:
-            continue
-        result["planned"].append((path, size))
-        if dry_run:
-            result["freed_bytes"] += size
-            continue
-        try:
-            os.remove(path)
-            result["removed"].append(path)
-            result["freed_bytes"] += size
-        except OSError as exc:
-            result["failed"].append((path, str(exc)))
+        done = remove_model_files(entry, models_dir, dry_run=dry_run)
+        for key in ("planned", "removed", "failed"):
+            result[key].extend(done[key])
+        result["freed_bytes"] += done["freed_bytes"]
     return result
 
 
@@ -588,8 +672,8 @@ def create_venv(venv_path, base_python=None, progress=None) -> None:
     """Build the venv. No ``--copies`` (macOS CLT python can't); the
     ``child_env()`` inside _run_streamed is load-bearing — with QGIS's
     PYTHONHOME inherited this exact call died on Windows."""
-    base_python = base_python or choose_base_python()
     progress = _as_progress(progress)
+    base_python = base_python or choose_base_python(progress=progress)
     progress(f"Creating the virtual environment with {base_python} …")
     try:
         _run_streamed([base_python, "-m", "venv", venv_path],
@@ -610,9 +694,7 @@ def create_venv(venv_path, base_python=None, progress=None) -> None:
 def ensure_pip(venv_path, progress=None) -> None:
     py = get_venv_python_path(venv_path)
     progress = _as_progress(progress)
-    if subprocess.run([py, "-I", "-c", "import pip"],
-                      capture_output=True, timeout=120,
-                      env=child_env()).returncode == 0:
+    if run_isolated(py, "import pip", timeout=120).returncode == 0:
         progress("pip is available.")
         return
     progress("pip missing — bootstrapping it with ensurepip …")
@@ -626,11 +708,11 @@ def distribution_installed(python_exe, dist, timeout=60) -> bool:
     importlib.metadata, not an import: importing ``onnxruntime`` cannot
     tell the two distributions apart, which is the entire problem."""
     try:
-        out = subprocess.run(
-            [python_exe, "-I", "-c",
-             "import importlib.metadata as m, sys;"
-             "sys.exit(0 if m.distribution(sys.argv[1]) else 1)", dist],
-            capture_output=True, timeout=timeout, env=child_env())
+        out = run_isolated(
+            python_exe,
+            "import importlib.metadata as m, sys;"
+            "sys.exit(0 if m.distribution(sys.argv[1]) else 1)",
+            timeout=timeout, args=(dist,))
         return out.returncode == 0
     except Exception:
         return False
@@ -694,6 +776,12 @@ def setup_environment(venv_path, base_python=None, progress=None,
             create_venv(venv_path, base_python, progress=report)
         ensure_pip(venv_path, progress=report)
         install_requirements(venv_path, progress=report, gpu=gpu)
+        if gpu:
+            # Visible install-time verdict for the variant that can
+            # silently fail to be what it claims (a CUDA generation
+            # mismatch installs fine and only fails at runtime); the CPU
+            # variant has nothing GPU-shaped to verify.
+            report(verify_gpu_providers(get_venv_python_path(venv_path)))
         _write_marker(venv_path, gpu=gpu)
     report(f"Environment ready in {report.elapsed():.0f}s: "
            f"{get_venv_python_path(venv_path)}")
@@ -702,13 +790,12 @@ def setup_environment(venv_path, base_python=None, progress=None,
 
 # --- top-level resolution used by classFactory ------------------------------
 
-def resolve_environment(plugin_dir, prompt=False, build=False) -> dict:
+def resolve_environment(plugin_dir) -> dict:
     """Decide which Python runs winmol_run.py. Returns {'status':
-    'byo'|'ready'|'installed'|'needs_setup'|'error', 'python',
-    'venv_path', 'message'}; never raises, so QGIS keeps loading.
-    ``build=False`` (plugin load) never does heavy work — 'needs_setup'
-    instead. ``prompt`` is accepted for call-site compat, ignored."""
-    del prompt
+    'byo'|'ready'|'needs_setup'|'error', 'python', 'venv_path',
+    'message'}; never raises, so QGIS keeps loading. Never does heavy
+    work — a missing environment reports 'needs_setup', and the actual
+    build runs through setup_environment on a worker thread."""
     venv_path = venv_location(plugin_dir)
     result = {"venv_path": venv_path, "python": None, "message": ""}
 
@@ -748,22 +835,12 @@ def resolve_environment(plugin_dir, prompt=False, build=False) -> dict:
                       message="WINMOL environment ready.")
         return result
 
-    if not build:
-        message = ("WINMOL environment not set up yet. Open the "
-                   "plugin dialog to create it (Python 3.11 + "
-                   "onnxruntime).")
-        if want_gpu:
-            message = ("WINMOL_GPU=1: the environment will be "
-                       "(re)built with the GPU runtime "
-                       "(onnxruntime-gpu) on the next Run.")
-        result.update(status="needs_setup", message=message)
-        return result
-
-    try:
-        info = setup_environment(venv_path, gpu=want_gpu)
-        result.update(status="installed", python=info["python"],
-                      message="WINMOL environment installed.")
-    except Exception as exc:
-        result.update(status="error",
-                      message=f"WINMOL setup failed: {exc}")
+    message = ("WINMOL environment not set up yet. Open the "
+               "plugin dialog to create it (Python 3.11 + "
+               "onnxruntime).")
+    if want_gpu:
+        message = ("WINMOL_GPU=1: the environment will be "
+                   "(re)built with the GPU runtime "
+                   "(onnxruntime-gpu) on the next Run.")
+    result.update(status="needs_setup", message=message)
     return result

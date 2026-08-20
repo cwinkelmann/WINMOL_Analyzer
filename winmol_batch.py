@@ -8,13 +8,14 @@
 
 import argparse
 import concurrent.futures
-import json
 import os
 import queue
 import subprocess
 import sys
 from typing import List, Optional
 
+from plugin_utils.config_overrides import set_default
+from plugin_utils.gpu_probe import run_nvidia_smi_query
 from plugin_utils.model_registry import (
     ModelDownloadError,
     Registry,
@@ -72,15 +73,8 @@ def list_orthomosaics(input_folder: str) -> List[str]:
 
 def detect_gpu_count() -> int:
     """Number of visible NVIDIA GPUs, or 0 if none / nvidia-smi unavailable."""
-    try:
-        out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=20)
-        if out.returncode == 0:
-            return len([ln for ln in out.stdout.splitlines() if ln.strip()])
-    except Exception:
-        pass
-    return 0
+    lines = run_nvidia_smi_query("index", timeout=20)
+    return len(lines) if lines else 0
 
 
 def _with_cpu_budget(overrides_json: str, cpu_budget: int) -> str:
@@ -89,18 +83,7 @@ def _with_cpu_budget(overrides_json: str, cpu_budget: int) -> str:
     An explicit user-set max_cpu_workers wins. Unparsable JSON is passed
     through untouched -- the child reports the real error.
     """
-    raw = (overrides_json or "").strip()
-    overrides = {}
-    if raw:
-        try:
-            overrides = json.loads(raw)
-        except Exception:
-            return overrides_json
-        if not isinstance(overrides, dict):
-            return overrides_json
-    if "max_cpu_workers" not in overrides:
-        overrides["max_cpu_workers"] = int(cpu_budget)
-    return json.dumps(overrides)
+    return set_default(overrides_json, "max_cpu_workers", int(cpu_budget))
 
 
 def run_winmol(input_image: str, model_path: str, output_folder: str,
@@ -124,6 +107,10 @@ def run_winmol(input_image: str, model_path: str, output_folder: str,
     ]
 
     env = dict(os.environ)
+    # winmol_run.py's determinism guard re-execs itself when
+    # PYTHONHASHSEED is unset; pinning it here spares every child that
+    # extra interpreter start. An explicit user value is respected.
+    env.setdefault("PYTHONHASHSEED", "0")
     if gpu_id is not None:
         # Pin this ortho to one GPU. The child then plans for a SINGLE GPU --
         # the well-tested path -- instead of every concurrent job trying to

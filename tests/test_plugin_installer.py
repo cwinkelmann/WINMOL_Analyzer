@@ -97,7 +97,7 @@ def test_stale_managed_pointer_falls_through_to_needs_setup(
     assert not os.path.exists(ghost)
     monkeypatch.setattr(installer, "configured_python_executable",
                         lambda: ghost)
-    result = installer.resolve_environment(plugin_dir, build=False)
+    result = installer.resolve_environment(plugin_dir)
     assert result["status"] == "needs_setup"
     assert result["python"] is None
     assert result["venv_path"] == venv
