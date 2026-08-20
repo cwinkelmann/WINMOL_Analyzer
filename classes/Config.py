@@ -141,6 +141,13 @@ class Config(object):
     stem_map_binary = True
     stem_binary_threshold = 0.5
 
+    # Pixels within this many prediction-grid pixels of a nodata boundary
+    # are dropped from the stem map. At the cliff the U-Net fires on the
+    # transition itself, leaving a thin bright rim that vectorizes into
+    # stems tracing the ortho outline (measured on Barnekow: 4.47% fg in
+    # the 0-4 px rim vs 1.5-2.7% just inside it). 0 disables.
+    stem_edge_margin_px = 4
+
     # stem vectorization
     min_length = 2.0
     max_distance = 8

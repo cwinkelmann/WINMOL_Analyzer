@@ -266,7 +266,26 @@ def _prepare_inference_batch(raw_tiles, raw_masks, config,
     return tile_batch, mask_resized
 
 
-def _binarize_prediction_core(pred_core, mask_core, threshold: float = 0.5):
+def _binarize_prediction_core(pred_core, mask_core, threshold: float = 0.5,
+                              edge_margin: int = 0):
+    """Binarize, dropping a margin of pixels along any nodata boundary.
+
+    At a nodata cliff the U-Net fires on the transition itself: measured on
+    Barnekow, foreground in the 0-4 px rim is 4.47% against 1.5-2.7% in the
+    4-64 px band just inside it, i.e. a thin bright line hugging the
+    boundary with a trough behind it. Those pixels sit on VALID data, so
+    the `& mask_core` below keeps them and vectorization turns them into
+    stems that trace the ortho outline.
+
+    Eroding the validity mask by a few pixels removes the rim. The erosion
+    uses border_value=1 so it only ever eats inward from real nodata --
+    the edges of this crop are tile seams, not boundaries, and eroding
+    those would punch a hole at every tile join.
+    """
+    if edge_margin > 0 and not mask_core.all():
+        from scipy.ndimage import binary_erosion
+        mask_core = binary_erosion(
+            mask_core, iterations=int(edge_margin), border_value=1)
     return np.ascontiguousarray(
         ((pred_core >= threshold) & mask_core).astype(np.uint8)
     )
@@ -285,7 +304,8 @@ def _predict_batch_core(raw_tiles, raw_masks, model, config):
         mask_core = mask_resized[idx, crop:(
             config.img_width - crop), crop:(config.img_width - crop), 0] > 0.5
         pred_cores.append(_binarize_prediction_core(
-            pred_core, mask_core, threshold=threshold))
+            pred_core, mask_core, threshold=threshold,
+            edge_margin=getattr(config, 'stem_edge_margin_px', 0)))
     return pred_cores
 
 
@@ -1222,6 +1242,7 @@ def predict_stream_to_raster(
                     mask_core,
                     threshold=float(getattr(
                         config, 'stem_binary_threshold', 0.5)),
+                    edge_margin=getattr(config, 'stem_edge_margin_px', 0),
                 )
                 write_batch_s += _write_prediction_core(
                     dst, pred_core, job, layout)
