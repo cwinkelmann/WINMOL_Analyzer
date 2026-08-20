@@ -1,11 +1,20 @@
 #!/usr/bin/env python
 from __future__ import annotations
 
-import json
 import os
+import sys
+
+# connect_stems joins stems in the set-iteration order of string-hashed Part
+# objects, which Python salts per process — so re-exec once with a pinned
+# PYTHONHASHSEED before anything hashes into a set ('-u' re-added to keep the
+# plugin's log stream unbuffered).
+if os.environ.get("PYTHONHASHSEED") != "0":
+    os.environ["PYTHONHASHSEED"] = "0"
+    os.execv(sys.executable, [sys.executable, "-u"] + sys.argv)
+
+import json
 import shutil
 import subprocess
-import sys
 import tempfile
 
 from classes.Config import Config
@@ -19,6 +28,25 @@ from utils import Quantification as Quant
 from utils.Tiling import build_tile_grid, meters_to_pixels
 
 VALID_PROCESS_TYPES = {'Stems', 'Trees', 'Nodes'}
+
+#: Providers that mean "a GPU/accelerator is available" — CUDA on NVIDIA,
+#: CoreML on Apple Silicon (Metal/ANE).
+_ACCELERATOR_PROVIDERS = ("CUDAExecutionProvider", "CoreMLExecutionProvider")
+
+
+def _cpu_stream_forces_onnx_cpu(prediction_backend, selected_providers):
+    """In cpu_stream mode, should the ONNX runtime be pinned to the CPU
+    provider?
+
+    cpu_stream is the single-device streaming path the planner picks when
+    there is no CUDA GPU. On Apple Silicon it is chosen for lack of CUDA,
+    but CoreML is still a real accelerator (18x faster than CPU here) and
+    must NOT be disabled. So force the CPU provider only when the user
+    explicitly asked for the ``cpu`` backend, or the machine offers no
+    accelerator at all (CUDA or CoreML)."""
+    if str(prediction_backend).lower() == "cpu":
+        return True
+    return not any(p in _ACCELERATOR_PROVIDERS for p in selected_providers)
 
 
 class ImageProcessing:
@@ -93,10 +121,20 @@ class ImageProcessing:
         print(f"  producer_workers = {plan.producer_workers}")
         print(f"  progress_interval_s = {plan.progress_interval_s}")
         print(f"  est_pred_tiles   = {plan.estimated_prediction_tiles}")
-        self._apply_plan_to_config(plan)
+        # Say so when the planner overrode a configured value. These caps
+        # used to be silent, which is how a configured
+        # prediction_producer_workers_gpu=6 ran as 3, and the vector pool
+        # ran on 2 of 12 cores, without anyone noticing they were capped.
+        for note in getattr(plan, 'capped', None) or []:
+            print(f"  WARNING: {note}")
+        self._apply_plan_to_config(plan, hardware)
         return plan
 
-    def _apply_plan_to_config(self, plan):
+    def _apply_plan_to_config(self, plan, hardware):
+        # Carry the detected hardware onto the config so the prediction
+        # phase can key its autotune cache on it without re-probing
+        # nvidia-smi.
+        self.config.hardware = hardware
         self.config.cpu_workers = (
             plan.vector_inner_workers
             if plan.vector_mode == 'tiled'
@@ -128,10 +166,21 @@ class ImageProcessing:
         from utils import Prediction as Pred
 
         if plan.prediction_mode == 'cpu_stream':
-            os.environ["WINMOL_ONNX_FORCE_CPU"] = "1"
+            from utils.onnx_runtime import selected_providers
+            if _cpu_stream_forces_onnx_cpu(
+                    getattr(self.config, 'prediction_backend', 'auto'),
+                    selected_providers()):
+                os.environ["WINMOL_ONNX_FORCE_CPU"] = "1"
 
         print("\nLoading Model...")
-        model = IO.load_model_from_path(self.model_path)
+        model = IO.load_model_from_path(self.model_path, self.config)
+        from utils.onnx_runtime import last_active_report
+        report = last_active_report()
+        if report:
+            print(
+                f"Execution providers (active): "
+                f"{report['active_providers']} "
+                f"(device: {report['accelerator_label']})")
         print("\nPerforming Prediction with Resampling in stream mode...")
         profile = Pred.predict_stream_to_raster(
             self.uav_path,
@@ -229,6 +278,10 @@ class ImageProcessing:
             output_gpkg=out_path,
             edge_buffer_m=plan.tile_overlap_m,
             config=self.config,
+            # Pass the full stem-map extent so stems on the ortho's true
+            # outer boundary (corners) aren't trimmed by the interior-seam
+            # dedup.
+            stem_map_path=self.stem_path,
         )
 
     def run_stem_pipeline(self, plan):
@@ -287,6 +340,8 @@ class ImageProcessing:
 
 
 if __name__ == '__main__':
+    print(f"Determinism: PYTHONHASHSEED={os.environ.get('PYTHONHASHSEED')}",
+          flush=True)
     if len(sys.argv) != 6:
         print("""Usage:
             python3 -u winmol_run.py <model_path> <input_tiff> <stem_map_tiff>

@@ -28,8 +28,13 @@ from qgis.PyQt.QtCore import QCoreApplication, QSettings, QTranslator
 from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import QAction
 
-# Initialize Qt resources from file resources.py
-from .resources import *
+# Initialize Qt resources (optional): the compiled resources.py is PyQt5-format
+# and may not load under Qt6/QGIS 4. Icons fall back to the icon.png file, so a
+# failure here is cosmetic, not fatal.
+try:
+    from .resources import *  # noqa: F401,F403
+except Exception:
+    pass
 
 # Import the code for the dialog
 from .winmol_analyzer_dialog import WINMOLAnalyzerDialog
@@ -52,17 +57,26 @@ class WINMOLAnalyzer:
         self.iface = iface
         # initialize plugin directory
         self.plugin_dir = os.path.dirname(__file__)
-        # initialize locale
-        locale = QSettings().value('locale/userLocale')[0:2]
-        locale_path = os.path.join(
-            self.plugin_dir,
-            'i18n',
-            'WINMOLAnalyze_{}.qm'.format(locale))
+        # Initialize locale. This runs inside __init__, which classFactory
+        # calls, so ANY exception here stops the plugin loading at all — no
+        # toolbar icon, no menu, nothing to recover from. QSettings.value()
+        # returns None for a missing key, and the previous `[0:2]` on that
+        # raised TypeError on profiles where 'locale/userLocale' is unset.
+        # There is no i18n directory in this repo and none is packaged, so a
+        # translation can never load; the whole block is best-effort.
+        try:
+            locale = str(QSettings().value('locale/userLocale', '') or '')[0:2]
+            locale_path = os.path.join(
+                self.plugin_dir,
+                'i18n',
+                'WINMOLAnalyze_{}.qm'.format(locale))
 
-        if os.path.exists(locale_path):
-            self.translator = QTranslator()
-            self.translator.load(locale_path)
-            QCoreApplication.installTranslator(self.translator)
+            if locale and os.path.exists(locale_path):
+                self.translator = QTranslator()
+                self.translator.load(locale_path)
+                QCoreApplication.installTranslator(self.translator)
+        except Exception:  # noqa: BLE001 - never block plugin load
+            pass
 
         # Declare instance attributes
         self.actions = []
@@ -165,7 +179,9 @@ class WINMOLAnalyzer:
     def initGui(self):
         """Create the menu entries and toolbar icons inside the QGIS GUI."""
 
-        icon_path = ':/plugins/winmol_analyzer/icon.png'
+        # Load from the file (works on Qt5 and Qt6) rather than the compiled
+        # ':/plugins/...' resource, which is PyQt5-format.
+        icon_path = os.path.join(os.path.dirname(__file__), 'icon.png')
         self.add_action(
             icon_path,
             text=self.tr(u'Detects stems from UAV images'),
@@ -177,6 +193,16 @@ class WINMOLAnalyzer:
 
     def unload(self):
         """Removes the plugin menu item and icon from QGIS GUI."""
+        # Stop any running background threads BEFORE QGIS drops the dialog
+        # reference: destroying a still-running QThread (e.g. unloading/
+        # reloading the plugin mid-run) triggers Qt's qFatal() and aborts
+        # all of QGIS.
+        dlg = getattr(self, "dlg", None)
+        if dlg is not None and hasattr(dlg, "_shutdown_threads"):
+            try:
+                dlg._shutdown_threads()
+            except Exception:
+                pass
         for action in self.actions:
             self.iface.removePluginMenu(
                 self.tr(u'&WINMOL Analyzer'),

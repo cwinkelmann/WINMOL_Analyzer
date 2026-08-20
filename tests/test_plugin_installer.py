@@ -57,7 +57,7 @@ def test_marker_roundtrip_and_hash_invalidation(tmp_path, monkeypatch):
     req = tmp_path / "cpu.txt"
     req.write_text("-r core.txt\nonnxruntime>=1.17\n")
     monkeypatch.setattr(installer, "plugin_requirements_path",
-                        lambda: req)
+                        lambda gpu=False: req)
     venv = tmp_path / "venv"
     venv.mkdir()
     assert not installer.marker_matches(str(venv))
@@ -72,14 +72,14 @@ def test_marker_roundtrip_and_hash_invalidation(tmp_path, monkeypatch):
 
 def test_core_txt_names_no_runtime():
     names = _requirement_names(
-        (REPO / "requirements" / "core.txt").read_text())
+        (REPO / "requirements" / "core.txt").read_text(encoding="utf-8"))
     assert names, "core.txt must list the geo/science stack"
     assert not [n for n in names
                 if "onnxruntime" in n or "tensorflow" in n]
 
 
 def test_cpu_txt_is_core_plus_one_runtime_and_psutil():
-    text = (REPO / "requirements" / "cpu.txt").read_text()
+    text = (REPO / "requirements" / "cpu.txt").read_text(encoding="utf-8")
     includes = [line.strip() for line in text.splitlines()
                 if line.strip().startswith("-r")]
     assert includes == ["-r core.txt"]
@@ -97,24 +97,31 @@ def test_stale_managed_pointer_falls_through_to_needs_setup(
     assert not os.path.exists(ghost)
     monkeypatch.setattr(installer, "configured_python_executable",
                         lambda: ghost)
-    result = installer.resolve_environment(plugin_dir, build=False)
+    result = installer.resolve_environment(plugin_dir)
     assert result["status"] == "needs_setup"
     assert result["python"] is None
     assert result["venv_path"] == venv
     assert set(result) >= {"status", "python", "venv_path", "message"}
 
 
-# Files that run before/without the "does compute deps import" probe
-# (winmol_run.py -> utils.Prediction/PredictWorkers -> utils.IO), so a
-# module-level import missing from requirements crashes the first real
-# run even though the venv built successfully.
-_CLOSURE_FILES = (
-    "winmol_run.py",
-    "utils/IO.py",
-    "utils/Prediction.py",
-    "utils/PredictWorkers.py",
-    "utils/onnx_runtime.py",
-)
+# Everything the plugin ships that runs in the compute venv. Derived,
+# not enumerated: this used to be a hand-written tuple of ~12 files, and
+# utils/onnx_preprocess.py was not in it -- so when the graph read
+# strategy became the default and put its module-level `import onnx` on
+# the default path, this test stayed green and the user got a
+# ModuleNotFoundError at model load instead.
+_RUNTIME_DIRS = ("utils", "classes", "plugin_utils")
+_ENTRY_POINTS = ("winmol_run.py", "winmol_batch.py")
+
+
+def _closure_files():
+    found = [Path(name) for name in _ENTRY_POINTS]
+    for directory in _RUNTIME_DIRS:
+        found += sorted(
+            p.relative_to(REPO) for p in (REPO / directory).glob("*.py"))
+    return found
+
+
 _LOCAL_PACKAGES = {"utils", "classes", "plugin_utils"}
 # Import roots not literally named in requirements/*.txt because they
 # ride in as transitive deps of a package that IS: geopandas pulls in
@@ -128,7 +135,7 @@ _IMPORT_TO_REQUIREMENT_NAME = {
 
 
 def _module_level_import_roots(path):
-    tree = ast.parse(path.read_text(), filename=str(path))
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     roots = set()
     for node in tree.body:
         if isinstance(node, ast.Import):
@@ -145,12 +152,12 @@ def test_module_level_imports_are_covered_by_requirements():
     on the first real run. Anything not needed at import time belongs
     inside the one function that uses it, not at module scope."""
     declared = set(_requirement_names(
-        (REPO / "requirements" / "core.txt").read_text())
+        (REPO / "requirements" / "core.txt").read_text(encoding="utf-8"))
         + _requirement_names(
-            (REPO / "requirements" / "cpu.txt").read_text()))
+            (REPO / "requirements" / "cpu.txt").read_text(encoding="utf-8")))
     stdlib = set(sys.stdlib_module_names)
     missing = []
-    for rel in _CLOSURE_FILES:
+    for rel in _closure_files():
         for root in _module_level_import_roots(REPO / rel):
             if root in stdlib or root in _LOCAL_PACKAGES:
                 continue
@@ -161,3 +168,22 @@ def test_module_level_imports_are_covered_by_requirements():
         "module-level imports uncovered by requirements/core.txt + "
         "cpu.txt (lazy-import inside the one function that needs it "
         "instead): " + ", ".join(missing))
+
+
+def test_marker_hash_covers_included_requirements(tmp_path):
+    """A change to core.txt must invalidate the sentinel.
+
+    cpu.txt is little more than `-r core.txt`, so hashing only the named
+    file left every existing install matching after a dependency was
+    added to the shared stack -- the venv would never rebuild and the
+    new package would never arrive.
+    """
+    core = tmp_path / "core.txt"
+    entry = tmp_path / "cpu.txt"
+    core.write_text("numpy==1.26.4\n")
+    entry.write_text("-r core.txt\nonnxruntime>=1.17\n")
+
+    before = installer._file_hash(entry)
+    core.write_text("numpy==1.26.4\nonnx>=1.15\n")
+
+    assert installer._file_hash(entry) != before

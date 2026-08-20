@@ -27,6 +27,11 @@ share/python-wheels/
 MANIFEST
 models/
 
+# Packaged plugin zips built by scripts/build_plugin_zip.sh (make package,
+# CI release, or a local proof build) — never a source artifact.
+WINMOL_Analyzer-*.zip
+WINMOL_Analyzer_QGIS_Plugin.zip
+
 # PyInstaller
 #  Usually these files are written by a python script from a template
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 
@@ -63,6 +63,9 @@ class ExecutionPlan:
     vector_tile_workers: int
     vector_inner_workers: int
     keep_temp: bool
+    #: Human-readable notes for every knob the planner reduced below what
+    #: the config asked for. Empty when nothing was overridden.
+    capped: list = field(default_factory=list)
 
 
 CPU_ONLY = 'cpu_only'
@@ -72,6 +75,34 @@ MULTI_GPU = 'multi_gpu_dgx'
 
 def _cfg(config: Any, key: str, default: Any) -> Any:
     return getattr(config, key, default)
+
+
+def _apply_caps(label: str, requested, caps, capped: list) -> int:
+    """Reduce ``requested`` to the tightest cap, recording WHY it bit.
+
+    Silent capping is how this pipeline hid two real limits: a configured
+    ``prediction_producer_workers_gpu = 6`` was cut to 3 by
+    ``cpu_workers // 3``, and the vector pool ran on 2 of 12 cores. In
+    both cases the config value looked honoured and never was, so nobody
+    thought to question it. Anything that lowers a user-set knob has to
+    say so out loud.
+
+    ``caps`` is an iterable of ``(value, reason)``; the note names the
+    constraint that actually bound, not just the final number.
+    """
+    resolved = int(requested)
+    binder = None
+    for value, reason in caps:
+        value = int(value)
+        if value < resolved:
+            resolved, binder = value, reason
+    resolved = max(1, resolved)
+    if resolved < int(requested):
+        capped.append(
+            f"{label}: config asked for {int(requested)}, using {resolved} "
+            f"(limited by {binder or 'a floor of 1'})"
+        )
+    return resolved
 
 
 def _meters_to_pixels(
@@ -115,9 +146,78 @@ def _scenario(hardware: Any) -> str:
     return MULTI_GPU
 
 
+#: Private resident bytes one vector tile worker needs. Measured at
+#: ~1.38 GB (Private_Dirty, smaps_rollup, Tegel R13/R12); rounded up for
+#: headroom since peak differs from the sampled instant.
+VECTOR_WORKER_PRIVATE_BYTES = 1.75 * (1024 ** 3)
+
+#: Sentinel for "this cap does not apply" inside the min() below.
+_UNCONSTRAINED = 1 << 30
+
+
 def _gpu_memory_gb(hardware: Any) -> float:
     values = list(getattr(hardware, 'gpu_memory_gb', []) or [])
     return max(values) if values else 0.0
+
+
+def _vector_available_bytes(hardware: Any) -> float:
+    """Free RAM in bytes, or 0.0 when it cannot be determined.
+
+    psutil ships in requirements/cpu.txt and gpu.txt, so this degrades
+    rather than raises when it is missing (e.g. a minimal CI image); the
+    fallback assumes half of total RAM is usable.
+    """
+    try:
+        # Clamped to the cgroup limit when one is set: a limited
+        # container otherwise reads the HOST's free memory and
+        # over-provisions the vector pool exactly as badly as reading
+        # the host's total.
+        from plugin_utils import container
+        return float(container.available_memory_bytes())
+    except Exception:
+        total_gb = getattr(hardware, 'total_ram_gb', None)
+        if total_gb:
+            return float(total_gb) * (1024 ** 3) * 0.5
+    return 0.0
+
+
+def _vector_memory_cap(config: Any, hardware: Any) -> int:
+    """How many vector tile workers free RAM can actually hold.
+
+    Sized on PRIVATE resident memory, not RSS. Measured with
+    smaps_rollup on a live Tegel vector phase, per worker:
+
+        RSS 2734 MB | Shared_Dirty 1257 MB | Private_Dirty 1381 MB
+
+    The Shared_Dirty part is copy-on-write state inherited from the
+    parent at fork; it is shared with the parent and every sibling, so
+    it costs physical RAM ONCE, not once per worker. Sizing off RSS
+    triple-counts it and badly under-provisions the pool.
+    """
+    per_worker = float(_cfg(
+        config, 'vector_worker_bytes', VECTOR_WORKER_PRIVATE_BYTES,
+    ) or VECTOR_WORKER_PRIVATE_BYTES)
+    if per_worker <= 0:
+        return _UNCONSTRAINED
+
+    total_gb = getattr(hardware, 'total_ram_gb', None)
+    fraction = float(_cfg(config, 'vector_ram_fraction', 0.4) or 0.4)
+    floor_bytes = (float(total_gb) * (1024 ** 3) * fraction
+                   if total_gb else 0.0)
+
+    # Deliberately the LARGER of "free right now" and a fraction of total.
+    # The plan is computed at startup, so the instantaneous reading is
+    # unrepresentative of the vector phase in BOTH directions: the model
+    # and prediction buffers are not allocated yet (so free RAM reads
+    # high), while anything else running on the box makes it read low --
+    # a transient dip must not permanently pin the pool to one worker.
+    # The fraction of total is the stable term; free RAM only ever raises
+    # the budget above it.
+    budget = max(_vector_available_bytes(hardware), floor_bytes)
+    if budget <= 0:
+        return _UNCONSTRAINED       # unknown -> let the CPU cap decide
+    # Floor of one worker: refusing to run is worse than swapping.
+    return max(1, int(budget // per_worker))
 
 
 def _vector_worker_split(
@@ -127,7 +227,11 @@ def _vector_worker_split(
     tiles: int,
     process_type: str,
     huge_nodes_job: bool,
+    hardware: Any = None,
+    capped: list | None = None,
 ) -> tuple[int, int]:
+    capped = [] if capped is None else capped
+
     if process_type == 'Stems':
         return 1, max(1, cpu_workers)
 
@@ -137,9 +241,24 @@ def _vector_worker_split(
 
     max_tile_workers = max(
         1,
-        int(_cfg(config, 'max_vector_tile_workers', 4)),
+        int(_cfg(config, 'max_vector_tile_workers', 16)),
     )
-    tile_workers = min(max_tile_workers, max(1, cpu_workers // 4), tiles)
+    # Was `cpu_workers // 4`. That divisor reserved three quarters of the
+    # budget for inner workers -- but this branch returns inner=1, so it
+    # reserved cores for parallelism it never created. On a 12-core box
+    # (cpu_workers=11) it yielded 2, and the vector phase, which is ~73%
+    # of a large run, used 2 of 12 cores. Bound by cores and free RAM
+    # instead; both are real constraints, the divisor was not.
+    tile_workers = _apply_caps(
+        'vector_tile_workers',
+        max_tile_workers,
+        [
+            (max(1, cpu_workers), 'cpu_workers'),
+            (_vector_memory_cap(config, hardware), 'free RAM / worker size'),
+            (tiles, 'number of vector tiles'),
+        ],
+        capped,
+    )
     if tile_workers <= 1:
         inner = cpu_workers if not huge_nodes_job else max(1, hw_cpu // 5)
         return 1, max(1, inner)
@@ -178,6 +297,10 @@ def build_execution_plan(
         raster.pixel_size_x,
         raster.pixel_size_y,
     )
+    # Every knob the planner reduces below its configured value lands
+    # here, so the run can print WHY instead of silently disagreeing
+    # with config.json.
+    capped: list = []
     keep_temp = bool(_cfg(config, 'keep_temp_tiles', False))
     max_gpu_workers = int(_cfg(config, 'max_gpu_workers', 8))
     hw_cpu = max(1, int(getattr(hardware, 'cpu_count', 1) or 1))
@@ -249,14 +372,17 @@ def build_execution_plan(
         )
         if huge_nodes_job:
             producer_queue_batches = max(producer_queue_batches, 8)
-        producer_workers = int(
+        requested_producers = int(
             _cfg(config, 'prediction_producer_workers_gpu', 3)
         )
+        producer_caps = [(max(1, cpu_workers // 3), 'cpu_workers // 3')]
         if cpu_workers < 10:
-            producer_workers = min(producer_workers, 2)
-        producer_workers = max(
-            1,
-            min(producer_workers, max(1, cpu_workers // 3)),
+            producer_caps.append((2, 'cpu_workers < 10'))
+        producer_workers = _apply_caps(
+            'prediction_producer_workers_gpu',
+            requested_producers,
+            producer_caps,
+            capped,
         )
         progress_interval_s = float(
             _cfg(config, 'progress_interval_s_gpu', 60.0)
@@ -321,6 +447,8 @@ def build_execution_plan(
         tiles,
         process_type,
         huge_nodes_job,
+        hardware,
+        capped,
     )
     prediction_mode = _resolve_prediction_mode(config, scen)
     vector_mode = 'none' if process_type == 'Stems' else 'tiled'
@@ -343,4 +471,5 @@ def build_execution_plan(
         vector_tile_workers=vector_tile_workers,
         vector_inner_workers=vector_inner_workers,
         keep_temp=keep_temp,
+        capped=capped,
     )

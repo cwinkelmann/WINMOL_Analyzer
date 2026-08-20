@@ -1,0 +1,58 @@
+# docker compose -f docker/compose.yaml run --rm cpu
+# docker compose -f docker/compose.yaml run --rm gpu
+#
+# Both services share the same three mounts. Put orthomosaics in ./input,
+# results land in ./output, models are downloaded once into ./models and
+# reused by every later run.
+services:
+  cpu:
+    image: winmol:cpu
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        VARIANT: cpu
+    volumes:
+      - ${WINMOL_INPUT_DIR:-./input}:/data/input:ro
+      - ${WINMOL_OUTPUT_DIR:-./output}:/data/output
+      - ${WINMOL_MODEL_DIR:-./models}:/data/models
+    environment:
+      # Everything is autodetected from the container's own limits; set
+      # these only to override. WINMOL_BUILD_OVERVIEWS needs the input
+      # mount to be writable (drop the :ro above).
+      # WINMOL_JOBS: "2"
+      # WINMOL_PROCESS_TYPE: "Stems"
+      # WINMOL_BUILD_OVERVIEWS: "1"
+      # GDAL_CACHEMAX: "4096"
+      WINMOL_PROCESS_TYPE: "${WINMOL_PROCESS_TYPE:-Nodes}"
+    command: ["${WINMOL_MODEL_FAMILY:-Spruce_Deadwood}"]
+    # Constrained-desktop example. Sizing is read from these limits, not
+    # from the host, so the container plans for what it actually has.
+    deploy:
+      resources:
+        limits:
+          cpus: "${WINMOL_CPUS:-4}"
+          memory: ${WINMOL_MEMORY:-8g}
+
+  gpu:
+    image: winmol:gpu
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        VARIANT: gpu
+    volumes:
+      - ${WINMOL_INPUT_DIR:-./input}:/data/input:ro
+      - ${WINMOL_OUTPUT_DIR:-./output}:/data/output
+      - ${WINMOL_MODEL_DIR:-./models}:/data/models
+    environment:
+      WINMOL_PROCESS_TYPE: "${WINMOL_PROCESS_TYPE:-Nodes}"
+    command: ["${WINMOL_MODEL_FAMILY:-Spruce_Deadwood}"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              # count: 8   -- or list specific ids with device_ids: ["0","1"]
+              count: all
+              capabilities: [gpu]

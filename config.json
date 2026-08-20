@@ -1,6 +1,189 @@
 {
-    "Beech": "https://zenodo.org/records/10491124/files/model_UNet_SpecDS_Beech_512_2023-02-28_042751.hdf5?download=1",
-    "Spruce": "https://zenodo.org/records/10491124/files/model_UNet_SpecDS_Spruce_512_2023-02-27_061925.hdf5?download=1",
-    "Spruce_Deadwood": "https://zenodo.org/records/15907576/files/model_UNet_SpecDS_Spruce_Deadwood_512_2024-12-19_194758.hdf5?download=1",
-    "General": "https://zenodo.org/records/10491124/files/model_UNet_GenDS_512_2023-02-27_211141.hdf5?download=1"
+    "_comment": [
+        "Schema 2. All models pinned (sha256 + size_mb) to release 'models-v1' on ",
+        "github.com/cwinkelmann/WINMOL_segmentor_pt. Families Spruce/Beech/",
+        "Spruce_Deadwood/General map to that release's timestamped Zenodo-flavour ",
+        "assets (model_UNet_<GenDS|SpecDS_*>_512_<timestamp>[_fp16|_int8].onnx); ",
+        "the beech_pytorch_* trio is our retrained PyTorch UNet (standalone, no ",
+        "family — resolve by explicit id)."
+    ],
+    "schema": 2,
+    "gui_default": "spruce_deadwood_int8",
+    "recommended": [
+        "spruce_deadwood_int8",
+        "beech_pytorch_int8",
+        "spruce_int8",
+        "beech_int8",
+        "general_int8"
+    ],
+    "families": {
+        "Spruce": {
+            "label": "Spruce",
+            "default": "spruce_fp32"
+        },
+        "Beech": {
+            "label": "Beech",
+            "default": "beech_fp32"
+        },
+        "Spruce_Deadwood": {
+            "label": "Spruce (windthrow + deadwood)",
+            "default": "spruce_deadwood_fp32"
+        },
+        "General": {
+            "label": "General (mixed species)",
+            "default": "general_fp32"
+        }
+    },
+    "models": {
+        "spruce_fp32": {
+            "label": "Spruce (fp32, reference)",
+            "family": "Spruce",
+            "precision": "fp32",
+            "url": "https://github.com/cwinkelmann/WINMOL_segmentor_pt/releases/download/models-v1/model_UNet_SpecDS_Spruce_512_2023-02-27_061925.onnx",
+            "file": "model_UNet_SpecDS_Spruce_512_2023-02-27_061925.onnx",
+            "sha256": "26546a66b64247961c8f2df07019d846297b1296f223755e405709c111c855fd",
+            "size_mb": 118.82,
+            "lossless": true
+        },
+        "spruce_fp16": {
+            "label": "Spruce (fp16, GPU)",
+            "family": "Spruce",
+            "precision": "fp16",
+            "url": "https://github.com/cwinkelmann/WINMOL_segmentor_pt/releases/download/models-v1/model_UNet_SpecDS_Spruce_512_2023-02-27_061925_fp16.onnx",
+            "file": "model_UNet_SpecDS_Spruce_512_2023-02-27_061925_fp16.onnx",
+            "sha256": "2f25fdc70b23e23d87ddf56f8f3a481c8db3d4d046491a27d6e4ab2a2cb5824a",
+            "size_mb": 59.43,
+            "lossless": true
+        },
+        "spruce_int8": {
+            "label": "Spruce (int8, CPU)",
+            "family": "Spruce",
+            "precision": "int8",
+            "url": "https://github.com/cwinkelmann/WINMOL_segmentor_pt/releases/download/models-v1/model_UNet_SpecDS_Spruce_512_2023-02-27_061925_int8.onnx",
+            "file": "model_UNet_SpecDS_Spruce_512_2023-02-27_061925_int8.onnx",
+            "sha256": "e6d22f398977b14b43e8ee5ae8468d378489d6c4d181468c9777eeece1cf733b",
+            "size_mb": 29.91,
+            "lossless": false
+        },
+        "beech_fp32": {
+            "label": "Beech (fp32, reference)",
+            "family": "Beech",
+            "precision": "fp32",
+            "url": "https://github.com/cwinkelmann/WINMOL_segmentor_pt/releases/download/models-v1/model_UNet_SpecDS_Beech_512_2023-02-28_042751.onnx",
+            "file": "model_UNet_SpecDS_Beech_512_2023-02-28_042751.onnx",
+            "sha256": "91497501aa4c303838569d17d62875dc1e6e1fa18dcb6086dfd9647e3dc34ca4",
+            "size_mb": 118.82,
+            "lossless": true
+        },
+        "beech_fp16": {
+            "label": "Beech (fp16, GPU)",
+            "family": "Beech",
+            "precision": "fp16",
+            "url": "https://github.com/cwinkelmann/WINMOL_segmentor_pt/releases/download/models-v1/model_UNet_SpecDS_Beech_512_2023-02-28_042751_fp16.onnx",
+            "file": "model_UNet_SpecDS_Beech_512_2023-02-28_042751_fp16.onnx",
+            "sha256": "42b8e369769052c48e16e4d305be15fe7fa211ec6d09f5b0f4fcbdedf21eb310",
+            "size_mb": 59.43,
+            "lossless": true
+        },
+        "beech_int8": {
+            "label": "Beech (int8, CPU)",
+            "family": "Beech",
+            "precision": "int8",
+            "url": "https://github.com/cwinkelmann/WINMOL_segmentor_pt/releases/download/models-v1/model_UNet_SpecDS_Beech_512_2023-02-28_042751_int8.onnx",
+            "file": "model_UNet_SpecDS_Beech_512_2023-02-28_042751_int8.onnx",
+            "sha256": "a19501ea98e04e695d89cad55590f99225c927c749b6b3df610ca95f02ab8289",
+            "size_mb": 29.91,
+            "lossless": false
+        },
+        "spruce_deadwood_fp32": {
+            "label": "Spruce + deadwood (fp32, reference)",
+            "family": "Spruce_Deadwood",
+            "precision": "fp32",
+            "url": "https://github.com/cwinkelmann/WINMOL_segmentor_pt/releases/download/models-v1/model_UNet_SpecDS_Spruce_Deadwood_512_2024-12-19_194758.onnx",
+            "file": "model_UNet_SpecDS_Spruce_Deadwood_512_2024-12-19_194758.onnx",
+            "sha256": "88028ece8e24a64f7b08727267f933e3d62e12dfbf76d6667d35fa76cfaf83f1",
+            "size_mb": 118.82,
+            "lossless": true
+        },
+        "spruce_deadwood_fp16": {
+            "label": "Spruce + deadwood (fp16, GPU)",
+            "family": "Spruce_Deadwood",
+            "precision": "fp16",
+            "url": "https://github.com/cwinkelmann/WINMOL_segmentor_pt/releases/download/models-v1/model_UNet_SpecDS_Spruce_Deadwood_512_2024-12-19_194758_fp16.onnx",
+            "file": "model_UNet_SpecDS_Spruce_Deadwood_512_2024-12-19_194758_fp16.onnx",
+            "sha256": "cadee59388d161e6bc64477cc7c91ef8211c3c6c5186b7747aca88dbc28f1e9d",
+            "size_mb": 59.43,
+            "lossless": true
+        },
+        "spruce_deadwood_int8": {
+            "label": "Spruce + deadwood (int8, CPU)",
+            "family": "Spruce_Deadwood",
+            "precision": "int8",
+            "url": "https://github.com/cwinkelmann/WINMOL_segmentor_pt/releases/download/models-v1/model_UNet_SpecDS_Spruce_Deadwood_512_2024-12-19_194758_int8.onnx",
+            "file": "model_UNet_SpecDS_Spruce_Deadwood_512_2024-12-19_194758_int8.onnx",
+            "sha256": "e95e7876b38dd356faa789a0be1ae59280a42279db5bb507552771540cd13f46",
+            "size_mb": 29.91,
+            "lossless": false
+        },
+        "general_fp32": {
+            "label": "General / mixed species (fp32, reference)",
+            "family": "General",
+            "precision": "fp32",
+            "url": "https://github.com/cwinkelmann/WINMOL_segmentor_pt/releases/download/models-v1/model_UNet_GenDS_512_2023-02-27_211141.onnx",
+            "file": "model_UNet_GenDS_512_2023-02-27_211141.onnx",
+            "sha256": "fa192f96eef750a9ebdc261983b74e0353b2b3f1f746a026655cabbe8f44e0f0",
+            "size_mb": 118.82,
+            "lossless": true
+        },
+        "general_fp16": {
+            "label": "General / mixed species (fp16, GPU)",
+            "family": "General",
+            "precision": "fp16",
+            "url": "https://github.com/cwinkelmann/WINMOL_segmentor_pt/releases/download/models-v1/model_UNet_GenDS_512_2023-02-27_211141_fp16.onnx",
+            "file": "model_UNet_GenDS_512_2023-02-27_211141_fp16.onnx",
+            "sha256": "8d8f2d303ff425983102d83dcac860f627c7a6898f0ab46804aa95cd2faf3dd5",
+            "size_mb": 59.43,
+            "lossless": true
+        },
+        "general_int8": {
+            "label": "General / mixed species (int8, CPU)",
+            "family": "General",
+            "precision": "int8",
+            "url": "https://github.com/cwinkelmann/WINMOL_segmentor_pt/releases/download/models-v1/model_UNet_GenDS_512_2023-02-27_211141_int8.onnx",
+            "file": "model_UNet_GenDS_512_2023-02-27_211141_int8.onnx",
+            "sha256": "507bb3da447de288d7a55a86c322fe6e547a28fdb7aca1cd3768745ef1e2060d",
+            "size_mb": 29.91,
+            "lossless": false
+        },
+        "beech_pytorch_fp32": {
+            "label": "Beech, our PyTorch retrain (fp32)",
+            "family": "",
+            "precision": "fp32",
+            "url": "https://github.com/cwinkelmann/WINMOL_segmentor_pt/releases/download/models-v1/model_UNet_SpecDS_Beech_512_pytorch.onnx",
+            "file": "model_UNet_SpecDS_Beech_512_pytorch.onnx",
+            "sha256": "e12653e519914dd4cea73517eb414c49061973589c271f0d47696702aea29cc6",
+            "size_mb": 118.38,
+            "lossless": true
+        },
+        "beech_pytorch_fp16": {
+            "label": "Beech, our PyTorch retrain (fp16, GPU, w05)",
+            "family": "",
+            "precision": "fp16",
+            "url": "https://github.com/cwinkelmann/WINMOL_segmentor_pt/releases/download/models-v1/model_UNet_SpecDS_Beech_512_pytorch_w05_fp16.onnx",
+            "file": "model_UNet_SpecDS_Beech_512_pytorch_w05_fp16.onnx",
+            "sha256": "71c47dda22b27c6918aaebd5edd06058e085f75e541c47ca1a60ebe4ec9e1825",
+            "size_mb": 14.81,
+            "lossless": true
+        },
+        "beech_pytorch_int8": {
+            "label": "Beech, our PyTorch retrain (int8, CPU 10x, w05)",
+            "family": "",
+            "precision": "int8",
+            "url": "https://github.com/cwinkelmann/WINMOL_segmentor_pt/releases/download/models-v1/model_UNet_SpecDS_Beech_512_pytorch_w05_int8.onnx",
+            "file": "model_UNet_SpecDS_Beech_512_pytorch_w05_int8.onnx",
+            "sha256": "74c1bd1d8ed31988df5756c9ca7fc4c300de804a1733dc13df5a0bd8fceaaabd",
+            "size_mb": 7.49,
+            "lossless": true
+        }
+    }
 }
