@@ -1,6 +1,6 @@
 """Proves the CLI prediction path is TensorFlow-free.
 
-Four groups:
+Five groups:
 1. ``_resize_batch`` on imagery (order=3, bicubic-like) resizes NHWC batches
    and takes an identity fast path when already at the target size.
 2. ``_resize_batch`` on masks (order=0, nearest) keeps values binary.
@@ -9,7 +9,12 @@ Four groups:
 4. ``utils.Prediction`` / ``utils.PredictWorkers`` import cleanly with
    TensorFlow poisoned out of ``sys.modules`` -- proving neither module
    needs it, even though this conda env has TensorFlow installed.
+5. ``TileBatchProducer(out_size=...)`` resamples tiles onto the model grid
+   during the GDAL read (cubic imagery / nearest mask), so tiles arrive
+   already sized and ``_resize_batch``'s identity fast path short-circuits
+   the skimage resize -- including for a window clipped at the raster edge.
 """
+import queue
 import sys
 
 import numpy as np
@@ -147,3 +152,134 @@ def test_prediction_and_predictworkers_import_without_tensorflow():
         sys.modules.pop("utils.Prediction", None)
         sys.modules.pop("utils.PredictWorkers", None)
         sys.modules.update(saved)
+
+
+# --- Group 5: resample-in-read (TileBatchProducer out_size) ----------------
+
+def _write_synthetic_geotiff(path, width=700, height=700, seed=0):
+    rasterio = pytest.importorskip("rasterio")
+    from rasterio.transform import from_origin
+
+    rng = np.random.default_rng(seed)
+    data = rng.integers(1, 255, size=(3, height, width), dtype=np.uint8)
+    profile = {
+        "driver": "GTiff", "width": width, "height": height, "count": 3,
+        "dtype": "uint8", "crs": rasterio.crs.CRS.from_epsg(32633),
+        "transform": from_origin(400000.0, 5900000.0, 0.05, 0.05),
+    }
+    with rasterio.open(str(path), "w", **profile) as dst:
+        dst.write(data)
+    return str(path)
+
+
+class _FakeConfig:
+    img_height = 512
+    img_width = 512
+
+
+def _run_producer(uav_path, jobs, out_size):
+    from utils.Prediction import TileBatchProducer
+
+    q = queue.Queue()
+    producer = TileBatchProducer(
+        uav_path=uav_path, chunk_size=max(1, len(jobs)), jobs=jobs,
+        n_channels=3, out_queue=q, out_size=out_size,
+    )
+    producer.run()  # synchronous call -- no thread needed for the test
+    assert producer.error is None
+
+    items = []
+    while True:
+        payload = q.get_nowait()
+        if payload.get('producer_done'):
+            break
+        items.extend(payload['items'])
+    return items
+
+
+def test_tile_batch_producer_resamples_tiles_to_model_grid(tmp_path):
+    uav_path = _write_synthetic_geotiff(tmp_path / "ortho.tif")
+
+    job = {'src_col': 0, 'src_row': 0, 'src_width': 300, 'src_height': 300,
+           'tile_index': 0, 'dst_row': 0, 'dst_col': 0}
+    items = _run_producer(uav_path, [job], out_size=(512, 512))
+
+    assert len(items) == 1
+    _, tile, valid_mask = items[0]
+    assert tile.shape == (512, 512, 3)
+    assert valid_mask.shape == (512, 512)
+    # A window fully inside the raster has no boundless padding: every
+    # resampled pixel is valid.
+    assert valid_mask.all()
+
+
+def test_tile_batch_producer_native_read_unchanged_without_out_size(
+    tmp_path,
+):
+    """out_size=None (the default) must keep reading at native resolution --
+    proving the resample-in-read branch is opt-in, not a behavior change for
+    any other caller of TileBatchProducer."""
+    uav_path = _write_synthetic_geotiff(tmp_path / "ortho.tif")
+
+    job = {'src_col': 0, 'src_row': 0, 'src_width': 300, 'src_height': 300,
+           'tile_index': 0, 'dst_row': 0, 'dst_col': 0}
+    items = _run_producer(uav_path, [job], out_size=None)
+
+    assert len(items) == 1
+    _, tile, valid_mask = items[0]
+    assert tile.shape == (300, 300, 3)
+    assert valid_mask.shape == (300, 300)
+
+
+def test_tile_batch_producer_bypasses_skimage_resize(tmp_path, monkeypatch):
+    from utils import Prediction as Pred
+
+    uav_path = _write_synthetic_geotiff(tmp_path / "ortho.tif")
+    job = {'src_col': 0, 'src_row': 0, 'src_width': 300, 'src_height': 300,
+           'tile_index': 0, 'dst_row': 0, 'dst_col': 0}
+    items = _run_producer(uav_path, [job], out_size=(512, 512))
+    _, tile, valid_mask = items[0]
+
+    def failing_resize(*args, **kwargs):
+        raise AssertionError(
+            "skimage resize must not run: tiles already arrive on the "
+            "model grid via the GDAL read"
+        )
+
+    monkeypatch.setattr(Pred, "resize", failing_resize)
+
+    tile_batch, mask_resized = Pred._prepare_inference_batch(
+        [tile], [valid_mask], _FakeConfig())
+
+    assert tile_batch.shape == (1, 512, 512, 3)
+    assert tile_batch.dtype == np.float32
+    assert mask_resized.shape == (1, 512, 512, 1)
+
+
+def test_tile_batch_producer_clipped_edge_window_still_yields_model_grid(
+    tmp_path,
+):
+    """A window that runs past the raster boundary (boundless + fill_value=0
+    padding) must still resample to exactly out_size -- this is where a
+    ratio/clipping bug would silently shrink or distort the output tile."""
+    width = height = 700
+    uav_path = _write_synthetic_geotiff(tmp_path / "ortho.tif", width, height)
+
+    # Window starts inside the raster but extends 300px past both edges
+    # (raster is 700x700; the window covers native cols/rows 600..900).
+    job = {'src_col': 600, 'src_row': 600, 'src_width': 300,
+           'src_height': 300, 'tile_index': 0, 'dst_row': 0, 'dst_col': 0}
+    items = _run_producer(uav_path, [job], out_size=(512, 512))
+
+    assert len(items) == 1
+    _, tile, valid_mask = items[0]
+    # The clipped window still resamples to exactly the model grid -- not a
+    # smaller or distorted shape.
+    assert tile.shape == (512, 512, 3)
+    assert valid_mask.shape == (512, 512)
+    # Top-left corner is deep inside real data (native px 600, 600); the
+    # bottom-right corner is deep inside the boundless fill_value=0 padding
+    # (native px ~900, 900, well past the 700x700 raster).
+    assert valid_mask[0, 0]
+    assert not valid_mask[-1, -1]
+    assert np.array_equal(tile[-1, -1], [0, 0, 0])

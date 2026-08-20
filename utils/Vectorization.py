@@ -50,6 +50,26 @@ def _clone_stem(stem: Stem) -> Stem:
     )
 
 
+def _merge_diameter_lists(first: Stem, second: Stem) -> List[float]:
+    """Per-node diameters for a merged path built as
+    ``first.path.coords[:-1] + second.path.coords[1:]`` (the construction every
+    merge branch in calc_connectivity_votes uses).
+
+    Only meaningful when BOTH parents carry one diameter per path node -- the
+    tiled edge-merge case, where diameters were measured in-tile before
+    merging. In-tile connect_stems runs BEFORE quantification (the lists are
+    empty), so this returns ``[]`` there and behaviour is unchanged; the
+    diameters are measured fresh afterwards. Without it a merged stem kept the
+    base's SHORTER diameter list, and quantify_stem then indexed
+    ``segment_diameter_list[i + 1]`` off the end (issue #41)."""
+    d_first = list(getattr(first, 'segment_diameter_list', []) or [])
+    d_second = list(getattr(second, 'segment_diameter_list', []) or [])
+    if (len(d_first) == len(first.path.coords)
+            and len(d_second) == len(second.path.coords)):
+        return d_first[:-1] + d_second[1:]
+    return []
+
+
 def _stem_end_lines(stem: Stem):
     if len(stem.path.coords) < 4:
         line_start = LineString([stem.path.coords[0], stem.path.coords[-1]])
@@ -299,6 +319,14 @@ def calc_connectivity_votes(
             candidate = _clone_stem(stems0)
             candidate.path = new_path
             candidate.stop = stem.stop
+            # merged path = stems0[:-1] + stem[1:]; merge the parents' per-node
+            # diameters the same way and drop the now-stale measures, so a
+            # later quantify_stem on this merged stem cannot IndexError (#41).
+            candidate.segment_diameter_list = \
+                _merge_diameter_lists(stems0, stem)
+            candidate.segment_length_list = []
+            candidate.segment_volume_list = []
+            candidate.vector = []
             slave = stem
             vote = calc_vote(ang_l_sp_el_st, ang_l_sp_mp, ang_mp_el_st,
                              candidate, stem, stems0, tolerance_angle)
@@ -342,6 +370,13 @@ def calc_connectivity_votes(
             candidate = _clone_stem(stems0)
             candidate.path = new_path
             candidate.start = stem.start
+            # merged path = stem[:-1] + stems0[1:] in this branch; merge the
+            # diameter lists the same way and drop the stale measures (#41).
+            candidate.segment_diameter_list = \
+                _merge_diameter_lists(stem, stems0)
+            candidate.segment_length_list = []
+            candidate.segment_volume_list = []
+            candidate.vector = []
             slave = stem
             vote = calc_vote(ang_el_sp_l_st, ang_el_sp_mp, ang_mp_l_st,
                              candidate, stems0, stem, tolerance_angle)
@@ -437,21 +472,35 @@ def remove_duplicates(stems: List[Stem], stems0=None) -> List[Stem]:
         kept.append(stems0)
         return kept, count
 
+    # Spatial prefilter. The original compared every stem against every other
+    # remaining stem: on one 4096 px tile with 1567 stems that was ~1.2 MILLION
+    # GEOS `contains` calls, the single largest entry in the vector-stage
+    # profile. A stem can only be contained in a 0.3 m buffer whose bounding
+    # box encloses it, so querying an STRtree first leaves only genuine
+    # candidates -- O(n^2) becomes ~O(n log n) with an identical result.
+    #
+    # Stems are processed longest-first (sorted above) and `alive` marks those
+    # neither kept nor already absorbed, which reproduces the original
+    # pop-the-longest / drop-the-contained sequence exactly.
+    paths = [s.path for s in stems]
+    tree = STRtree(paths)
+    alive = [True] * len(stems)
     kept = []
-    while stems:
-        base = stems.pop(0)
+    for i, base in enumerate(stems):
+        if not alive[i]:
+            continue
+        alive[i] = False
+        kept.append(base)
         buffer_geom = base.path.buffer(0.3)
-        survivors = []
-        for s in stems:
+        for j in tree.query(buffer_geom):
+            if not alive[j]:
+                continue
             try:
-                if buffer_geom.contains(s.path):
+                if buffer_geom.contains(paths[j]):
+                    alive[j] = False
                     count += 1
-                    continue
             except Exception:
                 pass
-            survivors.append(s)
-        kept.append(base)
-        stems = survivors
     return kept, count
 
 

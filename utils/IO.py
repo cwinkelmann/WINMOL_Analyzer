@@ -241,7 +241,9 @@ def load_orthomosaic_with_resampling(path, config):
                 int(src.height * scale_factor_y),
                 int(src.width * scale_factor_x)
             ),
-            resampling=Resampling.bilinear
+            # cubic for the same reason as the streamed read in
+            # Prediction.py: bilinear thins the mask at scale.
+            resampling=Resampling.cubic
         )
         img = img[0:3, :, :].transpose(1, 2, 0)
         transform = src.transform * src.transform.scale(
@@ -932,15 +934,39 @@ def _ensure_crs(gdf, target_crs):
     return gdf
 
 
-def _raster_filter_geom(raster_path, edge_buffer_m):
+def _raster_filter_geom(raster_path, edge_buffer_m, ortho_bounds=None):
+    """Keep-region for a tile's stems during the merge.
+
+    Shrinking the tile footprint inward by edge_buffer_m dedups stems that
+    also appear in the overlapping neighbour tile. But a tile side that
+    coincides with the ortho's TRUE OUTER boundary has no neighbour, so
+    shrinking there silently drops real stems (worst at the corners, where
+    two sides meet). When ortho_bounds is known we buffer ONLY the
+    interior-seam sides and leave boundary sides at the true extent.
+    """
     if not raster_path:
         return None, None
     try:
         with rasterio.open(raster_path) as src:
-            geom = box(*src.bounds)
-            inner = geom.buffer(-abs(edge_buffer_m))
+            b = src.bounds
+            eb = abs(edge_buffer_m)
+            if ortho_bounds is not None:
+                tol = eb * 1e-3
+                ob = ortho_bounds
+
+                def _side(v, o, sign):
+                    # keep true extent on the ortho boundary; else shrink in
+                    return v if abs(v - o) <= tol else v + sign * eb
+                left = _side(b.left, ob.left, +1)
+                bottom = _side(b.bottom, ob.bottom, +1)
+                right = _side(b.right, ob.right, -1)
+                top = _side(b.top, ob.top, -1)
+                inner = box(left, bottom, right, top) if right > left \
+                    and top > bottom else box(*b)
+            else:
+                inner = box(*b).buffer(-eb)
             if getattr(inner, 'is_empty', False):
-                inner = geom
+                inner = box(*b)
             return inner, src.crs
     except Exception:
         return None, None
@@ -1063,10 +1089,12 @@ def _select_child(gdf, tile_id, kept_local):
     return out
 
 
-def _process_tile(prefix, gpkg_path, raster_path, edge_buffer_m, target_crs):
+def _process_tile(prefix, gpkg_path, raster_path, edge_buffer_m, target_crs,
+                  ortho_bounds=None):
     tile_id = _tile_id_from_prefix(prefix)
 
-    filter_geom, raster_crs = _raster_filter_geom(raster_path, edge_buffer_m)
+    filter_geom, raster_crs = _raster_filter_geom(
+        raster_path, edge_buffer_m, ortho_bounds=ortho_bounds)
 
     stems, nodes, vectors = _read_tile_gpkg(gpkg_path)
     print(
@@ -1450,11 +1478,25 @@ def _reconstruct_edge_stems_for_tiled_merge(
     connected_edge_stems = \
         Vec.connect_stems(list(original_edge_stems), recon_cfg)
 
-    # Quantify the direct connect_stems outputs
-    # so their profile metadata is refreshed
-    # consistently with geometry after edge merging.
-    quantified_edge_stems = \
-        [Quant.quantify_stem(stem) for stem in connected_edge_stems]
+    # Quantify the direct connect_stems outputs so their lengths/volumes are
+    # consistent with the merged geometry. connect_stems now merges the
+    # parents' per-node diameter lists (Vectorization._merge_diameter_lists),
+    # but guard anyway: a stem whose diameter list does not match its path
+    # would crash quantify_stem with an IndexError at the very last step
+    # (issue #41) -- keep its geometry and clear the measures instead of dying.
+    quantified_edge_stems = []
+    n_unmeasured = 0
+    for stem in connected_edge_stems:
+        if len(stem.segment_diameter_list) == len(stem.path.coords):
+            quantified_edge_stems.append(Quant.quantify_stem(stem))
+        else:
+            stem.segment_length_list = []
+            stem.segment_volume_list = []
+            n_unmeasured += 1
+            quantified_edge_stems.append(stem)
+    if n_unmeasured:
+        print(f"WARNING: {n_unmeasured} merged edge stems kept without "
+              f"re-quantified measures (diameter/path mismatch)", flush=True)
 
     final_stems = inner_stems + quantified_edge_stems
     print(
@@ -1475,6 +1517,16 @@ def merge_and_filter_tiled_results(
 ):
     work_dir = os.path.abspath(work_dir)
     output_gpkg = _default_output_gpkg(work_dir, output_gpkg)
+
+    # Full-ortho extent: lets _raster_filter_geom keep stems on the ortho's
+    # true outer boundary (only interior tile seams get the dedup shrink).
+    ortho_bounds = None
+    if stem_map_path:
+        try:
+            with rasterio.open(stem_map_path) as _s:
+                ortho_bounds = _s.bounds
+        except Exception:
+            ortho_bounds = None
 
     _remove_existing_output(output_gpkg)
 
@@ -1508,6 +1560,7 @@ def merge_and_filter_tiled_results(
             raster_path,
             edge_buffer_m,
             target_crs,
+            ortho_bounds=ortho_bounds,
         )
         if out is None:
             continue

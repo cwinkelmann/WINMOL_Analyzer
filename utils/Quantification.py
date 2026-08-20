@@ -5,12 +5,15 @@
 
 import math
 import multiprocessing as mp
+from multiprocessing.pool import ThreadPool
 from typing import List, Tuple
 
 import geopandas as gpd
 import numpy as np
 import rasterio.features
 import scipy.ndimage as ndi
+import shapely
+from shapely import STRtree
 from shapely.geometry import LineString, Point
 
 from classes.Stem import Stem
@@ -73,7 +76,16 @@ def quantify_stems(stems: List[Stem], pred, profile, config=None):
         for stem in stems_:
             stems__.append(quantify_stem(stem))
     else:
-        with mp.Pool(workers) as pool:
+        # ThreadPool, not mp.Pool. These stages map over individual Stem
+        # objects (shapely geometry + diameter lists), so a process pool has to
+        # pickle every stem out to a worker and the result back. Measured on
+        # one 4096 px tile with 1567 stems: process pool 45.2 s vs 4.6 s
+        # serial -- ~10x SLOWER, with the cost flat in worker count (2/4/7 all
+        # ~45 s), i.e. pure transport overhead against 4.6 s of real work.
+        # Threads share memory, so the transport disappears; measured 4.8 s
+        # with byte-identical output. Coarse-grained pools that hand whole
+        # tiles to workers (VectorTilePipeline) are left as processes.
+        with ThreadPool(workers) as pool:
             for stem in pool.imap_unordered(clean_diameter, stems):
                 stems_.append(stem)
             for stem in pool.imap_unordered(quantify_stem, stems_):
@@ -137,6 +149,8 @@ def get_diameters(stems: List[Stem], pred, profile, config=None):
         pred_shapes = list(pred_shapes_)
         pred_shapes = gpd.GeoDataFrame.from_features(pred_shapes)
         pred_shapes = pred_shapes[pred_shapes['raster_val'] == 1]
+        # One STRtree for the whole stage instead of one per calc_d call.
+        pred_shapes = ContourIndex(pred_shapes)
 
         if workers <= 1 or len(stems) <= 1:
             for stem in stems:
@@ -146,7 +160,9 @@ def get_diameters(stems: List[Stem], pred, profile, config=None):
                 except Exception as error:
                     error_callback(error)
         else:
-            with mp.Pool(workers) as pool:
+            # ThreadPool for the same reason as quantify_stems: a process pool
+            # would pickle every Stem AND the full contour list to each worker.
+            with ThreadPool(workers) as pool:
                 r = []
                 for stem in stems:
                     r.append(pool.apply_async(
@@ -300,11 +316,47 @@ def calc_v_d_edt(stem, edt_map, profile, config=None):
 calc_v_d = calc_v_d_contour
 
 
+class ContourIndex:
+    """Contour geometries plus ONE STRtree over them.
+
+    ``GeoDataFrame.sindex`` is documented as a cached spatial index, and calc_d
+    was written assuming that. Measured, it is not: one 4096 px tile produced
+    **10,595** STRtree constructions, essentially one per calc_d call. That is
+    why the original sindex prefilter measured only ~1.3x instead of the
+    predicted 40-65% — the index was rebuilt and thrown away every time, so the
+    prefilter kept paying for itself.
+
+    Building it once here is what the comment always claimed was happening.
+    """
+
+    __slots__ = ("geoms", "tree")
+
+    def __init__(self, contours):
+        self.geoms = np.asarray(contours.geometry.values)
+        self.tree = STRtree(self.geoms)
+
+
 def calc_d(node, line, contours):
     node = Point(node)
     d = 0
-    intersects = contours.geometry.intersection(line)
-    intersects = intersects[~intersects.is_empty]
+    # Only intersect the line against polygons whose bounding box overlaps it —
+    # a line cannot intersect a polygon whose bbox it misses, so the set of
+    # non-empty intersections (and thus d, a max) is identical to intersecting
+    # against all polygons. Bit-identical result, fewer GEOS intersections.
+    if isinstance(contours, ContourIndex):
+        idx = contours.tree.query(line)
+        if len(idx) == 0:
+            return d
+        candidates = contours.geoms[idx]
+    else:
+        # Backwards-compatible path for callers still passing a GeoDataFrame.
+        idx = contours.sindex.query(line)
+        if len(idx) == 0:
+            return d
+        candidates = np.asarray(contours.geometry.iloc[idx].values)
+
+    intersects = shapely.intersection(candidates, line)
+    intersects = intersects[~shapely.is_empty(intersects)]
 
     for i in intersects:
         if node.distance(i) < 0.01:
