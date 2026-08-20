@@ -1,0 +1,40 @@
+name: Tests & package
+
+on: [push, pull_request]
+
+jobs:
+  tests:
+    name: Tests — ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      PYTHONHASHSEED: "0"   # match the runtime seed so results are reproducible in CI
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest numpy scipy shapely scikit-image onnx onnxruntime geopandas pyogrio fiona rasterio
+      - name: Run test suite
+        run: pytest tests/ -q
+
+  package:
+    name: Build plugin ZIP
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build the plugin ZIP (smoke check)
+        run: bash scripts/build_plugin_zip.sh HEAD WINMOL_Analyzer-ci.zip "ci-${{ github.sha }}"
+      - name: Upload the built plugin ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: WINMOL_Analyzer-plugin-zip
+          path: WINMOL_Analyzer-ci.zip

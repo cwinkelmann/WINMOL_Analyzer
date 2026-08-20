@@ -72,14 +72,14 @@ def test_marker_roundtrip_and_hash_invalidation(tmp_path, monkeypatch):
 
 def test_core_txt_names_no_runtime():
     names = _requirement_names(
-        (REPO / "requirements" / "core.txt").read_text())
+        (REPO / "requirements" / "core.txt").read_text(encoding="utf-8"))
     assert names, "core.txt must list the geo/science stack"
     assert not [n for n in names
                 if "onnxruntime" in n or "tensorflow" in n]
 
 
 def test_cpu_txt_is_core_plus_one_runtime_and_psutil():
-    text = (REPO / "requirements" / "cpu.txt").read_text()
+    text = (REPO / "requirements" / "cpu.txt").read_text(encoding="utf-8")
     includes = [line.strip() for line in text.splitlines()
                 if line.strip().startswith("-r")]
     assert includes == ["-r core.txt"]
@@ -136,7 +136,7 @@ _IMPORT_TO_REQUIREMENT_NAME = {
 
 
 def _module_level_import_roots(path):
-    tree = ast.parse(path.read_text(), filename=str(path))
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     roots = set()
     for node in tree.body:
         if isinstance(node, ast.Import):
@@ -153,9 +153,9 @@ def test_module_level_imports_are_covered_by_requirements():
     on the first real run. Anything not needed at import time belongs
     inside the one function that uses it, not at module scope."""
     declared = set(_requirement_names(
-        (REPO / "requirements" / "core.txt").read_text())
+        (REPO / "requirements" / "core.txt").read_text(encoding="utf-8"))
         + _requirement_names(
-            (REPO / "requirements" / "cpu.txt").read_text()))
+            (REPO / "requirements" / "cpu.txt").read_text(encoding="utf-8")))
     stdlib = set(sys.stdlib_module_names)
     missing = []
     for rel in _CLOSURE_FILES:
