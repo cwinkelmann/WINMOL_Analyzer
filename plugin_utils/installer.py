@@ -1,12 +1,13 @@
 """Environment setup for the WINMOL QGIS plugin.
 
 Inference runs in a separate Python env (requirements/cpu.txt —
-onnxruntime + geo stack): either a user-configured interpreter
-(QgsSettings ``winmol/python_executable``) or a venv this module builds
-once, blessed by a ``.winmol_ready`` sentinel keyed to the requirements
-hash. Import-safe without QGIS/PyQt (lazy imports); every child process
-runs with ``child_env()`` because QGIS exports PYTHONHOME/PYTHONPATH/
-GDAL vars that break any foreign interpreter (see childenv.py).
+onnxruntime + geo stack — or, opted in via WINMOL_GPU=1, gpu.txt with
+onnxruntime-gpu): either a user-configured interpreter (QgsSettings
+``winmol/python_executable``) or a venv this module builds once,
+blessed by a ``.winmol_ready`` sentinel keyed to the requirements hash
+and variant. Import-safe without QGIS/PyQt (lazy imports); every child
+process runs with ``child_env()`` because QGIS exports PYTHONHOME/
+PYTHONPATH/GDAL vars that break any foreign interpreter (childenv.py).
 """
 import collections
 import hashlib
@@ -25,7 +26,21 @@ from .childenv import child_env, safe_child_cwd
 WINMOL_VENV_NAME = "winmol_venv"
 READY_MARKER = ".winmol_ready"
 QSETTINGS_PYTHON_KEY = "winmol/python_executable"
+#: Any value here silences the dialog's one-line GPU offer.
+QSETTINGS_GPU_PROMPT_KEY = "winmol/gpu_offer_dismissed"
 CPU_REQUIREMENTS = "cpu.txt"
+GPU_REQUIREMENTS = "gpu.txt"
+#: Environment variable that opts a rebuild into the GPU runtime.
+GPU_ENV_VAR = "WINMOL_GPU"
+
+#: The two inference runtimes, and the rule about them: both provide
+#: the ``onnxruntime`` module, so exactly ONE may be installed. Every
+#: code path that installs one uninstalls the other first — pip never
+#: will (the two are unrelated distribution names to it), and with
+#: both present the loser's dangling shared libraries produce import
+#: errors that read like a broken CUDA install.
+CPU_RUNTIME_DIST = "onnxruntime"
+GPU_RUNTIME_DIST = "onnxruntime-gpu"
 
 # WINMOL is validated on Python 3.11 only; MIN==MAX pins it exactly.
 MIN_PY = (3, 11)
@@ -42,9 +57,22 @@ def repo_requirements_dir() -> Path:
     return Path(_PLUGIN_DIR, "requirements")
 
 
-def plugin_requirements_path() -> Path:
-    """The requirements file the compute environment is built from."""
+def plugin_requirements_path(gpu=False) -> Path:
+    """The requirements file the compute environment is built from.
+    ``gpu=True`` selects the CUDA twin (onnxruntime-gpu), falling back
+    to cpu.txt when gpu.txt is missing from an incomplete checkout."""
+    if gpu:
+        path = repo_requirements_dir().joinpath(GPU_REQUIREMENTS)
+        if path.exists():
+            return path
     return repo_requirements_dir().joinpath(CPU_REQUIREMENTS)
+
+
+def gpu_requested() -> bool:
+    """True when WINMOL_GPU=1 (or true/yes/on) asks for the CUDA
+    runtime. The only opt-in switch until a Setup tab exists."""
+    value = os.environ.get(GPU_ENV_VAR, "").strip().lower()
+    return value in ("1", "true", "yes", "on")
 
 
 def managed_root(plugin_dir) -> str:
@@ -164,32 +192,55 @@ def _marker_path(venv_path) -> str:
     return os.path.join(venv_path, READY_MARKER)
 
 
-def marker_matches(venv_path) -> bool:
-    """Sentinel matches the CURRENT requirements hash. Pure file I/O —
-    no interpreter spawned, so it is safe on a GUI thread."""
+def _read_marker(venv_path) -> dict:
     try:
         with open(_marker_path(venv_path)) as f:
-            stored = json.load(f).get("req_hash")
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
     except Exception:
+        return {}
+
+
+def installed_variant(venv_path):
+    """'cpu' | 'gpu' as recorded by the sentinel, or None without one.
+    Markers from before the variant field are cpu.txt installs."""
+    marker = _read_marker(venv_path)
+    if not marker:
+        return None
+    return marker.get("variant", "cpu")
+
+
+def marker_matches(venv_path, gpu=None) -> bool:
+    """Sentinel matches the CURRENT requirements hash of the venv's own
+    variant; a bool ``gpu`` additionally requires that variant. Pure
+    file I/O — no interpreter spawned, so safe on a GUI thread."""
+    marker = _read_marker(venv_path)
+    if not marker:
         return False
-    return stored == _file_hash(plugin_requirements_path())
+    variant = marker.get("variant", "cpu")
+    if gpu is not None and variant != ("gpu" if gpu else "cpu"):
+        return False
+    req = plugin_requirements_path(gpu=(variant == "gpu"))
+    return marker.get("req_hash") == _file_hash(req)
 
 
-def is_ready(venv_path) -> bool:
+def is_ready(venv_path, gpu=None) -> bool:
     """The venv exists, runs a supported Python, and matches the
-    current requirements."""
+    current requirements (of the required variant when ``gpu`` is a
+    bool; of whichever variant it was built as when None)."""
     py = get_venv_python_path(venv_path)
     if not os.path.exists(py):
         return False
     if not (MIN_PY <= _python_version(py) <= MAX_PY):
         return False
-    return marker_matches(venv_path)
+    return marker_matches(venv_path, gpu=gpu)
 
 
-def _write_marker(venv_path) -> None:
-    req = plugin_requirements_path()
+def _write_marker(venv_path, gpu=False) -> None:
+    req = plugin_requirements_path(gpu=gpu)
     with open(_marker_path(venv_path), "w") as f:
         json.dump({"req_hash": _file_hash(req),
+                   "variant": "gpu" if gpu else "cpu",
                    "requirements": str(req)}, f)
 
 
@@ -348,13 +399,55 @@ def ensure_pip(venv_path, progress=None) -> None:
                   heartbeat=10.0)
 
 
-def install_requirements(venv_path, progress=None) -> None:
-    """pip-install requirements/cpu.txt into the venv, streaming pip's
-    output (``--no-input`` prevents a hidden prompt; ``--progress-bar
-    off`` stops \\r spam a QPlainTextEdit can't render)."""
+def distribution_installed(python_exe, dist, timeout=60) -> bool:
+    """True when ``dist`` is installed in ``python_exe``. Asks
+    importlib.metadata, not an import: importing ``onnxruntime`` cannot
+    tell the two distributions apart, which is the entire problem."""
+    try:
+        out = subprocess.run(
+            [python_exe, "-I", "-c",
+             "import importlib.metadata as m, sys;"
+             "sys.exit(0 if m.distribution(sys.argv[1]) else 1)", dist],
+            capture_output=True, timeout=timeout, env=child_env())
+        return out.returncode == 0
+    except Exception:
+        return False
+
+
+def uninstall_conflicting_runtime(python_exe, gpu, progress=None) -> bool:
+    """Remove the runtime that must not coexist with the one we
+    install (see CPU_RUNTIME_DIST above — both ship the ``onnxruntime``
+    module and pip will never resolve the conflict itself). Returns
+    True when something was removed; failures are logged, not raised —
+    the install that follows fails loudly on its own if this mattered."""
+    progress = _as_progress(progress)
+    doomed = CPU_RUNTIME_DIST if gpu else GPU_RUNTIME_DIST
+    if not distribution_installed(python_exe, doomed):
+        return False
+    progress(f"Removing {doomed}: it cannot be installed alongside "
+             f"{GPU_RUNTIME_DIST if gpu else CPU_RUNTIME_DIST} — both "
+             "provide the 'onnxruntime' module.")
+    try:
+        _run_streamed(
+            [python_exe, "-u", "-m", "pip", "uninstall", "-y", doomed],
+            progress=progress, label=f"pip uninstall {doomed}",
+            timeout=600)
+        return True
+    except Exception as exc:
+        progress(f"Could not remove {doomed}: {exc}")
+        return False
+
+
+def install_requirements(venv_path, progress=None, gpu=False) -> None:
+    """pip-install requirements/cpu.txt (or gpu.txt) into the venv,
+    streaming pip's output (``--no-input`` prevents a hidden prompt;
+    ``--progress-bar off`` stops \\r spam a QPlainTextEdit can't
+    render). Uninstalls the conflicting runtime FIRST — a swap, never
+    an addition."""
     py = get_venv_python_path(venv_path)
     progress = _as_progress(progress)
-    req = str(plugin_requirements_path())
+    uninstall_conflicting_runtime(py, gpu, progress=progress)
+    req = str(plugin_requirements_path(gpu=gpu))
     progress(f"Installing packages from {os.path.basename(req)} — the "
              "first run downloads a few hundred MB and can take "
              "several minutes …")
@@ -365,18 +458,21 @@ def install_requirements(venv_path, progress=None) -> None:
         label=f"pip install -r {os.path.basename(req)}", timeout=3600)
 
 
-def setup_environment(venv_path, base_python=None, progress=None) -> dict:
+def setup_environment(venv_path, base_python=None, progress=None,
+                      gpu=False) -> dict:
     """Create the venv + install deps (idempotent via the sentinel).
-    Returns ``{'python': <exe>}``; raises only on a real venv/pip
-    failure, which callers convert to a retry."""
+    ``gpu=True`` builds/rebuilds the onnxruntime-gpu variant. Returns
+    ``{'python': <exe>}``; raises only on a real venv/pip failure,
+    which callers convert to a retry."""
     report = _as_progress(progress)
-    if not is_ready(venv_path):
-        report("Setting up the WINMOL environment …")
+    if not is_ready(venv_path, gpu=gpu):
+        report("Setting up the WINMOL environment "
+               f"({'GPU' if gpu else 'CPU'} runtime) …")
         if not os.path.exists(get_venv_python_path(venv_path)):
             create_venv(venv_path, base_python, progress=report)
         ensure_pip(venv_path, progress=report)
-        install_requirements(venv_path, progress=report)
-        _write_marker(venv_path)
+        install_requirements(venv_path, progress=report, gpu=gpu)
+        _write_marker(venv_path, gpu=gpu)
     report(f"Environment ready in {report.elapsed():.0f}s: "
            f"{get_venv_python_path(venv_path)}")
     return {"python": get_venv_python_path(venv_path)}
@@ -420,22 +516,29 @@ def resolve_environment(plugin_dir, prompt=False, build=False) -> dict:
                          "geopandas)."))
         return result
 
-    if is_ready(venv_path):
+    # WINMOL_GPU=1 requires the gpu variant; otherwise any variant the
+    # venv was built as is ready (a GPU venv must not rebuild as CPU
+    # just because the env var is unset today).
+    want_gpu = gpu_requested()
+    if is_ready(venv_path, gpu=True if want_gpu else None):
         result.update(status="ready",
                       python=get_venv_python_path(venv_path),
                       message="WINMOL environment ready.")
         return result
 
     if not build:
-        result.update(
-            status="needs_setup",
-            message="WINMOL environment not set up yet. Open the "
-                    "plugin dialog to create it (Python 3.11 + "
-                    "onnxruntime).")
+        message = ("WINMOL environment not set up yet. Open the "
+                   "plugin dialog to create it (Python 3.11 + "
+                   "onnxruntime).")
+        if want_gpu:
+            message = ("WINMOL_GPU=1: the environment will be "
+                       "(re)built with the GPU runtime "
+                       "(onnxruntime-gpu) on the next Run.")
+        result.update(status="needs_setup", message=message)
         return result
 
     try:
-        info = setup_environment(venv_path)
+        info = setup_environment(venv_path, gpu=want_gpu)
         result.update(status="installed", python=info["python"],
                       message="WINMOL environment installed.")
     except Exception as exc:

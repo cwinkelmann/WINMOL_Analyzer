@@ -38,6 +38,11 @@ from qgis.core import QgsProject, QgsVectorLayer, QgsRasterLayer
 from qgis.PyQt import QtWidgets, uic
 
 from .classes.Config import Config
+from .plugin_utils import gpu_probe
+from .plugin_utils.installer import (
+    QSETTINGS_GPU_PROMPT_KEY,
+    installed_variant,
+)
 from .plugin_utils.model_registry import load_registry
 from .tasks_threads import EnvSetupWorker, ModelEnsureWorker, Worker
 
@@ -650,7 +655,30 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             )
             return
         else:
+            self._maybe_offer_gpu()
             self._resolve_model_and_start(self.python_exe)
+
+    def _maybe_offer_gpu(self):
+        """One log line when an NVIDIA GPU is present but the venv
+        runs the CPU runtime. No Setup tab exists yet, so the offer
+        names the opt-in switch (WINMOL_GPU=1); setting any value on
+        QSETTINGS_GPU_PROMPT_KEY silences it."""
+        try:
+            from qgis.core import QgsSettings
+            if QgsSettings().value(QSETTINGS_GPU_PROMPT_KEY, ""):
+                return
+        except Exception:
+            pass
+        if installed_variant(self.venv_path) != "cpu":
+            return
+        if not gpu_probe.wants_gpu_runtime(gpu_probe.probe(timeout=2.0)):
+            return
+        self.update_output_log(
+            "NVIDIA GPU detected — the environment uses the CPU "
+            "runtime. To enable GPU support, restart QGIS with the "
+            "environment variable WINMOL_GPU=1 set and press Run: the "
+            "environment rebuilds once with onnxruntime-gpu."
+        )
 
     def _run_env_setup(self):
         """Build the compute venv off the GUI thread, then run the

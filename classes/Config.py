@@ -25,8 +25,25 @@ class Config(object):
     prediction_batch_autotune_patience = 4
     prediction_batch_autotune_repeats = 5
     prediction_batch_autotune_min_improve = 0.005
+    # Absolute floor a candidate must beat (in addition to the relative
+    # min_improve above) to count as progress -- kills jitter-chasing where
+    # e.g. 0.337 vs 0.340 s/tile is noise, not a real win.
+    prediction_batch_autotune_min_improve_s = 0.2
     prediction_batch_autotune_stop_on_oom = True
     prediction_batch_autotune_quiet = True
+    # Share of FREE memory (host RAM, or free VRAM when CUDA is the active
+    # provider) the sweep is allowed to spend; the rest is headroom for
+    # everything else already resident (OS, raster reader, model runtime).
+    prediction_batch_autotune_memory_fraction = 0.6
+    # Fudge factor over the raw tensor bytes (H*W*(C+classes)*4) to account
+    # for activations/workspace the runtime allocates per tile.
+    prediction_batch_autotune_activation_factor = 32
+    # Manual escape hatch: set to an int >= 1 to pin the prediction
+    # micro-batch verbatim and skip the autotune sweep entirely (no probing,
+    # no timing). None/0 = off (the sweep runs as usual). Env-overridable
+    # via WINMOL_CONFIG_OVERRIDES_JSON, e.g.
+    # WINMOL_CONFIG_OVERRIDES_JSON='{"prediction_batch_override": 4}'.
+    prediction_batch_override = None
     progress_interval_s_cpu = 45.0
     progress_interval_s_gpu = 60.0
     progress_interval_s_multi_gpu = 20.0
