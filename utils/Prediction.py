@@ -666,6 +666,22 @@ def _autotune_batch_size(
     if len(sample_tiles) < 2:
         return initial
 
+    # CoreML recompiles the model for every distinct batch shape, so the
+    # sweep pays a recompile per candidate (~20s total on an M2). Measured
+    # on this model: batch 2 is only ~3% faster per image than batch 1,
+    # and batch>=4 is 2-3x SLOWER. That best-case ~3% is smaller than the
+    # recompile cost of the sweep that would find it, so batch 1 is the
+    # right default -- skip the sweep entirely (a user pin still wins).
+    accel = str(getattr(model, 'accelerator', '') or '').lower()
+    if accel == 'coreml':
+        print(
+            f"{label} autotune: CoreML gains <=3% from batching and is "
+            f"much slower at batch>=4, not worth the recompile sweep — "
+            f"using batch {initial}.",
+            flush=True,
+        )
+        return initial
+
     patience = max(
         1,
         int(getattr(config, 'prediction_batch_autotune_patience', 2)),

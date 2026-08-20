@@ -27,6 +27,7 @@ import functools
 import os
 import glob
 import platform
+import time
 from pathlib import Path
 
 try:
@@ -36,7 +37,7 @@ except Exception:
 
 # qgis.PyQt shims to the active Qt binding (PyQt5 on QGIS 3).
 from qgis.PyQt.QtWidgets import QFileDialog
-from qgis.PyQt.QtCore import Qt, QThread, QUrl
+from qgis.PyQt.QtCore import Qt, QThread, QTimer, QUrl
 from qgis.PyQt.QtGui import QDesktopServices
 
 from qgis.core import QgsProject, QgsVectorLayer, QgsRasterLayer
@@ -47,6 +48,7 @@ from .plugin_utils import (
     config_overrides,
     gpu_probe,
     installer,
+    model_registry,
     model_status,
     setup_state,
 )
@@ -63,6 +65,57 @@ from .tasks_threads import (
 
 current_path = os.path.dirname(__file__)
 
+# Keep-alive for background threads that outlive the dialog. A parentless
+# QThread whose only Python reference is a dialog attribute gets GC-deleted
+# when the dialog is torn down (QGIS quit, plugin unload/reload) — and
+# destroying a QThread while its OS thread still runs triggers Qt's
+# qFatal() -> abort(), taking down all of QGIS. If a thread can't be stopped
+# promptly at teardown we stash it here (module scope survives dialog GC) so
+# it is never collected while running; it self-evicts on finished().
+_ALIVE_BG = set()
+
+#: Item 0 is load-bearing: a combo built from this list opens on it, so
+#: it has to be the answer the registry itself gives for this machine
+#: ("default" -> int8 on a CPU-only box, fp16 on an NVIDIA GPU, fp32 on
+#: Apple Silicon/CoreML). "auto"'s lossless-only gate would refuse the
+#: shipped int8 default and land on the 119 MB fp32 reference instead.
+VARIANT_ITEMS = (
+    ("Recommended for this machine", "default"),
+    ("Auto — lossless only", "auto"),
+    ("Reference (fp32)", "fp32"),
+    ("CPU-optimised (int8)", "int8"),
+    ("GPU-optimised (fp16)", "fp16"),
+)
+
+#: What the precision selector claims, in full. int8 honesty is
+#: load-bearing here: only the PyTorch w05 int8 build is certified
+#: lossless against its fp32 reference; the int8 builds of the
+#: Keras-derived families are domain-calibrated post-training
+#: quantisations, measured close but not certified equivalent.
+VARIANT_TOOLTIP = (
+    "Precision variant of the selected model family.\n\n"
+    "'Recommended for this machine' picks the int8 build on a CPU-only "
+    "machine (much smaller to download, much faster on CPU) and the "
+    "fp16 build on an NVIDIA GPU.\n\n"
+    "The int8 builds of the Keras-derived families (General / Beech / "
+    "Spruce / Spruce+deadwood) are domain-calibrated post-training "
+    "quantisations — measured close, but NOT certified lossless. Only "
+    "the PyTorch w05 int8 build is certified lossless against its fp32 "
+    "reference.\n\n"
+    "'Auto — lossless only' substitutes a device variant only where it "
+    "is certified lossless, and otherwise stays on fp32. Choose "
+    "'Reference (fp32)' if you need results identical to the published "
+    "reference model."
+)
+
+#: Idle text for setup_status_label. It is NEVER empty: an empty status
+#: line during a multi-minute pip install is what read as "frozen".
+IDLE_STATUS = "Idle."
+
+#: What the status line says while a detection owns the dialog, so it
+#: never lies about a live child process.
+RUN_STATUS = "Detection running — setup paused."
+
 # This loads your .ui file so that PyQt can populate your plugin with the
 # elements from Qt Designer
 FORM_CLASS, _ = uic.loadUiType(
@@ -76,18 +129,21 @@ def _refuse_if_busy(method):
     status line instead of entering the slot — one job at a time is a
     guarantee, not a hope.
 
-    The wrapper absorbs Qt signal arguments (``clicked`` emits a bool,
-    ``itemDoubleClicked`` an item+column) and calls the slot with none:
-    an undecorated bound method gets that truncation from PyQt for
-    free, but a ``*args`` wrapper forwards them and TypeErrors a bare
-    ``(self)`` slot. Decorated slots therefore must not declare signal
-    parameters — connect through a lambda if one ever needs them."""
+    The wrapper drops Qt's POSITIONAL signal arguments (``clicked``
+    emits a bool, ``itemDoubleClicked`` an item+column) — an undecorated
+    bound method gets that truncation from PyQt for free, but a
+    ``*args``-forwarding wrapper TypeErrors a bare ``(self)`` slot. It
+    still forwards KEYWORD arguments, so an internal caller can invoke a
+    decorated slot with kwargs (e.g. ``_setup_install_gpu(confirmed=True)``
+    from the pre-run offer). Decorated slots therefore must not declare
+    REQUIRED positional signal parameters; optional keyword params with
+    defaults are fine."""
     @functools.wraps(method)
-    def guarded(self, *_args, **_kwargs):
+    def guarded(self, *_args, **kwargs):
         if self._busy_kind():
             self._refuse_busy()
             return None
-        return method(self)
+        return method(self, **kwargs)
     return guarded
 
 
@@ -112,7 +168,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         ("models_download_button", "clicked", "_setup_download_selected"),
         ("models_download_default_button", "clicked",
          "_setup_download_default"),
-        ("models_verify_button", "clicked", "_setup_verify_all"),
+        ("models_verify_button", "clicked", "_setup_verify_selected"),
         ("models_delete_button", "clicked", "_setup_delete_model"),
         ("models_open_folder_button", "clicked",
          "_setup_open_models_folder"),
@@ -164,8 +220,6 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         # immediately before a run; never a hardcoded default.
         self.process_type = None
 
-        self.uav_layer_path = None
-        self.uav_layer_name = None
         self.crs = None
         self.worker = None
         self.thread = None
@@ -254,6 +308,31 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         # both shell out (bounded), so they run at most once per dialog.
         self._gpu_probe = None
         self._device = None
+        # Force-CPU retry (issue #24): once the user accepts "run on the CPU"
+        # after a GPU/cuDNN device failure, _force_cpu makes _start_analysis
+        # pin WINMOL_ONNX_FORCE_CPU for the rest of the session. _run_tail
+        # keeps the last child-output lines so a failure can be classified.
+        self._force_cpu = False
+        self._retry_cpu_pending = False
+        self._run_tail = []
+
+        # --- status narration (never-empty status + 1 Hz ticker) -------
+        # _last_status backs the elapsed-seconds ticker: while any job
+        # runs the label shows "<status> … (Ns)", so pip's and the
+        # child's silent stretches visibly move.
+        self._last_status = IDLE_STATUS
+        self._busy_t0 = None
+        # Where the Setup bar lands when the busy state ends: 100 after
+        # a completed download, 0 otherwise (failed/cancelled/no total).
+        self._setup_final_pct = 0
+        # Blocked->ready announcement latch (_apply_blocking_reason
+        # announces the transition once, never the initial state).
+        self._last_blocking_reason = None
+        # Parented to the dialog so Qt tears it down with it; a live
+        # QTimer is safe to just stop() (_shutdown_threads does).
+        self._status_timer = QTimer(self)
+        self._status_timer.setInterval(1000)
+        self._status_timer.timeout.connect(self._tick_status)
 
         # Model registry (config.json, schema-2): resolved entry for the
         # current combo selection, and the on-demand-download worker.
@@ -264,12 +343,10 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.ensure_thread = None
         self.ensure_worker = None
         self.populate_model_combo_box()
-
-        # The variant selector row is a placeholder in the .ui; nothing
-        # populates it yet, so it must not show as an empty row.
-        _variant = getattr(self, "model_variant_widget", None)
-        if _variant is not None:
-            _variant.hide()
+        # Builds variant_comboBox/model_info_label into the .ui's
+        # model_variant_widget row (and hides that row again for v1/
+        # unreadable registries, which have nothing to vary).
+        self._add_custom_controls()
 
         # The Setup/accelerator banners start hidden; the first
         # _refresh_setup_tab below decides whether either has anything
@@ -296,13 +373,12 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.uav_warning_label.hide()
 
         # Open where the user can act: Detection when a run could start
-        # now, Setup when the environment still needs work. From here on
-        # refreshes are live.
+        # now, Setup when the environment still needs work. Deferred a
+        # tick (rr6's _enter_first_run) so the first-open guidance can
+        # never block construction. From here on refreshes are live.
         self._setup_live = True
-        if setup_state.env_ready(self._env_info()):
-            self._go_to_detection()
-        else:
-            self._go_to_setup()
+        self._set_setup_status(IDLE_STATUS)
+        QTimer.singleShot(0, self._enter_first_run)
         self._refresh_setup_tab()
 
         # Last, once construction has placed every widget: the .ui's
@@ -360,6 +436,9 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.set_default_config_parameters()
         self.get_config_parameters_from_gui()
         self.uav_toolButton.clicked.connect(self.file_dialog_uav)
+        # Run's gate follows the input live: picking, typing or clearing
+        # the raster path re-evaluates the reason and the tooltip.
+        self.uav_lineEdit.textChanged.connect(self._update_run_gate)
         self.model_toolButton.clicked.connect(self.model_file_dialog)
         self.output_toolButton_stem.clicked.connect(self.file_dialog_stem)
         self.output_lineEdit_stem.textChanged.connect(self._update_derived_output_fields)
@@ -448,6 +527,27 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
     def _go_to_setup(self):
         self._show_tab(getattr(self, "tab_setup", None))
 
+    def _enter_first_run(self):
+        """Open on the tab that matches this machine: Detection when a
+        run could start now, Setup — with the first step narrated on
+        the status line and the primary button focused — when the
+        environment still needs work. Runs one tick after __init__
+        (QTimer.singleShot), so it can never block construction."""
+        if setup_state.env_ready(self._env_info()):
+            self._go_to_detection()
+            return
+        self._go_to_setup()
+        self._set_setup_status(
+            "Nothing is set up yet. Start with Step 1 — this takes a "
+            "few minutes and downloads a few hundred MB. QGIS stays "
+            "usable throughout.")
+        button = getattr(self, "env_create_button", None)
+        if button is not None:
+            try:
+                button.setFocus()
+            except Exception:                      # pragma: no cover - GUI
+                pass
+
     def _log(self, msg: str) -> None:
         """Write a message to the plugin log widget (and stdout as fallback)."""
         try:
@@ -458,21 +558,23 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
     def populate_model_combo_box(self) -> None:
         """Fill the model dropdown from the model registry (config.json).
 
-        Recommended entries come first, then the rest, each item's data
-        holding its registry entry id; the device-matched default entry
-        is preselected. A trailing "Custom..." entry (data
-        ``CUSTOM_MODEL_ID``) lets users browse to their own *.onnx file.
+        Schema-2 registries show ONE row per model FAMILY (the family
+        label, its default entry's id in userData) — the precision is
+        chosen by the Variant selector, not listed here — followed by
+        any family-less visible entries (e.g. the PyTorch retrain trio).
+        When the registry cannot be loaded, the classic Beech/Spruce/
+        General trio (data = the bare name, mapped to
+        ``models_dir/<name>.onnx`` by ``set_selected_model``) keeps
+        already-downloaded models runnable. A trailing "Custom..."
+        entry (data ``CUSTOM_MODEL_ID``) lets users browse to their own
+        *.onnx file.
         """
         config_path = os.path.join(os.path.dirname(__file__), "config.json")
-        ordered_ids = []
+        items = []          # (display text, entry id in userData)
+        default_id = None
         try:
             self.registry = load_registry(config_path)
-            seen = set()
-            for eid in list(self.registry.recommended) + sorted(
-                    self.registry.entries):
-                if eid in self.registry.entries and eid not in seen:
-                    seen.add(eid)
-                    ordered_ids.append(eid)
+            items, default_id = self._registry_combo_items()
         except Exception as e:
             self.registry = None
             self._log(f"Could not load model registry ({config_path}): {e}")
@@ -484,21 +586,16 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
 
         self.model_comboBox.clear()
 
-        for eid in ordered_ids:
-            self.model_comboBox.addItem(self.registry.entries[eid].label, eid)
+        if items:
+            for text, mid in items:
+                self.model_comboBox.addItem(text, mid)
+        else:
+            # Backward-compatible fallback: a corrupt config.json must
+            # not leave the combo with nothing but "Custom...".
+            for name in ["Beech", "Spruce", "General"]:
+                self.model_comboBox.addItem(name, name)
         self.model_comboBox.addItem("Custom...", self.CUSTOM_MODEL_ID)
 
-        default_id = None
-        if self.registry is not None and ordered_ids:
-            try:
-                # The dialog's cached 2 s-bounded probe (_model_device),
-                # NOT default_entry's own detect_device fallback — that
-                # one runs a 20 s nvidia-smi on the GUI thread at
-                # dialog open.
-                default_id = self.registry.default_entry(
-                    self._model_device()).id
-            except Exception:
-                default_id = ordered_ids[0]
         if default_id is not None:
             idx = self.model_comboBox.findData(default_id)
             if idx >= 0:
@@ -509,7 +606,74 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         except Exception:
             pass
 
+        # NOTE: the variant selector is NOT preset here. This method
+        # runs before _add_custom_controls() creates variant_comboBox,
+        # so a preset here would be dead code on every launch. It lives
+        # in _preset_default_variant(), called where the combo exists.
         self.handle_model_combo_box_change()
+
+    def _registry_combo_items(self):
+        """(items, default_id) for the model combo from self.registry.
+
+        Schema v2: one (family label, default entry id) per family. The
+        families behind the registry's ranked ``recommended`` list come
+        first (so the shipped default is row 0), then the rest in
+        registry order, then any family-less visible entries. v1: the
+        sorted flat keys, exactly as before the registry existed.
+
+        ``default_id`` is a combo id, i.e. a FAMILY default entry: the
+        registry's declared default may be an optimised variant
+        (spruce_deadwood_int8), which the combo represents by its
+        family row; the concrete precision comes from the variant
+        selector, preset in :meth:`_preset_default_variant`.
+        """
+        reg = self.registry
+        items = []
+        if reg.schema >= 2:
+            ranked, seen = [], set()
+            for mid in reg.recommended:
+                entry = reg.entries.get(mid)
+                fam = reg.families.get(entry.family) if entry else None
+                if fam is not None and fam.id not in seen:
+                    ranked.append(fam)
+                    seen.add(fam.id)
+            for fam in reg.families.values():
+                if fam.id not in seen:
+                    ranked.append(fam)
+                    seen.add(fam.id)
+
+            listed = set()
+            for fam in ranked:
+                entry = reg.entries[fam.default]
+                if not entry.hidden:
+                    items.append((fam.label, entry.id))
+                    listed.add(entry.id)
+            # hand-edited registries may hold family-less entries; keep
+            # them selectable rather than silently dropping them.
+            for entry in reg.visible():
+                if (entry.id not in listed
+                        and entry.family not in reg.families):
+                    items.append((entry.label, entry.id))
+            defaults = (self._default_combo_id(), "general_fp32")
+        else:
+            names = sorted((e.id for e in reg.visible()), key=str.lower)
+            items = [(name, name) for name in names]
+            defaults = ("Spruce_Deadwood", "General")
+        for _default in defaults:
+            if _default and _default in reg.entries:
+                return items, _default
+        return items, None
+
+    def _default_combo_id(self):
+        """The combo id (family default entry) for the registry's
+        declared default, or None."""
+        reg = self.registry
+        mid = reg.gui_default
+        entry = reg.entries.get(mid) if mid else None
+        if entry is None:
+            return None
+        fam = reg.families.get(entry.family)
+        return fam.default if fam is not None else entry.id
 
     def handle_model_combo_box_change(self):
         is_custom = self.model_comboBox.currentData() == self.CUSTOM_MODEL_ID
@@ -530,6 +694,213 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             widget.setEnabled(is_custom)
 
         self.apply_style_to_line_edit(self.model_lineEdit, is_custom)
+
+        self._refresh_variant_controls()
+        self._refresh_model_info()
+        # The 'recommended here' row follows the selected family, so
+        # the Setup tab has to follow the combo (cheap: stat-only
+        # rescan; no-op until _setup_live).
+        self._refresh_setup_tab()
+
+    # --- model registry helpers -----------------------------------------
+
+    def _current_family(self):
+        """The registry Family behind the current combo row, or None
+        (Custom, legacy flat config, or a family-less entry)."""
+        reg = self.registry
+        if reg is None or reg.schema < 2:
+            return None
+        mid = self.model_comboBox.currentData()
+        if not mid or mid == self.CUSTOM_MODEL_ID:
+            return None
+        entry = reg.entries.get(mid)
+        if entry is None:
+            return None
+        return reg.families.get(entry.family)
+
+    def _default_variant_value(self):
+        """The variant to preselect so the GUI opens on exactly the
+        entry the registry calls the effective default for this machine
+        (int8 on CPU, fp16 on a CUDA GPU, fp32 on Apple Silicon).
+
+        That is ``"default"`` for any schema-v2 registry — the registry
+        answers the device question itself, so the GUI cannot drift
+        from ``Registry.default_entry()``. Legacy v1 registries have no
+        families and no variants at all (the selector is hidden), so
+        they fall back to ``"auto"``.
+        """
+        reg = self.registry
+        if reg is None or reg.schema < 2:
+            return "auto"
+        return "default"
+
+    def _preset_default_variant(self):
+        """Select the precision the registry considers the effective
+        default on THIS machine, so what the user sees is what runs.
+        An ordinary selection: changing the combo overrides it. MUST be
+        called after the combo exists (from _add_custom_controls)."""
+        combo = getattr(self, "variant_comboBox", None)
+        if combo is None:
+            return
+        try:
+            idx = combo.findData(self._default_variant_value())
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+        except Exception:                          # pragma: no cover - GUI
+            pass
+
+    def _variant_value(self):
+        """Selected variant ('default'/'auto'/'fp32'/'int8'/'fp16').
+
+        With no combo (it is only built for schema-v2 registries) the
+        answer is the registry's own device default, not 'auto' — the
+        Setup tab must not recommend a different file from the one a
+        run would load.
+        """
+        combo = getattr(self, "variant_comboBox", None)
+        if combo is None:
+            return self._default_variant_value()
+        return combo.currentData() or self._default_variant_value()
+
+    def _selected_registry_entry(self):
+        """Resolve the combo selection (+ variant, + detected device)
+        to a concrete registry entry, or None for Custom / no registry.
+        """
+        reg = self.registry
+        if reg is None:
+            return None
+        mid = self.model_comboBox.currentData()
+        if not mid or mid == self.CUSTOM_MODEL_ID:
+            return None
+        entry = reg.entries.get(mid)
+        if entry is None:
+            return None
+        fam = reg.families.get(entry.family)
+        if fam is None or reg.schema < 2:
+            return entry
+        try:
+            # resolve via the FAMILY so the variant selector applies;
+            # an entry id would (deliberately) never be
+            # variant-rewritten. _model_device: the dialog's cached
+            # 2 s-bounded probe, never detect_device's 20 s nvidia-smi
+            # on the GUI thread.
+            return reg.resolve(fam.id, device=self._model_device(),
+                               variant=self._variant_value())
+        except (KeyError, ValueError):
+            return entry
+
+    def _on_variant_changed(self, _index=None):
+        self._refresh_model_info()
+        # The "recommended here" row — and with it the Setup tree's
+        # download-default target — changes with this combo. Without
+        # the repaint the Setup tree keeps recommending the previous
+        # precision.
+        self._refresh_setup_tab()
+
+    def _refresh_variant_controls(self):
+        """Enable the variant selector for registry families, gray out
+        variants the current family does not provide, and put each
+        variant's DOWNLOAD SIZE in its label.
+
+        The size belongs at the point of choice: 30 MB against 119 MB
+        is the whole reason a CPU-only machine wants the int8 build,
+        and it was previously invisible until the download started.
+        """
+        combo = getattr(self, "variant_comboBox", None)
+        if combo is None:
+            return
+        try:
+            fam = self._current_family()
+            combo.setEnabled(fam is not None)
+            if fam is None:
+                for i, (text, _val) in enumerate(VARIANT_ITEMS):
+                    combo.setItemText(i, text)
+                return
+            avail = {
+                "default": True, "auto": True, "fp32": True,
+                "int8": self._variant_entry(fam, "int8") is not None,
+                "fp16": self._variant_entry(fam, "fp16") is not None,
+            }
+            model = combo.model()
+            for i in range(combo.count()):
+                value = combo.itemData(i)
+                item = model.item(i)
+                if item is not None:
+                    item.setEnabled(avail.get(value, True))
+                combo.setItemText(i, self._variant_item_text(fam, i, value))
+            if not avail.get(combo.currentData(), True):
+                combo.setCurrentIndex(0)   # back to the device default
+        except Exception:                          # pragma: no cover - GUI
+            pass
+
+    def _variant_item_text(self, fam, index, value):
+        """'CPU-optimised (int8) — 30 MB' for one combo item."""
+        base = VARIANT_ITEMS[index][0] if index < len(VARIANT_ITEMS) \
+            else str(value)
+        entry = self._variant_entry(fam, value)
+        if entry is None:
+            return base
+        suffix = ""
+        if entry.size_mb:
+            suffix = f" — {entry.size_mb:.0f} MB"
+        if value in ("default", "auto"):
+            # These two are indirections; name the file they land on so
+            # "Recommended" is never a black box.
+            return f"{base}: {entry.precision}{suffix}"
+        return f"{base}{suffix}"
+
+    def _variant_entry(self, fam, value):
+        """The entry ``fam`` resolves to for one variant value, or
+        None (also when the family lacks that precision)."""
+        if self.registry is None or fam is None:
+            return None
+        try:
+            return self.registry.resolve(
+                fam.id, device=self._model_device(), variant=value)
+        except (KeyError, ValueError):
+            return None
+
+    def _local_model_path(self, entry):
+        """Where ``entry`` lives on disk, for READING: the managed
+        models_dir, or — rr6-era installs — <plugin_dir>/models. Falls
+        back to the managed path (which stays the WRITE target for new
+        downloads) when neither exists, so callers can test
+        os.path.exists on the answer."""
+        managed = model_registry.local_path(entry, self.models_dir)
+        if os.path.exists(managed) and os.path.getsize(managed) > 0:
+            return managed
+        legacy = model_registry.local_path(
+            entry, os.path.join(self._plugin_dir(), "models"))
+        if os.path.exists(legacy) and os.path.getsize(legacy) > 0:
+            return legacy
+        return managed
+
+    def _refresh_model_info(self):
+        """The gray info line in the model row: what the current
+        selection actually resolves to (file, installed / download-size
+        state). Shows only label-and-file — our registry carries no
+        description/F1 metadata, and nothing is fabricated."""
+        lbl = getattr(self, "model_info_label", None)
+        if lbl is None:
+            return
+        try:
+            if self.model_comboBox.currentData() == self.CUSTOM_MODEL_ID:
+                lbl.setText("Custom: pick a local .onnx model file below.")
+                return
+            entry = self._selected_registry_entry()
+            if entry is None:
+                lbl.setText("")
+                return
+            path = self._local_model_path(entry)
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                state = "installed"
+            elif entry.size_mb:
+                state = f"will download {entry.size_mb:.1f} MB on Run"
+            else:
+                state = "will download on Run"
+            lbl.setText(f"{entry.label}  |  {entry.file} — {state}")
+        except Exception:                          # pragma: no cover - GUI
+            pass
 
     def model_file_dialog(self):
         options = QFileDialog.Options()
@@ -633,6 +1004,99 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
                 self.run_button.setEnabled(False)
         else:
             print("Invalid raster layer. Check the path and format.")
+
+    def _add_custom_controls(self):
+        """Add controls not present in the .ui: the model variant
+        selector + info line, and a QGIS layer selector for the input
+        raster. Defensive — if a widget can't be placed (e.g. an older
+        or newer QGIS gui API), everything else still works."""
+        # Model variant selector + info line (registry schema v2 only),
+        # into the .ui's placeholder row (model_variant_widget /
+        # horizontalLayout_variant, which declares only the "Variant:"
+        # label). Item 0 is the registry's declared default FOR THIS
+        # MACHINE (int8 on a CPU-only box, fp16 on an NVIDIA GPU, fp32
+        # on Apple Silicon/CoreML); 'Auto — lossless only' is the
+        # conservative one step below it, and the fp32 reference is
+        # always one click away. See VARIANT_TOOLTIP for what int8 does
+        # and does not promise.
+        #
+        # It stays on the DETECTION tab, deliberately: which precision
+        # a run loads is results-affecting, and a precision chosen once
+        # during setup would silently change outputs months later.
+        try:
+            self.variant_comboBox = QtWidgets.QComboBox(self)
+            for text, val in VARIANT_ITEMS:
+                self.variant_comboBox.addItem(text, val)
+            self.variant_comboBox.setToolTip(VARIANT_TOOLTIP)
+            self.variant_comboBox.currentIndexChanged.connect(
+                self._on_variant_changed)
+            self.model_info_label = QtWidgets.QLabel(self)
+            self.model_info_label.setWordWrap(True)
+            self.model_info_label.setStyleSheet("color: gray;")
+            row = getattr(self, "horizontalLayout_variant", None)
+            if row is not None:
+                row.addWidget(self.variant_comboBox, 1)
+                row.addWidget(self.model_info_label, 2)
+            else:                                      # pragma: no cover
+                top = getattr(self, "verticalLayout", None) or self.layout()
+                if top is not None:
+                    top.addWidget(self.variant_comboBox)
+                    top.addWidget(self.model_info_label)
+            reg = self.registry
+            holder = getattr(self, "model_variant_widget", None)
+            if (reg is None or reg.schema < 2) and holder is not None:
+                holder.hide()              # nothing to vary in v1 configs
+            # The combo exists now, so the preset can finally take.
+            self._preset_default_variant()
+            self._refresh_variant_controls()
+            self._refresh_model_info()
+        except Exception as exc:                       # pragma: no cover - GUI
+            print("WINMOL: could not add model variant controls:", exc)
+
+        # Input raster layer selector (pick a layer already loaded in QGIS).
+        try:
+            from qgis.gui import QgsMapLayerComboBox
+            from qgis.core import QgsMapLayerProxyModel
+            self.uav_layer_combo = QgsMapLayerComboBox(self)
+            self.uav_layer_combo.setFilters(QgsMapLayerProxyModel.RasterLayer)
+            self.uav_layer_combo.setAllowEmptyLayer(True)
+            self.uav_layer_combo.setToolTip(
+                "Or pick a raster layer already loaded in QGIS")
+            # Connect AFTER construction so the combo's initial auto-selection
+            # doesn't fire into our slot; then force 'empty' so we never
+            # clobber a typed path when the dialog opens.
+            self.uav_layer_combo.layerChanged.connect(
+                self._on_uav_layer_changed)
+            row = QtWidgets.QWidget(self)
+            hr = QtWidgets.QHBoxLayout(row)
+            hr.setContentsMargins(0, 0, 0, 0)
+            hr.addWidget(QtWidgets.QLabel("Loaded layer:", row))
+            hr.addWidget(self.uav_layer_combo, 1)
+            grid = getattr(self, "gridLayout", None)
+            if grid is not None and hasattr(grid, "addWidget"):
+                grid.addWidget(row, 3, 0, 1, 3)
+            elif getattr(self, "verticalLayout_4", None) is not None:
+                self.verticalLayout_4.insertWidget(1, row)
+            try:
+                self.uav_layer_combo.setLayer(None)
+            except Exception:
+                pass
+        except Exception as exc:                       # pragma: no cover - GUI
+            print("WINMOL: could not add layer selector:", exc)
+
+    def _on_uav_layer_changed(self, layer):
+        """A raster layer was chosen: use its source as the input path."""
+        try:
+            if layer is None or not layer.isValid():
+                return
+            # Strip GDAL subdataset/URI decorations (e.g. 'path|layername').
+            src = layer.source().split("|")[0]
+            if src:
+                self.uav_lineEdit.setText(src)
+                self.uav_path = src
+                self.check_input_file()
+        except Exception:                              # pragma: no cover - GUI
+            pass
 
     def file_dialog_uav(self):
         options = QFileDialog.Options()
@@ -865,19 +1329,28 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self._update_derived_output_fields()
 
     def set_selected_model(self):
-        """Record the current combo selection. A registry entry is kept
-        unresolved (``model_path`` stays empty; resolved on Run by
-        ``_resolve_model_and_start``/``ModelEnsureWorker``); "Custom..."
-        uses the browsed path as-is, bypassing the registry entirely."""
+        """Record the current combo selection. A registry family row is
+        resolved through the variant selector + detected device to a
+        concrete entry, kept unresolved on disk (``model_path`` stays
+        empty; fetched on Run by ``_resolve_model_and_start``/
+        ``ModelEnsureWorker``); "Custom..." uses the browsed path
+        as-is, bypassing the registry entirely. A bare name (the
+        fallback combo when config.json failed to load) maps to
+        ``models_dir/<name>.onnx`` so already-downloaded models stay
+        runnable against a corrupt registry."""
         entry_id = self.model_comboBox.currentData()
         if entry_id is None or entry_id == self.CUSTOM_MODEL_ID:
             self._selected_model_entry = None
             self.model_path = self.model_lineEdit.text().strip()
-        else:
-            self._selected_model_entry = (
-                self.registry.entries.get(entry_id) if self.registry else None
-            )
+            return
+        entry = self._selected_registry_entry()
+        if entry is not None:
+            self._selected_model_entry = entry
             self.model_path = ""
+        else:
+            self._selected_model_entry = None
+            self.model_path = os.path.join(
+                self.models_dir, f"{entry_id}.onnx")
 
     def set_selected_process_type(self):
         # One run covers every selected product: "Nodes" writes the
@@ -965,6 +1438,10 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         # to completion idle is fine, but the run they were about to
         # start must not resurrect afterwards. _on_env_setup_done and
         # _on_model_ensured check this flag and bail out instead.
+        if self._busy_kind() is not None:
+            # Immediate feedback on the click; the worker's own
+            # "Analysis cancelled." arrives seconds later.
+            self.update_output_log("Cancelling…")
         self._cancel_requested = True
         if self.worker:
             self.worker.cancel()
@@ -978,6 +1455,74 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
     def close_application(self):
         print("Closing application")
         self.close()
+
+    def closeEvent(self, event):
+        # Never let a running background QThread be destroyed while its OS
+        # thread is alive — that qFatals QGIS. Stop/park threads first.
+        self._shutdown_threads()
+        super().closeEvent(event)
+
+    def _shutdown_threads(self):
+        """Stop background threads (inference + Setup-tab jobs) so the
+        dialog and its parentless QThreads can be torn down safely. Call
+        this from the plugin's unload() too, before QGIS drops the dialog
+        reference."""
+        # The status ticker first: a live QTimer is safe to just stop(),
+        # and a stopped one never fires into a half-torn-down dialog.
+        try:
+            self._status_timer.stop()
+        except (RuntimeError, AttributeError):
+            pass
+        # Inference: cancelling terminates the child process, so the thread's
+        # read loop returns quickly and the thread can be waited out.
+        if self._run_active and self.worker is not None:
+            try:
+                self.worker.cancel()
+            except (RuntimeError, AttributeError):
+                pass
+        self._reap_thread(self.thread, self.worker)
+        # Setup-tab jobs (env build, model download, deletion pricing and
+        # removal, maintenance): request cancel where the worker offers
+        # one. Network reads are timeout-bounded, but e.g. a pip install
+        # mid-flight can't be interrupted, so a thread may get parked.
+        for tname, wname in (
+            ("setup_thread", "setup_worker"),
+            ("ensure_thread", "ensure_worker"),
+            ("remove_thread", "remove_worker"),
+            ("maint_thread", "maint_worker"),
+            ("price_thread", "price_worker"),
+        ):
+            worker = getattr(self, wname, None)
+            cancel = getattr(worker, "cancel", None)
+            if cancel is not None:
+                try:
+                    cancel()
+                except (RuntimeError, AttributeError):
+                    pass
+            self._reap_thread(getattr(self, tname, None), worker)
+
+    def _reap_thread(self, thread, worker):
+        """Quit + wait a bounded time for a QThread. If it is still running
+        (e.g. pip mid-install), park it in _ALIVE_BG so it is never GC'd while
+        running (which would qFatal); it self-evicts when it finishes."""
+        if thread is None:
+            return
+        try:
+            if not thread.isRunning():
+                return
+            thread.quit()
+            if thread.wait(8000):
+                return
+            _ALIVE_BG.add(thread)
+            if worker is not None:
+                _ALIVE_BG.add(worker)
+
+            def _evict(t=thread, w=worker):
+                _ALIVE_BG.discard(t)
+                _ALIVE_BG.discard(w)
+            thread.finished.connect(_evict)
+        except RuntimeError:
+            pass
 
     def run_process(self):
         # A stale cancel from a previous env-setup/model-download phase
@@ -1029,7 +1574,8 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         if not self.uav_path:
             QtWidgets.QMessageBox.warning(
                 self, "WINMOL Analyzer",
-                "No input GeoTiff selected. Pick a file or type a path.")
+                "No input GeoTiff selected. Pick a file, type a path, or "
+                "choose a loaded raster layer.")
             return
         if not os.path.exists(self.uav_path):
             QtWidgets.QMessageBox.warning(
@@ -1079,35 +1625,96 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self._set_busy_ui(True)
             self._run_env_setup()
         elif self.env.get("status") == "error" or self.python_exe is None:
-            self.update_output_log(
-                self.env.get("message") or "WINMOL environment is not available."
-            )
+            message = (self.env.get("message")
+                       or "WINMOL environment is not available.")
+            self.update_output_log(message)
+            # Route to where the fix lives, with the reason already on
+            # the status line — a log line alone left the user on a tab
+            # with nothing actionable on it.
+            self._go_to_setup()
+            self._set_setup_status(
+                self.env.get("message") or setup_state.TXT_BLOCK_NO_ENV)
+            self._refresh_setup_tab()
             return
         else:
-            self._maybe_offer_gpu()
+            # The environment is usable — but is it using the right
+            # processor? Asked HERE, once, because this is the last
+            # moment before the user spends hours on something that
+            # takes minutes.
+            if not self._gpu_offer_pre_flight():
+                return
             self._resolve_model_and_start(self.python_exe)
 
-    def _maybe_offer_gpu(self):
-        """One log line when an NVIDIA GPU is present but the venv runs
-        the CPU runtime; it points at the Setup tab's install button.
-        Setting any value on QSETTINGS_GPU_PROMPT_KEY silences it."""
+    # --- the proactive pre-run offer ------------------------------------
+
+    def _gpu_prompt_dismissed(self):
+        """The token stored the last time the user said "run on the
+        CPU". A missing or unreadable key simply means "never
+        answered", so the worst a broken settings store can do is ask
+        once more."""
         try:
             from qgis.core import QgsSettings
-            if QgsSettings().value(
-                    installer.QSETTINGS_GPU_PROMPT_KEY, ""):
-                return
-        except Exception:
-            pass
-        if installer.installed_variant(self.venv_path) != "cpu":
+            return QgsSettings().value(
+                installer.QSETTINGS_GPU_PROMPT_KEY, "") or ""
+        except Exception:                          # pragma: no cover - GUI
+            return ""
+
+    def _remember_gpu_prompt(self, token):
+        """Persist "do not ask again on this machine/config" — the
+        writer for the key _gpu_prompt_dismissed reads."""
+        if not token:
             return
-        if not gpu_probe.wants_gpu_runtime(self._gpu_probe_cached()):
-            return
+        try:
+            from qgis.core import QgsSettings
+            QgsSettings().setValue(
+                installer.QSETTINGS_GPU_PROMPT_KEY, token)
+        except Exception as exc:                   # pragma: no cover - GUI
+            self.update_output_log(
+                f"Could not remember the GPU runtime choice: {exc}")
+
+    def _gpu_offer_pre_flight(self):
+        """Interrupt Run once when an NVIDIA GPU sits idle beside the
+        CPU runtime. True to go ahead with the run.
+
+        The Setup tab's install button is otherwise the only entry
+        point, and a user whose environment already works has no reason
+        to open that tab — the question arrives at the one moment it is
+        actionable, after the inputs validate and before a run that
+        would take hours starts. Decided from what the dialog already
+        holds (the sentinel's variant + the cached GPU probe handed to
+        a pure setup_state function); nothing is measured here."""
+        probe = self._gpu_probe_cached()
+        token = setup_state.accelerator_token(probe.label)
+        decision = setup_state.pre_run_decision(
+            installer.installed_variant(self.venv_path),
+            probe.present, self._gpu_prompt_dismissed(), token)
+        if decision != setup_state.PRERUN_OFFER:
+            return True
+        gpu = probe.label or "An NVIDIA GPU"
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Warning)
+        box.setWindowTitle(setup_state.TXT_PRERUN_TITLE)
+        box.setText(setup_state.TXT_PRERUN_GPU_IDLE.format(gpu=gpu))
+        install = box.addButton(setup_state.TXT_PRERUN_INSTALL,
+                                QtWidgets.QMessageBox.AcceptRole)
+        # RejectRole, so Esc and the window's close button both mean
+        # "run on the CPU" — the choice that costs the user nothing.
+        run_anyway = box.addButton(setup_state.TXT_PRERUN_RUN_ANYWAY,
+                                   QtWidgets.QMessageBox.RejectRole)
+        box.setDefaultButton(run_anyway)
+        box.exec_()
+        if box.clickedButton() is install:
+            # Nothing is persisted: an aborted run is not an answer.
+            # The run does not start — the environment it would use is
+            # about to be rebuilt (press Run again afterwards).
+            self._go_to_setup()
+            self._setup_install_gpu(confirmed=True)
+            return False
+        self._remember_gpu_prompt(token)
         self.update_output_log(
-            "NVIDIA GPU detected — the environment uses the CPU "
-            "runtime. Open the Setup tab and press 'Install GPU "
-            "runtime…' to switch (a one-time onnxruntime-gpu "
-            "download)."
-        )
+            f"Running on the CPU with {gpu} idle, as chosen. The "
+            "Setup tab can install the GPU runtime later.")
+        return True
 
     def _run_env_setup(self):
         """Build the compute venv off the GUI thread, then run the
@@ -1127,16 +1734,18 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         thread.finished.connect(thread.deleteLater)
         return thread
 
-    def _start_env_setup_worker(self, gpu, then_run):
+    def _start_env_setup_worker(self, gpu, then_run, target_exe=None):
         """The single EnvSetupWorker launch site (first-run build,
-        create, repair, GPU install). ``gpu`` None honors WINMOL_GPU;
-        a bool is an explicit variant choice. ``then_run`` continues
-        into the model/run chain on success. Every caller holds
-        _setup_running before this is reached, so a live setup_thread
-        is never reassigned."""
+        create, repair, GPU install, pip-into-BYO). ``gpu`` None honors
+        WINMOL_GPU; a bool is an explicit variant choice.
+        ``target_exe`` installs into a bring-your-own interpreter
+        instead of the managed venv. ``then_run`` continues into the
+        model/run chain on success. Every caller holds _setup_running
+        before this is reached, so a live setup_thread is never
+        reassigned."""
         self._setup_then_run = bool(then_run)
         self.setup_worker = EnvSetupWorker(
-            os.path.dirname(__file__), gpu=gpu)
+            os.path.dirname(__file__), gpu=gpu, target_exe=target_exe)
         self.setup_thread = self._new_worker_thread(self.setup_worker)
         self.setup_worker.log.connect(self._on_setup_log)
         self.setup_worker.done.connect(self._on_env_setup_done)
@@ -1180,17 +1789,43 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         # be a lie.
         self._reresolve_env()
         self._refresh_setup_tab()
+        # A modal, not only a log line: the build the user explicitly
+        # started died, and the fallback lives behind a button they
+        # may never have noticed.
+        QtWidgets.QMessageBox.warning(
+            self, "WINMOL environment",
+            f"Could not set up the environment:\n{message}\n\n"
+            "Use 'Choose interpreter…' on the Setup tab to point at "
+            "an existing Python 3.11 environment instead.")
 
     def _resolve_model_and_start(self, python_exe):
         """Ensure the selected model is present locally, then start the
         analysis. A registry entry is resolved/downloaded off the GUI
-        thread (ModelEnsureWorker -> model_registry.ensure_model); a
-        Custom path (model_path already set) is used as-is."""
+        thread (ModelEnsureWorker -> model_registry.ensure_model) — but
+        only with the user's consent (name, size, source URL) when the
+        file is not on disk yet. A Custom path (model_path already set)
+        is used as-is; an rr6-era file under <plugin_dir>/models is run
+        in place instead of being re-downloaded."""
         if self._selected_model_entry is None:
             self._start_analysis(python_exe)
             return
         if self._model_ensuring:
             self.update_output_log("Model download is already running...")
+            return
+
+        entry = self._selected_model_entry
+        local = self._local_model_path(entry)
+        if os.path.exists(local) and os.path.getsize(local) > 0:
+            if local != model_registry.local_path(entry, self.models_dir):
+                # rr6-era install: the file lives next to the plugin.
+                # Use it directly; new downloads still land in the
+                # managed models_dir.
+                self.model_path = local
+                self._start_analysis(python_exe)
+                return
+        elif not self._confirm_model_download(entry):
+            self._set_busy_ui(False)
+            self.update_output_log("Run cancelled: model download declined.")
             return
 
         self._model_ensuring = True
@@ -1203,7 +1838,10 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self._selected_model_entry, self.models_dir
         )
         self.ensure_thread = self._new_worker_thread(self.ensure_worker)
-        self.ensure_worker.log.connect(self.update_output_log)
+        # _on_setup_log echoes each line to the status too, and the
+        # percent signal turns the Setup bar determinate.
+        self.ensure_worker.log.connect(self._on_setup_log)
+        self.ensure_worker.progress.connect(self._on_setup_progress)
         self.ensure_worker.done.connect(self._on_model_ensured)
         self.ensure_worker.failed.connect(self._on_model_ensure_failed)
         self.ensure_worker.done.connect(self.ensure_thread.quit)
@@ -1212,9 +1850,22 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.ensure_worker.failed.connect(self.ensure_worker.deleteLater)
         self.ensure_thread.start()
 
+    def _confirm_model_download(self, entry):
+        """rr6's consent prompt: label, size and source URL BEFORE any
+        model download starts. True = go ahead."""
+        size = f" ({entry.size_mb:.1f} MB)" if entry.size_mb else ""
+        reply = QtWidgets.QMessageBox.question(
+            self, "Download model",
+            f"The model '{entry.label}' is not installed yet.\n\n"
+            f"Download it now{size}?\n\nSource: {entry.url}",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.Yes)
+        return reply == QtWidgets.QMessageBox.Yes
+
     def _on_model_ensured(self, model_path):
         self._model_ensuring = False
         self.model_path = model_path
+        self._refresh_model_info()  # 'will download' -> 'installed'
         self._refresh_setup_tab()   # the file is on disk now
         if self._cancel_requested:
             self._cancel_requested = False
@@ -1226,7 +1877,13 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
     def _on_model_ensure_failed(self, message):
         self._model_ensuring = False
         self._set_busy_ui(False)
-        self.update_output_log(f"Model download failed: {message}")
+        url = getattr(self._selected_model_entry, "url", "")
+        self.handle_process_error(
+            f"Model download failed: {message}\n\n"
+            f"You can download it manually from:\n{url}\n"
+            "and either place it in the plugin's models folder "
+            f"({self.models_dir}) or select it via the Custom model "
+            "picker.")
         self._refresh_setup_tab()
 
     def _start_analysis(self, python_exe):
@@ -1239,6 +1896,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             return
         path_dirname = os.path.dirname(__file__)
         script_path = os.path.join(path_dirname, "winmol_run.py")
+        self._run_tail = []
 
         command = [
             python_exe,
@@ -1268,6 +1926,13 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             # environment is the only other channel that carries a config
             # value to the child.
             env_extra.update(self._batch_override_env())
+            if self._force_cpu:
+                # Issue #24: the user chose CPU after a GPU/cuDNN device
+                # failure. Pin the CPU provider for the child so the model
+                # runs on the CPU regardless of the auto provider precedence.
+                env_extra["WINMOL_ONNX_FORCE_CPU"] = "1"
+                self.update_output_log(
+                    "Running on the CPU (GPU disabled for this session).")
             self.worker = Worker(command, env_extra=env_extra)
             self.worker.moveToThread(self.thread)
             self.thread.started.connect(self.worker.run_process)
@@ -1278,7 +1943,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             # layers load ONLY on success; failures surface in the log
             # and a dialog instead of loading empty/absent layers.
             self.worker.succeeded.connect(self._on_run_succeeded)
-            self.worker.error.connect(self.handle_process_error)
+            self.worker.error.connect(self._on_run_error)
             self.worker.finished.connect(self.thread.quit)
             self.worker.finished.connect(self.worker.deleteLater)
             self.thread.finished.connect(self.thread.deleteLater)
@@ -1288,6 +1953,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self._run_active = True
             self._show_run_progress(True)
             self._set_busy_ui(True)
+            self._set_setup_status(RUN_STATUS)
             self.thread.start()
         # catch out of memory error
         except MemoryError:
@@ -1311,11 +1977,30 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         the progress bar when it carries one of the pipeline's done/total
         counters (plugin_utils.run_progress)."""
         self.update_output_log(text)
+        # Keep a bounded tail of child output so a failure can be classified
+        # (GPU device error -> offer a CPU retry, issue #24).
+        self._run_tail.append(text)
+        if len(self._run_tail) > 100:
+            del self._run_tail[:-100]
         if self._run_progress is None:
             return
         percent = self._run_progress.feed(text)
         if percent is not None:
             self.update_progress(percent)
+
+    def _on_run_error(self, message):
+        """Worker error slot. A GPU/accelerator device failure gets a
+        targeted 'retry on the CPU' offer (issue #24) — but only after the
+        run's QThread has fully torn down, so the relaunch cannot reassign
+        self.thread over a live thread (qFatal). Everything else surfaces
+        immediately, as before."""
+        haystack = str(message) + "\n" + "\n".join(self._run_tail)
+        if (not self._force_cpu
+                and setup_state.looks_like_gpu_failure(haystack)):
+            self._retry_cpu_pending = True
+            self.update_output_log(message)
+            return
+        self.handle_process_error(message)
 
     def handle_process_error(self, message):
         """Show a failure instead of silently loading empty/absent layers."""
@@ -1340,6 +2025,9 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self._run_progress = None
         self._show_run_progress(False)
         self._set_busy_ui(False)
+        # The run no longer owns the dialog; RUN_STATUS would now be a
+        # lie (this also covers cancel — the thread finishes either way).
+        self._set_setup_status(IDLE_STATUS)
         self._refresh_setup_tab()
         produced = any(os.path.exists(p) for p in self._last_outputs)
         self._set_export_enabled(produced)
@@ -1347,6 +2035,35 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self.update_output_log(
                 "Outputs were written to a temp folder. Use 'Export…' to "
                 "save them to a permanent location.")
+        # Deferred from _on_run_error: the failed run's thread is gone now,
+        # so relaunching on the CPU is safe (issue #24).
+        if self._retry_cpu_pending:
+            self._retry_cpu_pending = False
+            self._offer_cpu_retry()
+
+    def _offer_cpu_retry(self):
+        """After a GPU/device failure, offer to re-run on the CPU (issue
+        #24). The GPU driver/cuDNN could not run the model on this machine;
+        the CPU can. Accepting pins CPU for the rest of the session and
+        re-launches with the inputs already validated for the failed run."""
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Warning)
+        box.setWindowTitle("GPU inference failed")
+        box.setText(
+            "The run failed on the GPU with a CUDA/cuDNN device error — the "
+            "GPU driver or cuDNN on this machine could not run the model.\n\n"
+            "Re-run on the CPU instead? It is slower but does not use the "
+            "GPU.")
+        retry = box.addButton("Run on the CPU",
+                              QtWidgets.QMessageBox.AcceptRole)
+        box.addButton("Cancel", QtWidgets.QMessageBox.RejectRole)
+        box.setDefaultButton(retry)
+        box.exec_()
+        if box.clickedButton() is not retry:
+            return
+        self._force_cpu = True
+        self.update_output_log("Retrying on the CPU…")
+        self._start_analysis(self.python_exe)
 
     def _show_run_progress(self, on):
         """Show the detection progress bar ONLY while a detection runs.
@@ -1373,11 +2090,23 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         land between the decision and the repaint. The Setup buttons
         (and the model tree — its double-click is a download path
         around the buttons) ride _refresh_setup_buttons, which reads
-        the same _busy_kind the guards do."""
-        try:
-            self.run_button.setEnabled(not busy)
-        except Exception:                          # pragma: no cover - GUI
-            pass
+        the same _busy_kind the guards do; run_button rides
+        _update_run_gate, which reads it too.
+
+        Also owns the 1 Hz status ticker: one continuous busy period
+        per Run click (env build -> model download -> run share one
+        t0), so the elapsed counter never restarts mid-flow."""
+        self._update_run_gate()
+        if busy:
+            if self._busy_t0 is None:
+                self._busy_t0 = time.monotonic()
+            self._status_timer.start()
+        else:
+            self._status_timer.stop()
+            self._busy_t0 = None
+            # Strip the ticker's elapsed suffix; whatever terminal
+            # status the slot set (before or after this call) stays.
+            self._set_label("setup_status_label", self._last_status)
         self._refresh_setup_buttons()
         self._show_setup_progress(
             busy and self._busy_kind() in ("env", "delete", "models"))
@@ -1436,7 +2165,20 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             pass
 
     def _set_setup_status(self, text):
-        self._set_label("setup_status_label", text)
+        # Never empty: an empty status line during a multi-minute job
+        # is what read as "frozen". _last_status backs the ticker.
+        self._last_status = str(text) if text else IDLE_STATUS
+        self._set_label("setup_status_label", self._last_status)
+
+    def _tick_status(self):
+        """1 Hz while any job runs: append the elapsed seconds so the
+        UI visibly moves through pip's and the child's silent
+        stretches."""
+        if self._busy_t0 is None:
+            return
+        elapsed = time.monotonic() - self._busy_t0
+        self._set_label("setup_status_label",
+                        f"{self._last_status} … ({elapsed:.0f}s)")
 
     def _append_setup_detail(self, text):
         widget = getattr(self, "setup_detail_log", None)
@@ -1448,27 +2190,54 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             pass
 
     def _on_setup_log(self, text):
-        """Worker log lines go to both logs: the Setup tab's detail box
+        """Worker log lines go to both logs — the Setup tab's detail box
         (where the job was started) and the main log (where a first-run
-        build directs the user). Both widgets cap their scrollback."""
+        build directs the user) — and the latest line becomes the
+        status, trimmed, so the narration follows the work. Both log
+        widgets cap their scrollback."""
         self._append_setup_detail(text)
         self.update_output_log(text)
+        self._set_setup_status(str(text)[:120])
 
     def _show_setup_progress(self, on):
         """The Setup tab's own bar: indeterminate while a setup job
-        runs (real progress is in the detail log), reset when idle.
-        The detection bar below the tabs is _show_run_progress's."""
+        runs — until a worker reports a real percent and
+        _on_setup_progress flips it determinate — then holds the
+        terminal value when idle: 100 after a completed download, 0
+        otherwise (failed/cancelled/no total). The detection bar below
+        the tabs is _show_run_progress's."""
         bar = getattr(self, "setup_progress_bar", None)
         if bar is None:
             return
         try:
             if on:
+                self._setup_final_pct = 0
                 bar.setRange(0, 0)
             else:
                 bar.setRange(0, 100)
-                bar.setValue(0)
+                bar.setValue(self._setup_final_pct)
         except Exception:                          # pragma: no cover - GUI
             pass
+
+    def _on_setup_progress(self, percent):
+        """A worker reported a real download percent: flip the Setup
+        bar from indeterminate to determinate and track the terminal
+        value. Only ever the Setup tab's own bar — the run's
+        progress_bar stays wired to the inference Worker alone."""
+        bar = getattr(self, "setup_progress_bar", None)
+        if bar is None:
+            return
+        try:
+            if bar.maximum() == 0:
+                bar.setRange(0, 100)
+            bar.setValue(int(percent))
+        except Exception:                          # pragma: no cover - GUI
+            return
+        if int(percent) >= 100:
+            # A download that reaches 100% stays there when
+            # _show_setup_progress(False) applies the terminal value;
+            # otherwise a completed download snaps back to 0.
+            self._setup_final_pct = 100
 
     # --- environment snapshot ------------------------------------------
 
@@ -1552,13 +2321,15 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self._maybe_start_size_pricing()
 
     def _apply_blocking_reason(self, info):
-        """The Detection-tab banner, the idle-GPU nudge and the Step-3
-        line all derive from one string so they cannot disagree.
-        Deliberately NOT wired to run_button.setEnabled: the Detection
-        tab's own validation (CRS check, _run_active) owns that, and
-        two owners fighting over one button is an rr-era bug class."""
+        """The Run gate, the Detection-tab banner, the idle-GPU nudge
+        and the Step-3 line all derive from one reason string so they
+        cannot disagree. run_button has exactly ONE owner —
+        _update_run_gate sets both its enabled state and its tooltip
+        from the same reason (the rr-era bug class was two owners
+        fighting over that button)."""
         busy = self._busy_kind() in ("env", "delete", "models")
         reason = setup_state.blocking_reason(info, busy=busy)
+        self._update_run_gate()
         banner = getattr(self, "setup_banner_widget", None)
         if banner is not None:
             try:
@@ -1568,26 +2339,88 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self._set_label("setup_banner_label", reason or "")
         self._apply_accel_nudge(info, reason)
         self._set_label("setup_ready_label", reason or self._ready_text())
+        # The blocked -> ready transition announces itself, once: focus
+        # lands on "Go to detection" and the status says what to do
+        # next — only when the user is looking at the Setup tab, so a
+        # first-run build that continues straight into a run never
+        # writes "press Run" over a live run's status.
+        previous = self._last_blocking_reason
+        self._last_blocking_reason = reason
+        if (previous is not None and reason is None
+                and self._is_setup_current()):
+            self._set_setup_status(
+                "Setup complete — switch to the Detection tab and "
+                "press Run.")
+            button = getattr(self, "setup_go_detect_button", None)
+            if button is not None:
+                try:
+                    button.setFocus()
+                except Exception:                  # pragma: no cover - GUI
+                    pass
+
+    def _run_blocking_reason(self):
+        """Why Run cannot start right now, or None. One string feeds
+        the button's enabled state AND its tooltip, computed from the
+        same predicates the guards use (_busy_kind, the cached env,
+        the input field), so they can never disagree."""
+        kind = self._busy_kind()
+        if kind == "run":
+            return ("A run is already in progress — wait for it to "
+                    "finish, or press Cancel.")
+        if kind is not None:
+            return setup_state.TXT_BLOCK_BUSY
+        # needs_setup does NOT block Run: clicking Run builds the env
+        # then runs (the zero-prerequisite "install QGIS + plugin, ready
+        # to go" flow). Only a genuinely broken BYO interpreter is a
+        # dead end the click cannot recover from.
+        info = self._env_info()
+        if info.status == "error" and info.python is None:
+            return info.message or setup_state.TXT_ENV_ERROR
+        try:
+            has_input = bool(self.uav_lineEdit.text().strip())
+        except Exception:                          # pragma: no cover - GUI
+            has_input = True
+        if not has_input:
+            return ("Select an input raster (GeoTiff) first — pick a "
+                    "file, type a path, or choose a loaded layer.")
+        return None
+
+    def _update_run_gate(self):
+        """The ONLY setEnabled/setToolTip owner for run_button. A
+        disabled Run explains itself in the tooltip; when the reason
+        clears (setup completed, input picked) the button re-enables
+        through the same single path."""
+        if not getattr(self, "_setup_live", False):
+            return
+        reason = self._run_blocking_reason()
+        button = getattr(self, "run_button", None)
+        if button is None:
+            return
+        try:
+            button.setEnabled(reason is None)
+            button.setToolTip(reason or "Run the detection")
+        except Exception:                          # pragma: no cover - GUI
+            pass
 
     def _apply_accel_nudge(self, info, reason):
         """The idle-GPU hint on the Detection tab: shown only when
-        nothing more urgent is on screen, the managed venv is CPU-only,
-        and a usable NVIDIA GPU is present. Everyone else sees
-        nothing."""
+        nothing more urgent is on screen, the managed venv records a
+        CPU-only install, and an NVIDIA GPU answered the probe — the
+        same setup_state.should_nudge the pre-run offer decides by, so
+        the banner and the question can never disagree. Everyone else
+        sees nothing."""
+        probe = self._gpu_probe_cached()
         show = (reason is None and info.managed
-                and (info.variant or "cpu") != "gpu"
-                and self._gpu_probe_cached().present)
+                and setup_state.should_nudge(info.variant, probe.present))
         widget = getattr(self, "accel_banner_widget", None)
         if widget is not None:
             try:
                 widget.setVisible(bool(show))
             except Exception:                      # pragma: no cover - GUI
                 pass
-        text = ""
-        if show:
-            text = (f"{self._gpu_probe_cached().label} is idle — the "
-                    "detection runs on the CPU runtime.")
-        self._set_label("accel_banner_label", text)
+        self._set_label(
+            "accel_banner_label",
+            setup_state.accel_nudge_text(probe.label) if show else "")
 
     def _ready_text(self):
         row = next((r for r in self._model_rows if r.is_default), None)
@@ -1673,11 +2506,17 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         # _apply_blocking_reason.
         states.pop("run_button", None)
         idle = not busy
+        # GPU runtime install: managed venv recorded as CPU-only, OR a
+        # bring-your-own interpreter (no sentinel to read — rr6 offered
+        # unconditionally there too; the swap lands in the SAME
+        # environment the detection runs in, whichever of the two).
+        gpu_target = (
+            (info.managed and (info.variant or "cpu") != "gpu")
+            or (not info.managed and bool(info.python)))
         states.update({
             "env_repair_button": idle and (
                 info.managed or os.path.isdir(info.venv_path)),
-            "env_gpu_button": idle and info.managed
-            and (info.variant or "cpu") != "gpu"
+            "env_gpu_button": idle and gpu_target
             and self._gpu_probe_cached().present,
             "env_open_folder_button": idle,
             "models_open_folder_button": idle,
@@ -1693,15 +2532,43 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
                 widget.setEnabled(bool(on))
             except Exception:                      # pragma: no cover - GUI
                 pass
+        self._set_verify_tooltip(self._selected_model_row())
+
+    def _set_verify_tooltip(self, row):
+        """Always written, never only on the unpinned branch: a tooltip
+        that says "no checksum is published for this model" and is then
+        left behind would describe the PREVIOUS selection."""
+        verify = getattr(self, "models_verify_button", None)
+        if verify is None:
+            return
+        if row is not None and not row.pinned:
+            tip = "No checksum is published for this model"
+        else:
+            tip = "Check the file on disk against its published checksum"
+        try:
+            verify.setToolTip(tip)
+        except Exception:                          # pragma: no cover - GUI
+            pass
 
     # --- model tree -----------------------------------------------------
 
     def _scan_models(self):
         """stat()-only snapshot; safe on the GUI thread by
-        model_status.scan's contract (never hashes, never networks)."""
+        model_status.scan's contract (never hashes, never networks).
+        The Detection tab's family + variant selection is fed in so
+        the ``is_default`` row is the file THAT selection would load —
+        the combo/variant change handlers repaint the Setup tab for
+        exactly this reason. The legacy ``<plugin_dir>/models`` dir is
+        a read fallback, so rr6-era installs show 'installed'."""
         try:
-            return model_status.scan(self.config_path, self.models_dir,
-                                     device=self._model_device())
+            fam = self._current_family()
+            return model_status.scan(
+                self.config_path, self.models_dir,
+                device=self._model_device(),
+                family_id=fam.id if fam is not None else None,
+                variant=self._variant_value(),
+                fallback_dirs=(
+                    os.path.join(self._plugin_dir(), "models"),))
         except Exception as exc:
             self._append_setup_detail(
                 f"Could not read the model registry: {exc}")
@@ -1748,16 +2615,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             try:
                 tree.blockSignals(True)
                 tree.clear()
-                for row in self._visible_rows():
-                    item = QtWidgets.QTreeWidgetItem(tree, [
-                        row.label,
-                        self._precision_text(row),
-                        self._model_size_text(row),
-                        self._model_state_text(row),
-                    ])
-                    item.setData(0, Qt.UserRole, row.entry_id)
-                    if row.entry_id == selected:
-                        tree.setCurrentItem(item)
+                self._fill_model_tree(tree, selected)
             except Exception:                      # pragma: no cover - GUI
                 pass
             finally:
@@ -1770,11 +2628,46 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self._set_label("models_dir_label", self.models_dir)
         self._refresh_setup_buttons()
 
+    def _fill_model_tree(self, tree, selected):
+        """Family-grouped rendering: an expanded parent per family
+        whose 4th column summarises disk usage, the precision variants
+        as children. Parents carry no entry id, so selecting one
+        simply disables the per-row actions."""
+        grouped = model_status.group_by_family(self._visible_rows())
+        for _fam_id, fam_label, rows in grouped:
+            parent = QtWidgets.QTreeWidgetItem(
+                tree,
+                [fam_label, "", "", model_status.family_summary(rows)])
+            parent.setExpanded(True)
+            for row in rows:
+                child = QtWidgets.QTreeWidgetItem(parent, [
+                    row.label,
+                    self._precision_text(row),
+                    self._model_size_text(row),
+                    self._model_state_text(row),
+                ])
+                child.setData(0, Qt.UserRole, row.entry_id)
+                child.setToolTip(0, self._row_tooltip(row))
+                if row.entry_id == selected:
+                    tree.setCurrentItem(child)
+
+    @staticmethod
+    def _row_tooltip(row):
+        """Per-row tooltip from what the registry actually carries —
+        our config.json has no description/F1 metadata (rr6's did),
+        and nothing is fabricated in its place."""
+        lines = [row.label, row.file]
+        if row.installed:
+            lines.append(f"on disk: {row.path}")
+        elif row.size_mb:
+            lines.append(f"download size: {row.size_mb:.1f} MB")
+        return "\n".join(lines)
+
     @staticmethod
     def _precision_text(row):
         text = {"fp16": "fp16 (GPU)", "int8": "int8 (CPU)"}.get(
             row.precision, row.precision)
-        return f"{text} — default here" if row.is_default else text
+        return f"{text} — recommended here" if row.is_default else text
 
     @staticmethod
     def _model_size_text(row):
@@ -1805,14 +2698,45 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
 
     @_refuse_if_busy
     def _setup_create_env(self):
+        gpu = self._confirm_gpu_for_create()
         self._setup_running = True
         self._set_busy_ui(True)
-        self._set_setup_status("Creating the WINMOL environment …")
+        runtime = " (GPU runtime)" if gpu else ""
+        self._set_setup_status(
+            f"Creating the WINMOL environment{runtime} …")
         self._append_setup_detail(
             "Creating the environment. The first run downloads a few "
             "hundred MB and can take several minutes; QGIS stays "
             "usable.")
-        self._start_env_setup_worker(gpu=None, then_run=False)
+        self._start_env_setup_worker(gpu=gpu, then_run=False)
+
+    def _confirm_gpu_for_create(self):
+        """Ask whether to build the GPU variant BEFORE the build, not
+        bolted on afterwards — an NVIDIA box that gets the CPU runtime
+        here has to download the whole environment twice. No usable
+        GPU: no question, and None keeps honoring the WINMOL_GPU env
+        var. Reads the cached 2 s-bounded probe — nothing here blocks
+        the GUI thread."""
+        probe = self._gpu_probe_cached()
+        if not probe.present:
+            return None
+        reply = QtWidgets.QMessageBox.question(
+            self, "Install the GPU runtime?",
+            f"{probe.label} detected.\n\n"
+            "Build the environment with the GPU runtime "
+            "(onnxruntime-gpu, roughly 2 GB more to download)?\n\n"
+            "Detection is several hundred times faster on it. 'No' "
+            "builds the CPU runtime; the Setup tab can install the "
+            "GPU runtime later.",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.Yes)
+        gpu = reply == QtWidgets.QMessageBox.Yes
+        self._append_setup_detail(
+            f"Building the GPU runtime for {probe.label}."
+            if gpu else
+            "Building the CPU-only runtime. You can add the GPU "
+            "runtime later from the Setup tab.")
+        return gpu
 
     @_refuse_if_busy
     def _setup_repair_env(self):
@@ -1837,37 +2761,59 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self._start_env_setup_worker(gpu=gpu, then_run=False)
 
     @_refuse_if_busy
-    def _setup_install_gpu(self):
+    def _setup_install_gpu(self, confirmed=False):
         """Swap the CPU inference runtime for the CUDA one, explicitly
         confirmed — a 2 GB download is not started on the user's
         behalf. No marker games needed: setup_environment(gpu=True)
         sees the CPU-variant sentinel as not-ready and rebuilds, and
         install_requirements removes the conflicting CPU runtime first
         (installer.uninstall_conflicting_runtime — both distributions
-        provide the 'onnxruntime' module, so exactly one may exist)."""
+        provide the 'onnxruntime' module, so exactly one may exist).
+
+        ``confirmed=True`` skips the confirm box — the pre-run GPU offer
+        already asked, so the click-through would double-prompt.
+
+        A bring-your-own interpreter gets the runtime installed into
+        ITSELF (EnvSetupWorker ``target_exe``) — the swap has to land
+        in the same environment the detection runs in, whichever of
+        the two that is."""
         probe = self._gpu_probe_cached()
         if not probe.present:
             self._set_setup_status(
                 probe.detail or "No usable NVIDIA GPU was found.")
             return
-        reply = QtWidgets.QMessageBox.question(
-            self, "Install GPU runtime",
-            f"Replace the CPU inference runtime with the CUDA one for "
-            f"{probe.label}?\n\n"
-            "This downloads onnxruntime-gpu (roughly 2 GB with its CUDA "
-            "libraries) into WINMOL's environment and removes the CPU "
-            "runtime — the two cannot coexist.\n\n"
-            "'No' keeps the working CPU environment.",
-            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-            QtWidgets.QMessageBox.No)
-        if reply != QtWidgets.QMessageBox.Yes:
-            return
+        target = self._byo_interpreter()
+        if not confirmed:
+            where = (f"your interpreter ({target})" if target
+                     else "WINMOL's environment")
+            reply = QtWidgets.QMessageBox.question(
+                self, "Install GPU runtime",
+                f"Replace the CPU inference runtime with the CUDA one for "
+                f"{probe.label}?\n\n"
+                "This downloads onnxruntime-gpu (roughly 2 GB with its "
+                f"CUDA libraries) into {where} and removes "
+                "the CPU runtime — the two cannot coexist.\n\n"
+                "'No' keeps the working CPU environment.",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No)
+            if reply != QtWidgets.QMessageBox.Yes:
+                return
         self._venv_bytes = None
         self._setup_running = True
         self._set_busy_ui(True)
         self._set_setup_status(
             f"Installing the GPU runtime for {probe.label} …")
-        self._start_env_setup_worker(gpu=True, then_run=False)
+        self._start_env_setup_worker(gpu=True, then_run=False,
+                                     target_exe=target)
+
+    def _byo_interpreter(self):
+        """The user's own interpreter when that is what we are pointed
+        at, else None so the managed venv is (re)built instead."""
+        exe = (self.python_exe or "").strip()
+        if not exe:
+            return None
+        venv = self.venv_path or installer.venv_location(self._plugin_dir())
+        return None if installer.path_is_inside(exe, venv) else exe
 
     @_refuse_if_busy
     def _setup_choose_interpreter(self):
@@ -1895,18 +2841,44 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self._set_setup_status("Interpreter not usable.")
             return
         if not installer._has_compute_deps(file_path):
-            QtWidgets.QMessageBox.warning(
-                self, "WINMOL Analyzer",
+            reply = QtWidgets.QMessageBox.question(
+                self, "Missing dependencies",
                 f"{file_path}\n\nis missing WINMOL's dependencies "
-                "(onnxruntime / rasterio / geopandas). Install "
-                "requirements/cpu.txt into it first, or let WINMOL "
-                "create its own environment.")
-            self._set_setup_status("Interpreter not usable.")
+                "(onnxruntime / rasterio / geopandas).\n\n"
+                "Install them into it now? pip runs in the "
+                "background and its output appears below; QGIS "
+                "stays usable.",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.Yes)
+            if reply != QtWidgets.QMessageBox.Yes:
+                self._set_setup_status("Interpreter not usable.")
+                return
+            # Persisted BEFORE the install: if pip fails midway the
+            # Setup tab then reports THIS interpreter as missing deps
+            # (honest, recoverable — retry, choose again, or forget),
+            # instead of silently forgetting the user's choice.
+            self._save_python_setting(file_path)
+            self._pip_install_into(file_path)
             return
         self._save_python_setting(file_path)
         self._reresolve_env()
         self._set_setup_status(f"Using your interpreter: {file_path}")
         self._refresh_setup_tab()
+
+    def _pip_install_into(self, exe):
+        """Install the CPU requirements into a user-picked interpreter
+        — on the worker thread (running pip inline froze QGIS for the
+        whole multi-minute install). The GPU runtime stays a separate,
+        explicitly-confirmed step ('Install GPU runtime…' serves BYO
+        interpreters too)."""
+        self._setup_running = True
+        self._set_busy_ui(True)
+        self._set_setup_status(f"Installing dependencies into {exe} …")
+        self._append_setup_detail(
+            f"Installing dependencies into {exe}. This can take "
+            "several minutes; progress appears below.")
+        self._start_env_setup_worker(gpu=False, then_run=False,
+                                     target_exe=exe)
 
     def _save_python_setting(self, value):
         """Write (or, with a falsy value, forget) the configured
@@ -1995,14 +2967,14 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self._start_remove_worker(dry_run=True, flags=flags)
 
     def _ask_deletion_scope(self):
-        """A small purpose-built dialog: venv on, models off. Returns
-        the flag dict for deletion_plan/EnvRemoveWorker, or None when
-        cancelled. (No runtime checkbox: a machine with no Python 3.11
-        on PATH gets one auto-downloaded under managed_root/py311 —
-        see plugin_utils/py311.py — but it is a small, reusable build
-        artifact left in place across venv rebuilds/deletions; deleting
-        it too is a manual step via installer.remove_environment(...,
-        remove_runtime=True), not this quick dialog.)"""
+        """A small purpose-built dialog: venv on, the two destructive
+        extras off. Returns the flag dict for deletion_plan/
+        EnvRemoveWorker, or None when cancelled. The runtime checkbox
+        covers the Python 3.11 auto-downloaded under
+        managed_root/py311 (plugin_utils/py311.py) — a reusable build
+        artifact kept across venv rebuilds by default, but removable
+        here (installer.remove_environment prices and deletes it
+        through the same managed-tree containment as the venv)."""
         box = QtWidgets.QDialog(self)
         box.setWindowTitle("Delete WINMOL environment")
         layout = QtWidgets.QVBoxLayout(box)
@@ -2015,9 +2987,11 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         layout.addWidget(note)
         venv_cb = QtWidgets.QCheckBox("Virtual environment", box)
         venv_cb.setChecked(True)
+        runtime_cb = QtWidgets.QCheckBox(
+            "Downloaded Python 3.11 runtime", box)
         models_cb = QtWidgets.QCheckBox("Downloaded models", box)
-        layout.addWidget(venv_cb)
-        layout.addWidget(models_cb)
+        for widget in (venv_cb, runtime_cb, models_cb):
+            layout.addWidget(widget)
         buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.Ok
             | QtWidgets.QDialogButtonBox.Cancel, box)
@@ -2028,7 +3002,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         if not accepted:
             return None
         return {"remove_venv": venv_cb.isChecked(),
-                "remove_runtime": False,
+                "remove_runtime": runtime_cb.isChecked(),
                 "remove_models": models_cb.isChecked()}
 
     def _start_remove_worker(self, dry_run, flags):
@@ -2159,11 +3133,19 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self._set_setup_status(f"Environment removal failed: {message}")
         self._append_setup_detail(message)
         self._refresh_setup_tab()
+        QtWidgets.QMessageBox.warning(
+            self, "WINMOL Analyzer",
+            f"Environment removal failed:\n{message}")
 
     # --- Step 2 slots: models -------------------------------------------
 
     @_refuse_if_busy
     def _setup_rescan(self):
+        # Rescan is the documented recovery for out-of-band changes
+        # (venv deleted or repaired outside the dialog), so it re-runs
+        # the resolution instead of repainting the cached verdict —
+        # the same sanctioned click-time cost as choose-interpreter.
+        self._reresolve_env()
         self._venv_bytes = None     # an honest rescan re-prices too
         self._set_setup_status("Rescanned.")
         self._refresh_setup_tab()
@@ -2184,16 +3166,29 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
 
     @_refuse_if_busy
     def _setup_download_default(self):
-        try:
-            entry = self.registry.default_entry(self._model_device())
-        except Exception:
-            entry = None
+        # The scan's is_default row IS the recommendation the tree
+        # shows — resolved from the Detection tab's family + variant —
+        # so this button downloads exactly the highlighted file, never
+        # a second opinion about it.
+        row = next((r for r in self._model_rows if r.is_default), None)
+        entry = (self.registry.entries.get(row.entry_id)
+                 if row is not None and self.registry is not None
+                 else None)
         if entry is None:
-            self._set_setup_status("No default model for this machine.")
+            self._set_setup_status(
+                "No recommended model for this selection.")
             return
         self._start_model_download(entry)
 
     def _start_model_download(self, entry):
+        # Same consent as the Run pre-flight: every download path first
+        # names the model, its size and its source. An installed file
+        # only gets re-verified — nothing to consent to.
+        local = self._local_model_path(entry)
+        if not (os.path.exists(local) and os.path.getsize(local) > 0):
+            if not self._confirm_model_download(entry):
+                self._set_setup_status("Download cancelled.")
+                return
         self._models_busy = True
         self._start_model_job(
             ModelEnsureWorker(entry, self.models_dir),
@@ -2204,18 +3199,40 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self._models_busy = False
         self._set_setup_status(f"Model ready: {model_path}")
         self._set_busy_ui(False)
+        self._refresh_model_info()  # the Detection info line follows
         self._refresh_setup_tab()
 
     @_refuse_if_busy
-    def _setup_verify_all(self):
-        """Checksum every pinned model file on disk (worker-thread
-        territory — hashing a 100 MB file is not a click-time cost)."""
+    def _setup_verify_selected(self):
+        """Checksum the SELECTED row's file (worker-thread territory —
+        hashing a 100 MB file is not a click-time cost). An unpinned
+        row is refused honestly: there is nothing to verify against,
+        and pretending otherwise would manufacture confidence. The
+        job's models_dir follows where the file actually lives, so an
+        rr6-era install next to the plugin verifies in place."""
+        row = self._selected_model_row()
+        if row is None:
+            self._set_setup_status("Select a model first.")
+            return
+        if not row.pinned:
+            self._set_setup_status(
+                "No checksum is published for this model; there is "
+                "nothing to verify against.")
+            return
+        if not row.installed:
+            self._set_setup_status(
+                f"{row.file} is not on disk yet — nothing to verify.")
+            return
+        models_dir = self.models_dir
+        legacy = os.path.join(self._plugin_dir(), "models")
+        if row.path == os.path.join(legacy, row.file):
+            models_dir = legacy
         self._models_busy = True
         self._start_model_job(
             ModelMaintenanceWorker(
-                "verify-all", self.config_path, self.models_dir,
-                device=self._model_device()),
-            "Verifying model checksums …",
+                "verify-all", self.config_path, models_dir,
+                entry_ids=[row.entry_id], device=self._model_device()),
+            f"Verifying {row.file} …",
             self._on_model_maintenance_done)
 
     @_refuse_if_busy
@@ -2258,6 +3275,11 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.maint_worker = worker
         self.maint_thread = self._new_worker_thread(worker)
         worker.log.connect(self._on_setup_log)
+        # ModelEnsureWorker reports a download percent; the maintenance
+        # worker has no signal of that name and stays indeterminate.
+        progress = getattr(worker, "progress", None)
+        if progress is not None:
+            progress.connect(self._on_setup_progress)
         worker.done.connect(done_slot)
         worker.failed.connect(self._on_model_job_failed)
         worker.done.connect(self.maint_thread.quit)
@@ -2301,6 +3323,9 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self._append_setup_detail(message)
         self._set_busy_ui(False)
         self._refresh_setup_tab()
+        QtWidgets.QMessageBox.warning(
+            self, "WINMOL Analyzer",
+            f"Model operation failed:\n{message}")
 
     def _set_export_enabled(self, on):
         btn = getattr(self, "export_button", None)
