@@ -24,27 +24,41 @@ Dialog
 """
 
 import os
-import psutil
 import glob
+import platform
 from pathlib import Path
 
-from PyQt5.QtWidgets import QFileDialog
+try:
+    import psutil          # optional: used only to report available RAM
+except Exception:
+    psutil = None
 
-
-from PyQt5.QtCore import QThread
-
+# qgis.PyQt shims to the active Qt binding (PyQt5 on QGIS 3).
+from qgis.PyQt.QtWidgets import QFileDialog
+from qgis.PyQt.QtCore import Qt, QThread, QUrl
+from qgis.PyQt.QtGui import QDesktopServices
 
 from qgis.core import QgsProject, QgsVectorLayer, QgsRasterLayer
 from qgis.PyQt import QtWidgets, uic
 
 from .classes.Config import Config
-from .plugin_utils import gpu_probe
-from .plugin_utils.installer import (
-    QSETTINGS_GPU_PROMPT_KEY,
-    installed_variant,
+from .plugin_utils import (
+    config_overrides,
+    gpu_probe,
+    installer,
+    model_status,
+    setup_state,
 )
 from .plugin_utils.model_registry import load_registry
-from .tasks_threads import EnvSetupWorker, ModelEnsureWorker, Worker
+from .plugin_utils.output_selection import gpkg_layers_for, process_type_for
+from .plugin_utils.run_progress import RunProgress
+from .tasks_threads import (
+    EnvRemoveWorker,
+    EnvSetupWorker,
+    ModelEnsureWorker,
+    ModelMaintenanceWorker,
+    Worker,
+)
 
 current_path = os.path.dirname(__file__)
 
@@ -61,8 +75,44 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
     #: opposed to a registry entry id.
     CUSTOM_MODEL_ID = "__custom__"
 
+    #: (widget, signal, slot) for every live Setup-tab control. The
+    #: model tree's double-click is a second path into the download
+    #: slot, so it carries the same busy guard as the button.
+    SETUP_CONNECTIONS = (
+        ("env_create_button", "clicked", "_setup_create_env"),
+        ("env_choose_button", "clicked", "_setup_choose_interpreter"),
+        ("env_repair_button", "clicked", "_setup_repair_env"),
+        ("env_delete_button", "clicked", "_setup_delete_env"),
+        ("env_gpu_button", "clicked", "_setup_install_gpu"),
+        ("env_open_folder_button", "clicked", "_setup_open_env_folder"),
+        ("models_refresh_button", "clicked", "_setup_rescan"),
+        ("models_download_button", "clicked", "_setup_download_selected"),
+        ("models_download_default_button", "clicked",
+         "_setup_download_default"),
+        ("models_verify_button", "clicked", "_setup_verify_all"),
+        ("models_delete_button", "clicked", "_setup_delete_model"),
+        ("models_open_folder_button", "clicked",
+         "_setup_open_models_folder"),
+        ("models_treeWidget", "itemDoubleClicked",
+         "_setup_download_selected"),
+        ("models_treeWidget", "itemSelectionChanged",
+         "_refresh_setup_buttons"),
+        ("models_variants_checkBox", "toggled", "_refresh_model_tree"),
+    )
+
+    #: (widget, signal, slot) for the tab-navigation buttons that are
+    #: already fully functional: they only switch tabs.
+    NAVIGATION_CONNECTIONS = (
+        ("setup_go_detect_button", "clicked", "_go_to_detection"),
+        ("setup_open_log_button", "clicked", "_go_to_log"),
+        ("setup_banner_button", "clicked", "_go_to_setup"),
+        ("accel_banner_button", "clicked", "_go_to_setup"),
+    )
+
     def __init__(self, parent=None, env=None):
-        """Constructor."""
+        """Constructor. `env` is the dict from
+        installer.resolve_environment ({'status', 'python', 'venv_path',
+        'message'})."""
         super(WINMOLAnalyzerDialog, self).__init__(parent)
         self.setupUi(self)
         # Derived outputs are auto-generated from the stem map output path.
@@ -72,6 +122,9 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self.output_lineEdit_nodes.setReadOnly(True)
             self.output_toolButton_trees.setEnabled(False)
             self.output_toolButton_nodes.setEnabled(False)
+            # Output is optional now: empty -> temp folder, then Export.
+            self.output_lineEdit_stem.setPlaceholderText(
+                "optional — leave empty to use a temp folder, then Export…")
         except Exception:
             pass
         self._updating_output_fields = False
@@ -84,19 +137,47 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.model_path = ""
         self.stem_path = ""
         self.trees_path = ""
-        self.process_type = "Stems"
+        # Resolved from the output checkboxes in set_selected_process_type()
+        # immediately before a run; never a hardcoded default.
+        self.process_type = None
 
         self.uav_layer_path = None
         self.uav_layer_name = None
         self.crs = None
         self.worker = None
         self.thread = None
+        # Re-entrancy guard: reassigning self.thread while its OS thread
+        # is still running destroys a live QThread -> Qt qFatal() -> the
+        # whole QGIS process aborts. Never start a second run over a live
+        # one.
+        self._run_active = False
+        # Set by cancel_process while env setup / model download is in
+        # flight (neither worker has a hard-kill). Checked by
+        # _on_env_setup_done / _on_model_ensured so a cancelled run
+        # cannot resurrect once the phase finishes idle; cleared at the
+        # top of run_process.
+        self._cancel_requested = False
+        # Incremental stdout parser driving the detection progress bar.
+        # Created per run in _start_analysis, fed in _on_worker_line.
+        self._run_progress = None
+        # Outputs of the last successful run, for the Export action. Each
+        # entry is an absolute path (stem map + optional gpkg).
+        self._last_outputs = []
+        # If True, the stem map went to a temp dir and should be offered
+        # for export (the user didn't choose a permanent output path).
+        self._last_output_is_temp = False
 
         # Create a Config instance
         self.config = Config()
 
         self.set_connections()
         self.output_log.setReadOnly(True)
+        # A verbose run streams thousands of lines through here; cap the
+        # scrollback so the widget can't grow without bound.
+        try:
+            self.output_log.setMaximumBlockCount(5000)
+        except Exception:
+            pass
         # env comes from plugin_utils.installer.resolve_environment():
         # {'status', 'python', 'venv_path', 'message'}. status is one of
         # byo/ready (python_exe usable now) or needs_setup/error (Run
@@ -107,7 +188,49 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.setup_thread = None
         self.setup_worker = None
         self._setup_running = False
-        self.models_dir = os.path.join(os.path.dirname(self.venv_path), "models")
+        self.models_dir = os.path.join(
+            os.path.dirname(self.venv_path), "models")
+        self.config_path = os.path.join(
+            os.path.dirname(__file__), "config.json")
+
+        # --- Setup-tab state -------------------------------------------
+        # Refreshes are ignored until the end of __init__ (the tab-change
+        # signal fires while widgets are still being placed).
+        self._setup_live = False
+        # True while an EnvSetupWorker launched from the SETUP TAB is in
+        # flight and the run should NOT start when it completes (create/
+        # repair/GPU install). run_process's first-run build sets it
+        # back to True.
+        self._setup_then_run = True
+        # Delete-environment cycle guard: covers pricing worker, the
+        # confirmation dialog between the two workers, and the removal
+        # worker. One cycle at a time.
+        self._env_removing = False
+        self.remove_thread = None
+        self.remove_worker = None
+        # Setup-tab model maintenance guard (download/verify/delete).
+        # The run pre-flight's own download keeps _model_ensuring.
+        self._models_busy = False
+        self.maint_thread = None
+        self.maint_worker = None
+        # Passive venv-size pricing (EnvRemoveWorker dry-run on its own
+        # thread). _venv_bytes None = unknown/stale -> re-priced on the
+        # next refresh; directory_size on a 2 GB venv is seconds, so it
+        # never runs on the GUI thread.
+        self._pricing = False
+        self._venv_bytes = None
+        self.price_thread = None
+        self.price_worker = None
+        # Delete-env flow scratch: (priced plan, scope flags) armed by
+        # the dry-run worker, consumed on its thread.finished.
+        self._pending_deletion = None
+        self._deletion_flags = None
+        # Model rows from the last model_status.scan (stat-only).
+        self._model_rows = []
+        # Lazy caches: gpu_probe.probe() and the model-device verdict
+        # both shell out (bounded), so they run at most once per dialog.
+        self._gpu_probe = None
+        self._device = None
 
         # Model registry (config.json, schema-2): resolved entry for the
         # current combo selection, and the on-demand-download worker.
@@ -118,7 +241,31 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.ensure_thread = None
         self.ensure_worker = None
         self.populate_model_combo_box()
-        self.process_type = None
+
+        # The variant selector row is a placeholder in the .ui; nothing
+        # populates it yet, so it must not show as an empty row.
+        _variant = getattr(self, "model_variant_widget", None)
+        if _variant is not None:
+            _variant.hide()
+
+        # The Setup/accelerator banners start hidden; the first
+        # _refresh_setup_tab below decides whether either has anything
+        # honest to say.
+        for _wname in ("setup_banner_widget", "accel_banner_widget"):
+            _w = getattr(self, _wname, None)
+            if _w is not None:
+                _w.hide()
+
+        # Deliberate cut: this lineage has no batch-size autotune cache,
+        # so the button would only ever say "nothing to clear".
+        _autotune = getattr(self, "autotune_clear_button", None)
+        if _autotune is not None:
+            _autotune.hide()
+
+        # The detection bar is hidden until a detection actually runs, so
+        # it never doubles up with the Setup tab's own progress bar.
+        self._show_run_progress(False)
+        self._set_export_enabled(False)
 
         # Nodes output uses the Trees output path (no separate file/path field).
         # Hide/disable the old nodes output widgets if they exist in the .ui.
@@ -130,6 +277,63 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
 
         # hide warning label
         self.uav_warning_label.hide()
+
+        # Open where the user can act: Detection when a run could start
+        # now, Setup when the environment still needs work. From here on
+        # refreshes are live.
+        self._setup_live = True
+        if setup_state.env_ready(self._env_info()):
+            self._go_to_detection()
+        else:
+            self._go_to_setup()
+        self._refresh_setup_tab()
+
+        # Last, once construction has placed every widget: the .ui's
+        # declared default size is only a wish, and on a short screen it
+        # used to push the Run button off the desktop.
+        self._fit_to_available_screen()
+
+    def _fit_to_available_screen(self):
+        """Clamp the just-built dialog to the screen it will open on.
+
+        Called exactly once, from the constructor, before the dialog is
+        ever shown — so it shrinks the .ui's declared default but never
+        fights a resize the user made afterwards. The tab pages live in
+        QScrollAreas, so shrinking hides nothing: Run, the button row and
+        the progress bar sit outside them and stay reachable.
+
+        Every Qt lookup here is optional. Under a headless test, an
+        offscreen platform plugin or a Qt build without QScreen this must
+        do nothing rather than raise.
+        """
+        try:
+            screen = None
+            handle = self.windowHandle()
+            if handle is not None:
+                screen = handle.screen()
+            if screen is None:
+                parent = self.parentWidget()
+                if parent is not None and parent.window() is not None:
+                    screen = getattr(parent.window(), "screen", lambda: None)()
+            if screen is None:
+                screen = QtWidgets.QApplication.primaryScreen()
+            if screen is None:
+                return
+            available = screen.availableGeometry()
+            # availableGeometry already excludes the macOS menu bar and the
+            # dock / Windows taskbar; this is the window frame on top of it.
+            chrome = 60
+            floor_w, floor_h = 480, 320
+            width = min(self.width(),
+                        max(available.width() - chrome, floor_w))
+            height = min(self.height(),
+                         max(available.height() - chrome, floor_h))
+            if (width, height) != (self.width(), self.height()):
+                self.resize(width, height)
+        except Exception:
+            # A dialog that opens slightly too tall is a nuisance; one that
+            # refuses to construct is a broken plugin.
+            pass
 
     def set_connections(self):
         self.run_button.clicked.connect(self.run_process)
@@ -146,16 +350,91 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.output_checkBox_stem.stateChanged.connect(self.checkbox_changed_stem)
         self.output_checkBox_trees.stateChanged.connect(self.checkbox_changed_trees)
         self.output_checkBox_nodes.stateChanged.connect(self.checkbox_changed_nodes)
-        self.checkbox_changed_stem(2)
-        self.checkbox_changed_trees(1)
-        self.checkbox_changed_nodes(1)
+        # Prime the handlers from the widgets themselves, so the .ui stays
+        # the single source of truth for the default selection (all three
+        # products on). Order is load-bearing: stem gates trees, trees gates
+        # nodes -- priming out of order would cascade a box back off.
+        for _cb, _handler in (
+            (self.output_checkBox_stem, self.checkbox_changed_stem),
+            (self.output_checkBox_trees, self.checkbox_changed_trees),
+            (self.output_checkBox_nodes, self.checkbox_changed_nodes),
+        ):
+            _handler(Qt.Checked if _cb.isChecked() else Qt.Unchecked)
         self.close_button.clicked.connect(self.close_application)
         self.cancel_button.clicked.connect(self.cancel_process)
+        # Export lives in the bottom button row (declared in the .ui) and
+        # stays dead until a run has actually written something.
+        self.export_button.clicked.connect(self.export_results)
+        self._connect_setup_tab()
+
+    def _connect_setup_tab(self):
+        """Wire the Setup tab. Guarded so a uic binding failure degrades
+        to a dead button instead of raising during construction."""
+        for widget_name, signal_name, slot_name in (
+                self.NAVIGATION_CONNECTIONS + self.SETUP_CONNECTIONS):
+            self._connect_or_report(
+                widget_name, signal_name, getattr(self, slot_name, None))
+        # Refresh whenever the Setup tab becomes visible, so it never
+        # shows a state from before the last job.
+        try:
+            self.log_widget.currentChanged.connect(self._on_tab_changed)
+        except Exception:                          # pragma: no cover - GUI
+            print("WINMOL: could not wire the tab-change refresh")
+
+    def _connect_or_report(self, widget_name, signal_name, slot):
+        widget = getattr(self, widget_name, None)
+        signal = getattr(widget, signal_name, None)
+        if signal is None or slot is None:
+            print(f"WINMOL: could not wire {widget_name}.{signal_name}")
+            return
+        try:
+            signal.connect(slot)
+        except Exception as exc:                   # pragma: no cover - GUI
+            print(f"WINMOL: could not wire {widget_name}: {exc}")
+
+    def _on_tab_changed(self, _index):
+        if self._is_setup_current():
+            self._refresh_setup_tab()
+
+    def _is_setup_current(self):
+        page = getattr(self, "tab_setup", None)
+        try:
+            return page is not None and \
+                self.log_widget.currentWidget() is page
+        except Exception:                          # pragma: no cover - GUI
+            return False
+
+    # --- tab navigation ------------------------------------------------
+
+    def _show_tab(self, page):
+        """Select a tab BY WIDGET, never by index.
+
+        Tab positions have moved across layouts (the order is now Setup,
+        Detection, Log) — a ``setCurrentIndex(1)`` literal written for
+        one order silently opens the wrong tab under the next.
+        """
+        if page is None:
+            return
+        try:
+            index = self.log_widget.indexOf(page)
+            if index >= 0:
+                self.log_widget.setCurrentIndex(index)
+        except Exception:                          # pragma: no cover - GUI
+            pass
+
+    def _go_to_detection(self):
+        self._show_tab(getattr(self, "tab", None))
+
+    def _go_to_log(self):
+        self._show_tab(getattr(self, "tab_2", None))
+
+    def _go_to_setup(self):
+        self._show_tab(getattr(self, "tab_setup", None))
 
     def _log(self, msg: str) -> None:
         """Write a message to the plugin log widget (and stdout as fallback)."""
         try:
-            self.output_log.append(str(msg))
+            self.output_log.appendPlainText(str(msg))
         except Exception:
             print(msg)
 
@@ -245,6 +524,10 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
 
     def set_default_config_parameters(self):
         # set default values
+        # 0 == "Auto" (the spin box' specialValueText): let the planner
+        # size the batch and let the one-time autotune refine it.
+        self.batchsize_spinBox.setValue(
+            int(getattr(self.config, "prediction_batch_override", 0) or 0))
         self.minlength_doubleSpinBox.setValue(self.config.min_length)
         self.maxdistance_doubleSpinBox.setValue(self.config.max_distance)
         self.tolerance_doubleSpinBox.setValue(self.config.tolerance_angle)
@@ -257,6 +540,27 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.config.max_distance = self.maxdistance_doubleSpinBox.value()
         self.config.tolerance_angle = self.tolerance_doubleSpinBox.value()
         self.config.max_tree_height = self.maxtree_doubleSpinBox.value()
+
+    def _batch_override_env(self):
+        """Child environment pinning the prediction batch size, or ``{}``.
+
+        0 is "Auto" and injects nothing. Read here, on the GUI thread and
+        before the worker starts — no widget is ever touched from the
+        worker. Any WINMOL_CONFIG_OVERRIDES_JSON the user set themselves
+        is merged, not replaced.
+        """
+        try:
+            value = int(self.batchsize_spinBox.value())
+        except Exception:
+            return {}
+        env = config_overrides.batch_override_env(
+            value, os.environ.get(config_overrides.ENV_VAR))
+        if env:
+            self.update_output_log(
+                f"Prediction batch size pinned to {value} tiles "
+                "(batch-size autotune skipped)."
+            )
+        return env
 
     def set_crs(self, layer):
         # get crs from uav image
@@ -278,7 +582,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
 
             if not self.crs.isGeographic():  # isGeographic() returns True for unprojected systems like EPSG:4326
                 # Enable processing button
-                self.run_button.setEnabled(True)
+                self.run_button.setEnabled(not self._run_active)
                 self.uav_warning_label.hide()  # Hide CRS error if shown before
 
                 # Get the raster's pixel size in map units
@@ -349,8 +653,22 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self.output_lineEdit_stem.setText(file_path)
 
     def set_path_from_line_edit(self):
-        # Single user-controlled output path: stem map output.
-        stem_out = self._normalize_stem_map_output(self.output_lineEdit_stem.text().strip())
+        # Input path: always re-read from the visible field (the source of
+        # truth) — the cached self.uav_path from the file dialog is not
+        # authoritative when the user typed a path. Empty here == the
+        # "No such file" crash in rasterio, so capture it now and validate
+        # in run_process.
+        self.uav_path = self.uav_lineEdit.text().strip()
+
+        # Output stem map path is OPTIONAL. If the user left it empty we
+        # write to a temp dir and offer an Export afterwards, so a run
+        # "just works" without forcing a path up front. (An empty path
+        # otherwise crashes deep in the prediction phase.)
+        stem_field = self.output_lineEdit_stem.text().strip()
+        self._last_output_is_temp = not bool(stem_field)
+        if not stem_field:
+            stem_field = self._temp_stem_map_base()
+        stem_out = self._normalize_stem_map_output(stem_field)
         self.stem_path = stem_out
 
         # Derived vector output: '<base>_detected_stems.gpkg'
@@ -363,11 +681,40 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         else:
             self.trees_path = ""
 
+        # Remember what this run will produce, for the Export action.
+        self._last_outputs = [
+            p for p in (self.stem_path, self.trees_path) if p]
+
         # Keep UI in sync (read-only display)
         try:
             self.output_lineEdit_trees.setText(gpkg_path if self.output_checkBox_trees.isChecked() or self.output_checkBox_nodes.isChecked() else "")
         except Exception:
             pass
+
+    def _winmol_tmp_dir(self) -> str:
+        """A temp area for outputs when no output path is given. Under the
+        QGIS profile so it's discoverable, falling back to the system temp
+        dir."""
+        base = None
+        try:
+            from qgis.core import QgsApplication
+            base = QgsApplication.qgisSettingsDirPath()
+        except Exception:
+            base = None
+        root = os.path.join(base, "winmol", "tmp") if base else None
+        if not root:
+            import tempfile
+            root = os.path.join(tempfile.gettempdir(), "winmol")
+        os.makedirs(root, exist_ok=True)
+        return root
+
+    def _temp_stem_map_base(self) -> str:
+        """Unique base path for a temp stem map: '<tmp>/<input>_<id>'.
+        _normalize_stem_map_output appends '_stem_map.tiff'."""
+        import uuid
+        stem = Path(self.uav_path).stem if self.uav_path else "winmol"
+        return os.path.join(self._winmol_tmp_dir(),
+                            f"{stem}_{uuid.uuid4().hex[:8]}")
 
     def _suggest_stem_map_output(self, uav_path: str) -> str:
         """Derive default stem map output path from input image path."""
@@ -466,7 +813,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self.trees_path = self.output_lineEdit_trees.text()
 
     def checkbox_changed_stem(self, state):
-        is_checked = state == 2
+        is_checked = state == Qt.Checked
         self.output_lineEdit_stem.setEnabled(is_checked)
         self.output_toolButton_stem.setEnabled(is_checked)
         self.apply_style_to_line_edit(self.output_lineEdit_stem, is_checked)
@@ -481,7 +828,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self._update_derived_output_fields()
 
     def checkbox_changed_trees(self, state):
-        is_checked = state == 2
+        is_checked = state == Qt.Checked
 
         # Trees/Nodes outputs are derived; prevent manual path editing.
         self.output_checkBox_nodes.setEnabled(is_checked)
@@ -511,18 +858,14 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self.model_path = ""
 
     def set_selected_process_type(self):
-        stem_checked = self.output_checkBox_stem.isChecked()
-        trees_checked = self.output_checkBox_trees.isChecked()
-        nodes_checked = self.output_checkBox_nodes.isChecked()
-
-        if nodes_checked:
-            self.process_type = "Nodes"
-        elif trees_checked:
-            self.process_type = "Trees"
-        elif stem_checked:
-            self.process_type = "Stems"
-        else:
-            self.process_type = "Stems"
+        # One run covers every selected product: "Nodes" writes the
+        # stem-map raster *and* a GeoPackage with the stems, vectors and
+        # nodes layers.
+        self.process_type = process_type_for(
+            self.output_checkBox_stem.isChecked(),
+            self.output_checkBox_trees.isChecked(),
+            self.output_checkBox_nodes.isChecked(),
+        )
 
     def save_temp_layer(self, layer, layer_name: str, add_to_legend: bool = True):
         """
@@ -593,14 +936,52 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         # If the process is running, cancel it. cancel() terminates (then
         # kills) the child; the worker's own finished signal, already
         # wired to thread.quit(), tears the thread down once it exits.
+        # The bar resets immediately so a cancelled run never keeps a
+        # stale percentage on screen.
+        #
+        # env setup / model download have no hard-kill: letting them run
+        # to completion idle is fine, but the run they were about to
+        # start must not resurrect afterwards. _on_env_setup_done and
+        # _on_model_ensured check this flag and bail out instead.
+        self._cancel_requested = True
         if self.worker:
             self.worker.cancel()
+        bar = getattr(self, "progress_bar", None)
+        if bar is not None:
+            try:
+                bar.setValue(0)
+            except Exception:                      # pragma: no cover - GUI
+                pass
 
     def close_application(self):
         print("Closing application")
         self.close()
 
     def run_process(self):
+        # A stale cancel from a previous env-setup/model-download phase
+        # must not carry into this run.
+        self._cancel_requested = False
+
+        # Guard against re-entry: a second Run while one is live would
+        # reassign self.thread and destroy a still-running QThread -> Qt
+        # qFatal aborts the whole QGIS process.
+        if self._run_active:
+            QtWidgets.QMessageBox.information(
+                self, "WINMOL Analyzer",
+                "A run is already in progress. Wait for it to finish, or "
+                "press Cancel, before starting another.")
+            return
+        # The Setup tab must not be mid-job either: a run exec'ing an
+        # interpreter that a delete job is erasing, or loading a model
+        # a download is replacing, is the crash class the one-job-at-a-
+        # time rule exists for.
+        if self._busy_kind() is not None:
+            QtWidgets.QMessageBox.information(
+                self, "WINMOL Analyzer",
+                "A setup job is running. Wait for it to finish before "
+                "starting a run.")
+            return
+
         # set chosen parameters
         self.set_selected_model()
 
@@ -620,6 +1001,30 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.set_selected_process_type()
         self.set_path_from_line_edit()
 
+        # Validate the input BEFORE launching the subprocess: an empty or
+        # missing path otherwise surfaces as an opaque rasterio
+        # "No such file or directory" deep in winmol_run.py.
+        if not self.uav_path:
+            QtWidgets.QMessageBox.warning(
+                self, "WINMOL Analyzer",
+                "No input GeoTiff selected. Pick a file or type a path.")
+            return
+        if not os.path.exists(self.uav_path):
+            QtWidgets.QMessageBox.warning(
+                self, "WINMOL Analyzer",
+                f"Input GeoTiff was not found:\n{self.uav_path}")
+            return
+        # The stem map raster is always written; an empty output path
+        # crashes the prediction phase. set_path_from_line_edit derives a
+        # temp path for an empty field, so this only trips if that
+        # derivation somehow failed.
+        if not self.stem_path or Path(self.stem_path).name == "":
+            QtWidgets.QMessageBox.warning(
+                self, "WINMOL Analyzer",
+                "No output path is set and none could be derived from the "
+                "input. Set an output stem map path.")
+            return
+
         # check if uav image is loaded in qgis
         self.check_uav_input_exists(self.stem_path)
 
@@ -632,8 +1037,9 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             alt = str(p.with_name(p.stem + "_new.gpkg"))
             self.check_uav_input_exists(alt)
 
-        # Switch to the log tab in the QTabWidget
-        self.log_widget.setCurrentIndex(1)
+        # Switch to the log tab in the QTabWidget (by widget, never by
+        # index — the Setup page sits before Detection and Log now)
+        self._go_to_log()
 
         # clear the output log
         self.output_log.clear()
@@ -648,6 +1054,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
                 "Setting up the WINMOL environment (first run only)..."
             )
             self._setup_running = True
+            self._set_busy_ui(True)
             self._run_env_setup()
         elif self.env.get("status") == "error" or self.python_exe is None:
             self.update_output_log(
@@ -659,36 +1066,47 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self._resolve_model_and_start(self.python_exe)
 
     def _maybe_offer_gpu(self):
-        """One log line when an NVIDIA GPU is present but the venv
-        runs the CPU runtime. No Setup tab exists yet, so the offer
-        names the opt-in switch (WINMOL_GPU=1); setting any value on
-        QSETTINGS_GPU_PROMPT_KEY silences it."""
+        """One log line when an NVIDIA GPU is present but the venv runs
+        the CPU runtime; it points at the Setup tab's install button.
+        Setting any value on QSETTINGS_GPU_PROMPT_KEY silences it."""
         try:
             from qgis.core import QgsSettings
-            if QgsSettings().value(QSETTINGS_GPU_PROMPT_KEY, ""):
+            if QgsSettings().value(
+                    installer.QSETTINGS_GPU_PROMPT_KEY, ""):
                 return
         except Exception:
             pass
-        if installed_variant(self.venv_path) != "cpu":
+        if installer.installed_variant(self.venv_path) != "cpu":
             return
-        if not gpu_probe.wants_gpu_runtime(gpu_probe.probe(timeout=2.0)):
+        if not gpu_probe.wants_gpu_runtime(self._gpu_probe_cached()):
             return
         self.update_output_log(
             "NVIDIA GPU detected — the environment uses the CPU "
-            "runtime. To enable GPU support, restart QGIS with the "
-            "environment variable WINMOL_GPU=1 set and press Run: the "
-            "environment rebuilds once with onnxruntime-gpu."
+            "runtime. Open the Setup tab and press 'Install GPU "
+            "runtime…' to switch (a one-time onnxruntime-gpu "
+            "download)."
         )
 
     def _run_env_setup(self):
         """Build the compute venv off the GUI thread, then run the
-        analysis once it reports a usable interpreter."""
-        plugin_dir = os.path.dirname(__file__)
+        analysis once it reports a usable interpreter (run_process's
+        first-run path; the caller set _setup_running and busy UI)."""
+        self._start_env_setup_worker(gpu=None, then_run=True)
+
+    def _start_env_setup_worker(self, gpu, then_run):
+        """The single EnvSetupWorker launch site (first-run build,
+        create, repair, GPU install). ``gpu`` None honors WINMOL_GPU;
+        a bool is an explicit variant choice. ``then_run`` continues
+        into the model/run chain on success. Every caller holds
+        _setup_running before this is reached, so a live setup_thread
+        is never reassigned."""
+        self._setup_then_run = bool(then_run)
         self.setup_thread = QThread()
-        self.setup_worker = EnvSetupWorker(plugin_dir)
+        self.setup_worker = EnvSetupWorker(
+            os.path.dirname(__file__), gpu=gpu)
         self.setup_worker.moveToThread(self.setup_thread)
         self.setup_thread.started.connect(self.setup_worker.run)
-        self.setup_worker.log.connect(self.update_output_log)
+        self.setup_worker.log.connect(self._on_setup_log)
         self.setup_worker.done.connect(self._on_env_setup_done)
         self.setup_worker.failed.connect(self._on_env_setup_failed)
         self.setup_worker.done.connect(self.setup_thread.quit)
@@ -702,12 +1120,35 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self._setup_running = False
         self.python_exe = python_exe
         self.env["status"] = "ready"
+        self.env["python"] = python_exe
+        self.env["message"] = ""
+        self._venv_bytes = None      # the build changed the tree
+        if self._cancel_requested and self._setup_then_run:
+            self._cancel_requested = False
+            self._set_busy_ui(False)
+            self.update_output_log("Run cancelled.")
+            self._refresh_setup_tab()
+            return
         self.update_output_log("WINMOL environment ready.")
-        self._resolve_model_and_start(python_exe)
+        self._set_setup_status("Environment ready.")
+        if self._setup_then_run:
+            self._refresh_setup_tab()
+            self._resolve_model_and_start(python_exe)
+        else:
+            self._set_busy_ui(False)
+            self._refresh_setup_tab()
 
     def _on_env_setup_failed(self, message):
         self._setup_running = False
+        self._set_busy_ui(False)
         self.update_output_log(f"WINMOL environment setup failed: {message}")
+        self._set_setup_status("Environment setup failed — see details.")
+        self._append_setup_detail(message)
+        # Re-resolve rather than trust the cache: a failed REPAIR has
+        # already invalidated the sentinel, so a cached "ready" would
+        # be a lie.
+        self._reresolve_env()
+        self._refresh_setup_tab()
 
     def _resolve_model_and_start(self, python_exe):
         """Ensure the selected model is present locally, then start the
@@ -723,6 +1164,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
 
         self._model_ensuring = True
         self._pending_python_exe = python_exe
+        self._set_busy_ui(True)
         self.update_output_log(
             f"Preparing model '{self._selected_model_entry.label}'..."
         )
@@ -745,13 +1187,28 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
     def _on_model_ensured(self, model_path):
         self._model_ensuring = False
         self.model_path = model_path
+        self._refresh_setup_tab()   # the file is on disk now
+        if self._cancel_requested:
+            self._cancel_requested = False
+            self._set_busy_ui(False)
+            self.update_output_log("Run cancelled.")
+            return
         self._start_analysis(self._pending_python_exe)
 
     def _on_model_ensure_failed(self, message):
         self._model_ensuring = False
+        self._set_busy_ui(False)
         self.update_output_log(f"Model download failed: {message}")
+        self._refresh_setup_tab()
 
     def _start_analysis(self, python_exe):
+        # A model download (or a previous env-setup) completing while a
+        # run is already active must not reassign self.thread over a
+        # LIVE QThread -> Qt qFatal() aborts the whole QGIS process.
+        if self._run_active:
+            self.update_output_log(
+                "A run is already active — skipping.")
+            return
         path_dirname = os.path.dirname(__file__)
         script_path = os.path.join(path_dirname, "winmol_run.py")
 
@@ -771,20 +1228,36 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         # Run this part for responsive GUI
         try:
             self.thread = QThread()
-            self.worker = Worker(command)
+            # The run command is five positional arguments; the
+            # environment is the only channel that carries a config value
+            # to the child.
+            self.worker = Worker(command, env_extra=self._batch_override_env())
             self.worker.moveToThread(self.thread)
-            self.worker.progress_signal.connect(self.update_progress)
             self.thread.started.connect(self.worker.run_process)
+            # The progress bar is driven by the pipeline's own printed
+            # counters, parsed per line in _on_worker_line.
+            self._run_progress = RunProgress(self.process_type)
+            self.worker.update_signal.connect(self._on_worker_line)
+            # layers load ONLY on success; failures surface in the log
+            # and a dialog instead of loading empty/absent layers.
+            self.worker.succeeded.connect(self._on_run_succeeded)
+            self.worker.error.connect(self.handle_process_error)
             self.worker.finished.connect(self.thread.quit)
             self.worker.finished.connect(self.worker.deleteLater)
             self.thread.finished.connect(self.thread.deleteLater)
-            self.thread.finished.connect(self.load_layers_to_session)
-            self.worker.update_signal.connect(self.update_output_log)
-            self.worker.error.connect(self.update_output_log)
+            self.thread.finished.connect(self._on_run_finished)
+            # Mark active + lock Run BEFORE starting, so a second click
+            # can't reassign self.thread (abort).
+            self._run_active = True
+            self._show_run_progress(True)
+            self._set_busy_ui(True)
             self.thread.start()
         # catch out of memory error
         except MemoryError:
-            self.worker.update_signal.disconnect(self.update_output_log)
+            self._run_active = False
+            self._show_run_progress(False)
+            self._set_busy_ui(False)
+            self.worker.update_signal.disconnect(self._on_worker_line)
             self.update_output_log(
                 "The operation ran out of memory. "
                 "Please free up some memory and "
@@ -796,17 +1269,1057 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         # Update your QPlainTextEdit with the output
         self.output_log.appendPlainText(text)
 
-    def load_layers_to_session(self):
-        """Load outputs after processing finishes.
+    def _on_worker_line(self, text):
+        """One stdout line from the running child: log it, and advance
+        the progress bar when it carries one of the pipeline's done/total
+        counters (plugin_utils.run_progress)."""
+        self.update_output_log(text)
+        if self._run_progress is None:
+            return
+        percent = self._run_progress.feed(text)
+        if percent is not None:
+            self.update_progress(percent)
 
-        Legacy output was GeoJSON:
-            (*_stems.geojson, *_nodes.geojson, *_vectors.geojson).
-        Newer versions write GeoPackage:
-            (*.gpkg) with layers: stems, nodes, vectors.
+    def handle_process_error(self, message):
+        """Show a failure instead of silently loading empty/absent layers."""
+        self.update_output_log(message)
+        try:
+            QtWidgets.QMessageBox.warning(self, "WINMOL Analyzer", message)
+        except Exception:
+            pass
 
-        This method supports both.
+    def _on_run_succeeded(self):
+        """Exit code 0: complete the bar, then load the outputs."""
+        if self._run_progress is not None:
+            self.update_progress(self._run_progress.finish(ok=True))
+        self.load_layers_to_session()
+
+    def _on_run_finished(self):
+        """Runs on thread.finished (success OR failure): clear the active
+        flag so the next run can safely build a fresh thread, and
+        re-enable the UI. Offers Export if the run produced outputs on
+        disk."""
+        self._run_active = False
+        self._run_progress = None
+        self._show_run_progress(False)
+        self._set_busy_ui(False)
+        self._refresh_setup_tab()
+        produced = any(os.path.exists(p) for p in self._last_outputs)
+        self._set_export_enabled(produced)
+        if produced and self._last_output_is_temp:
+            self.update_output_log(
+                "Outputs were written to a temp folder. Use 'Export…' to "
+                "save them to a permanent location.")
+
+    def _show_run_progress(self, on):
+        """Show the detection progress bar ONLY while a detection runs.
+
+        It lives in the persistent row below the tabs, so it is visible
+        on the Setup tab too — a confusing SECOND bar next to the Setup
+        tab's own bar during an environment build. Tied to the detection
+        run so setup jobs never show it.
         """
+        bar = getattr(self, "progress_bar", None)
+        if bar is None:
+            return
+        try:
+            if on:
+                bar.setValue(0)
+            bar.setVisible(bool(on))
+        except Exception:                          # pragma: no cover - GUI
+            pass
 
+    def _set_busy_ui(self, busy):
+        """Disable Run and every Setup control while any job owns the
+        dialog. Applied eagerly (callers set their guard flag FIRST,
+        then call this, before thread.start) so a second click cannot
+        land between the decision and the repaint. The Setup buttons
+        (and the model tree — its double-click is a download path
+        around the buttons) ride _refresh_setup_buttons, which reads
+        the same _busy_kind the guards do."""
+        try:
+            self.run_button.setEnabled(not busy)
+        except Exception:                          # pragma: no cover - GUI
+            pass
+        self._refresh_setup_buttons()
+        self._show_setup_progress(
+            busy and self._busy_kind() in ("env", "delete", "models"))
+
+    # === Setup tab =====================================================
+    #
+    # Design rules (enforced by the helpers below, in one place each):
+    #
+    # * ONE job at a time. _busy_kind() is the single predicate; every
+    #   slot refuses first, and _refresh_setup_buttons disables every
+    #   control while anything runs — including the model tree, whose
+    #   double-click is a second path into the download slot.
+    # * Nothing slow on the GUI thread. The environment snapshot comes
+    #   from the CACHED resolution (never setup_state.env_info, which
+    #   spawns interpreter probes); the venv size rides EnvRemoveWorker
+    #   dry-run pricing on its own thread; model_status.scan is
+    #   stat()-only by contract. The two sanctioned exceptions, both
+    #   subprocess-bounded and click-triggered: interpreter validation
+    #   in _setup_choose_interpreter (~1-2 s) and _reresolve_env after
+    #   a state change.
+    # * Deletion never happens from unload()/close — only from the
+    #   explicit, twice-confirmed flow below (the rr lesson: unload()
+    #   also fires on QGIS shutdown and plugin reload).
+
+    def _plugin_dir(self):
+        return os.path.dirname(__file__)
+
+    def _busy_kind(self):
+        """What owns the dialog right now: 'run' | 'env' | 'delete' |
+        'models' | None. The one predicate every guard and the button
+        interlock consult, so they cannot disagree."""
+        if self._run_active:
+            return "run"
+        if self._setup_running:
+            return "env"
+        if self._env_removing:
+            return "delete"
+        if self._models_busy or self._model_ensuring:
+            return "models"
+        return None
+
+    def _refuse_busy(self):
+        self._set_setup_status(
+            f"Cannot do that while a {self._busy_kind()} job is "
+            "running. Wait for it to finish.")
+
+    # --- small display helpers -----------------------------------------
+
+    def _set_label(self, name, text):
+        widget = getattr(self, name, None)
+        if widget is None:
+            return
+        try:
+            widget.setText(text)
+        except Exception:                          # pragma: no cover - GUI
+            pass
+
+    def _set_setup_status(self, text):
+        self._set_label("setup_status_label", text)
+
+    def _append_setup_detail(self, text):
+        widget = getattr(self, "setup_detail_log", None)
+        if widget is None:
+            return
+        try:
+            widget.appendPlainText(str(text))
+        except Exception:                          # pragma: no cover - GUI
+            pass
+
+    def _on_setup_log(self, text):
+        """Worker log lines go to both logs: the Setup tab's detail box
+        (where the job was started) and the main log (where a first-run
+        build directs the user). Both widgets cap their scrollback."""
+        self._append_setup_detail(text)
+        self.update_output_log(text)
+
+    def _show_setup_progress(self, on):
+        """The Setup tab's own bar: indeterminate while a setup job
+        runs (real progress is in the detail log), reset when idle.
+        The detection bar below the tabs is _show_run_progress's."""
+        bar = getattr(self, "setup_progress_bar", None)
+        if bar is None:
+            return
+        try:
+            if on:
+                bar.setRange(0, 0)
+            else:
+                bar.setRange(0, 100)
+                bar.setValue(0)
+        except Exception:                          # pragma: no cover - GUI
+            pass
+
+    # --- environment snapshot ------------------------------------------
+
+    def _env_info(self):
+        """EnvInfo from the CACHED resolution — self.env, refreshed by
+        worker terminal slots and _reresolve_env. setup_state.env_info
+        is deliberately NOT called here: it re-runs interpreter probes
+        and walks the venv for its size, both banned on the GUI thread.
+        The size comes from the pricing cache instead (0 = unknown or
+        empty; env_detail_text simply omits it)."""
+        venv_path = self.venv_path \
+            or installer.venv_location(self._plugin_dir())
+        exe = self.python_exe
+        return setup_state.EnvInfo(
+            status=self.env.get("status") or "needs_setup",
+            python=exe,
+            venv_path=venv_path,
+            managed=bool(exe) and installer.path_is_inside(exe, venv_path),
+            variant=installer.installed_variant(venv_path),
+            venv_bytes=int(self._venv_bytes or 0),
+            message=self.env.get("message") or "",
+        )
+
+    def _reresolve_env(self):
+        """Synchronously re-run resolve_environment(build=False) into
+        the cache. Sub-second without a configured interpreter; a few
+        seconds worst case with one (two subprocess probes) — accepted
+        on a click / worker completion, same rule as choose."""
+        self.env = installer.resolve_environment(
+            self._plugin_dir(), build=False)
+        self.venv_path = self.env.get("venv_path") or self.venv_path
+        self.python_exe = self.env.get("python")
+        self.models_dir = os.path.join(
+            os.path.dirname(self.venv_path), "models")
+        self._venv_bytes = None     # stale after any env change
+
+    def _gpu_probe_cached(self):
+        """gpu_probe.probe() once per dialog, bounded to 2 s (vs the
+        module's 8 s default) because it runs on the GUI thread. GPUs
+        do not appear mid-session; reopening the dialog re-probes."""
+        if self._gpu_probe is None:
+            self._gpu_probe = gpu_probe.probe(timeout=2.0)
+        return self._gpu_probe
+
+    def _model_device(self):
+        """Which device rule marks the default model row. Mirrors
+        model_registry.detect_device (WINMOL_DEVICE override, Apple
+        Silicon, NVIDIA probe) but rides the dialog's cached 2 s-bounded
+        probe instead of detect_device's own 20 s nvidia-smi call —
+        this feeds every Setup-tab refresh on the GUI thread."""
+        if self._device is None:
+            forced = os.environ.get("WINMOL_DEVICE", "").strip().lower()
+            if forced in ("cpu", "gpu", "coreml"):
+                self._device = forced
+            elif (platform.system() == "Darwin"
+                    and platform.machine() == "arm64"):
+                self._device = "coreml"
+            else:
+                self._device = (
+                    "gpu" if self._gpu_probe_cached().present else "cpu")
+        return self._device
+
+    # --- the single repaint entry point --------------------------------
+
+    def _refresh_setup_tab(self):
+        """Recompute everything the Setup tab (and the Detection-tab
+        banners) display. Called on tab switch and from every worker's
+        terminal slot; cheap by the section's rules above."""
+        if not getattr(self, "_setup_live", False):
+            return
+        info = self._env_info()
+        self._set_label("env_state_label", setup_state.env_state_text(info))
+        self._set_label("env_path_label", info.python or "")
+        self._set_label("env_detail_label",
+                        setup_state.env_detail_text(info))
+        self._set_label("env_location_label", setup_state.env_location_text(
+            self._plugin_dir(), info.venv_bytes))
+        self._set_label("env_accel_label", self._accel_text(info))
+        self._model_rows = self._scan_models()
+        self._refresh_model_tree()      # ...ends in the button interlock
+        self._apply_blocking_reason(info)
+        self._maybe_start_size_pricing()
+
+    def _apply_blocking_reason(self, info):
+        """The Detection-tab banner, the idle-GPU nudge and the Step-3
+        line all derive from one string so they cannot disagree.
+        Deliberately NOT wired to run_button.setEnabled: the Detection
+        tab's own validation (CRS check, _run_active) owns that, and
+        two owners fighting over one button is an rr-era bug class."""
+        busy = self._busy_kind() in ("env", "delete", "models")
+        reason = setup_state.blocking_reason(info, busy=busy)
+        banner = getattr(self, "setup_banner_widget", None)
+        if banner is not None:
+            try:
+                banner.setVisible(reason is not None)
+            except Exception:                      # pragma: no cover - GUI
+                pass
+        self._set_label("setup_banner_label", reason or "")
+        self._apply_accel_nudge(info, reason)
+        self._set_label("setup_ready_label", reason or self._ready_text())
+
+    def _apply_accel_nudge(self, info, reason):
+        """The idle-GPU hint on the Detection tab: shown only when
+        nothing more urgent is on screen, the managed venv is CPU-only,
+        and a usable NVIDIA GPU is present. Everyone else sees
+        nothing."""
+        show = (reason is None and info.managed
+                and (info.variant or "cpu") != "gpu"
+                and self._gpu_probe_cached().present)
+        widget = getattr(self, "accel_banner_widget", None)
+        if widget is not None:
+            try:
+                widget.setVisible(bool(show))
+            except Exception:                      # pragma: no cover - GUI
+                pass
+        text = ""
+        if show:
+            text = (f"{self._gpu_probe_cached().label} is idle — the "
+                    "detection runs on the CPU runtime.")
+        self._set_label("accel_banner_label", text)
+
+    def _ready_text(self):
+        row = next((r for r in self._model_rows if r.is_default), None)
+        if row is None:
+            return "Environment ready."
+        state = ("installed" if row.installed
+                 else "downloaded automatically on the first run")
+        return f"Environment ready. Default model '{row.label}' is {state}."
+
+    def _accel_text(self, info):
+        """One line about which processor will run the detection."""
+        if not setup_state.env_ready(info):
+            return ("Which processor runs the detection is decided once "
+                    "the environment exists.")
+        if not info.managed:
+            return ("Using your own interpreter — WINMOL does not manage "
+                    "its runtime.")
+        if info.variant == "gpu":
+            return "GPU runtime installed (onnxruntime-gpu)."
+        probe = self._gpu_probe_cached()
+        if probe.present:
+            return (f"{probe.label} detected — the environment uses the "
+                    "CPU runtime. 'Install GPU runtime…' switches it.")
+        return "CPU runtime (no usable NVIDIA GPU was found)."
+
+    # --- venv size pricing (lazy, off-thread) ---------------------------
+
+    def _maybe_start_size_pricing(self):
+        """Fill the size cache when stale. EnvRemoveWorker's dry run
+        walks the venv with the exact code path a real deletion prices
+        with, and emits ``priced`` without deleting anything. Passive:
+        refuses to start while any job runs, and its result is dropped
+        if a job started in the meantime (the job's terminal slot
+        re-stales the cache anyway)."""
+        if (self._venv_bytes is not None or self._pricing
+                or self._busy_kind() is not None):
+            return
+        venv = self.venv_path or installer.venv_location(self._plugin_dir())
+        if not os.path.isdir(venv):
+            self._venv_bytes = 0
+            return
+        self._pricing = True
+        self.price_thread = QThread()
+        self.price_worker = EnvRemoveWorker(
+            self._plugin_dir(), dry_run=True)
+        self.price_worker.moveToThread(self.price_thread)
+        self.price_thread.started.connect(self.price_worker.run)
+        self.price_worker.priced.connect(self._on_size_priced)
+        self.price_worker.failed.connect(self._on_size_price_failed)
+        self.price_worker.priced.connect(self.price_thread.quit)
+        self.price_worker.failed.connect(self.price_thread.quit)
+        self.price_worker.priced.connect(self.price_worker.deleteLater)
+        self.price_worker.failed.connect(self.price_worker.deleteLater)
+        self.price_thread.finished.connect(self.price_thread.deleteLater)
+        self.price_thread.start()
+
+    def _on_size_priced(self, plan):
+        self._pricing = False
+        if self._busy_kind() is not None:
+            return          # a job started mid-walk; it re-prices after
+        self._venv_bytes = int(plan.get("freed_bytes") or 0)
+        self._refresh_setup_tab()
+
+    def _on_size_price_failed(self, message):
+        self._pricing = False
+        self._venv_bytes = 0
+        self._append_setup_detail(
+            f"Could not measure the environment size: {message}")
+
+    # --- the button interlock -------------------------------------------
+
+    def _refresh_setup_buttons(self, *_args):
+        """Apply the interlock — the ONLY caller of setEnabled on a
+        Setup control. setup_state.button_states is the authority for
+        the buttons it knows; the few it does not cover (repair / GPU /
+        open-folder / go-to-detection, and the tree + checkbox inputs)
+        are derived here from the same EnvInfo and the same busy rule:
+        while anything runs, everything is off."""
+        if not getattr(self, "_setup_live", False):
+            return
+        info = self._env_info()
+        busy = self._busy_kind() is not None
+        states = setup_state.button_states(
+            info, self._model_rows, self._selected_entry_id(), busy=busy)
+        # run_button belongs to the Detection tab's validation, see
+        # _apply_blocking_reason.
+        states.pop("run_button", None)
+        idle = not busy
+        states.update({
+            "env_repair_button": idle and (
+                info.managed or os.path.isdir(info.venv_path)),
+            "env_gpu_button": idle and info.managed
+            and (info.variant or "cpu") != "gpu"
+            and self._gpu_probe_cached().present,
+            "env_open_folder_button": idle,
+            "models_open_folder_button": idle,
+            "setup_go_detect_button": idle and setup_state.env_ready(info),
+            "models_treeWidget": idle,
+            "models_variants_checkBox": idle,
+        })
+        for name, on in states.items():
+            widget = getattr(self, name, None)
+            if widget is None:
+                continue
+            try:
+                widget.setEnabled(bool(on))
+            except Exception:                      # pragma: no cover - GUI
+                pass
+
+    # --- model tree -----------------------------------------------------
+
+    def _scan_models(self):
+        """stat()-only snapshot; safe on the GUI thread by
+        model_status.scan's contract (never hashes, never networks)."""
+        try:
+            return model_status.scan(self.config_path, self.models_dir,
+                                     device=self._model_device())
+        except Exception as exc:
+            self._append_setup_detail(
+                f"Could not read the model registry: {exc}")
+            return []
+
+    def _preferred_entry_ids(self):
+        """One entry id per family: what registry.resolve picks for
+        this device — the same resolution a run would use."""
+        ids = set()
+        if self.registry is None:
+            return ids
+        for fam_id in self.registry.families:
+            try:
+                ids.add(self.registry.resolve(
+                    fam_id, device=self._model_device()).id)
+            except Exception:
+                pass
+        return ids
+
+    def _visible_rows(self):
+        """The tree's row filter. Checked ("Show all precision
+        variants"): everything. Unchecked (default): per family the
+        device-preferred variant, plus the default row and every
+        INSTALLED file — bytes on disk are never hidden. A registry
+        without families (schema 1) has no variants to fold away."""
+        checkbox = getattr(self, "models_variants_checkBox", None)
+        if checkbox is not None and checkbox.isChecked():
+            return list(self._model_rows)
+        if self.registry is None or not self.registry.families:
+            return list(self._model_rows)
+        preferred = self._preferred_entry_ids()
+        return [row for row in self._model_rows
+                if row.installed or row.is_default
+                or row.entry_id in preferred]
+
+    def _refresh_model_tree(self, *_args):
+        """Repaint the model tree (keeping the selection), the summary
+        line and the folder line, then re-derive the buttons — the
+        variants toggle can drop the selection, and buttons enabled for
+        a row that no longer exists click into nothing."""
+        tree = getattr(self, "models_treeWidget", None)
+        if tree is not None:
+            selected = self._selected_entry_id()
+            try:
+                tree.blockSignals(True)
+                tree.clear()
+                for row in self._visible_rows():
+                    item = QtWidgets.QTreeWidgetItem(tree, [
+                        row.label,
+                        self._precision_text(row),
+                        self._model_size_text(row),
+                        self._model_state_text(row),
+                    ])
+                    item.setData(0, Qt.UserRole, row.entry_id)
+                    if row.entry_id == selected:
+                        tree.setCurrentItem(item)
+            except Exception:                      # pragma: no cover - GUI
+                pass
+            finally:
+                try:
+                    tree.blockSignals(False)
+                except Exception:                  # pragma: no cover - GUI
+                    pass
+        self._set_label("models_summary_label",
+                        setup_state.models_summary_text(self._model_rows))
+        self._set_label("models_dir_label", self.models_dir)
+        self._refresh_setup_buttons()
+
+    @staticmethod
+    def _precision_text(row):
+        text = {"fp16": "fp16 (GPU)", "int8": "int8 (CPU)"}.get(
+            row.precision, row.precision)
+        return f"{text} — default here" if row.is_default else text
+
+    @staticmethod
+    def _model_size_text(row):
+        if row.installed:
+            return setup_state.human_bytes(row.bytes_on_disk)
+        if row.size_mb:
+            return f"{row.size_mb:.1f} MB"
+        return ""
+
+    @staticmethod
+    def _model_state_text(row):
+        return "installed" if row.installed else "not downloaded"
+
+    def _selected_entry_id(self):
+        tree = getattr(self, "models_treeWidget", None)
+        if tree is None:
+            return None
+        item = tree.currentItem()
+        if item is None:
+            return None
+        return item.data(0, Qt.UserRole)
+
+    def _selected_model_row(self):
+        return setup_state.find_row(
+            self._model_rows, self._selected_entry_id())
+
+    # --- Step 1 slots: environment --------------------------------------
+
+    def _setup_create_env(self):
+        if self._busy_kind():
+            self._refuse_busy()
+            return
+        self._setup_running = True
+        self._set_busy_ui(True)
+        self._set_setup_status("Creating the WINMOL environment …")
+        self._append_setup_detail(
+            "Creating the environment. The first run downloads a few "
+            "hundred MB and can take several minutes; QGIS stays "
+            "usable.")
+        self._start_env_setup_worker(gpu=None, then_run=False)
+
+    def _setup_repair_env(self):
+        """Reinstall the dependencies. The variant is read BEFORE the
+        sentinel is dropped: a repair must reinstall what the user
+        chose, never silently downgrade a GPU environment to CPU. And
+        invalidating the marker first is mandatory — setup_environment
+        short-circuits on a valid sentinel, so the repair would
+        otherwise be a no-op."""
+        if self._busy_kind():
+            self._refuse_busy()
+            return
+        venv = self.venv_path or installer.venv_location(self._plugin_dir())
+        gpu = installer.installed_variant(venv) == "gpu"
+        installer.invalidate_marker(venv)
+        self._venv_bytes = None
+        self._setup_running = True
+        self._set_busy_ui(True)
+        runtime = "GPU" if gpu else "CPU"
+        self._set_setup_status(
+            f"Reinstalling the WINMOL dependencies ({runtime} runtime) …")
+        self._append_setup_detail(
+            "Reinstalling. pip can take a while on a slow link; it is "
+            "safe to leave running and QGIS stays usable.")
+        self._start_env_setup_worker(gpu=gpu, then_run=False)
+
+    def _setup_install_gpu(self):
+        """Swap the CPU inference runtime for the CUDA one, explicitly
+        confirmed — a 2 GB download is not started on the user's
+        behalf. No marker games needed: setup_environment(gpu=True)
+        sees the CPU-variant sentinel as not-ready and rebuilds, and
+        install_requirements removes the conflicting CPU runtime first
+        (installer.uninstall_conflicting_runtime — both distributions
+        provide the 'onnxruntime' module, so exactly one may exist)."""
+        if self._busy_kind():
+            self._refuse_busy()
+            return
+        probe = self._gpu_probe_cached()
+        if not probe.present:
+            self._set_setup_status(
+                probe.detail or "No usable NVIDIA GPU was found.")
+            return
+        reply = QtWidgets.QMessageBox.question(
+            self, "Install GPU runtime",
+            f"Replace the CPU inference runtime with the CUDA one for "
+            f"{probe.label}?\n\n"
+            "This downloads onnxruntime-gpu (roughly 2 GB with its CUDA "
+            "libraries) into WINMOL's environment and removes the CPU "
+            "runtime — the two cannot coexist.\n\n"
+            "'No' keeps the working CPU environment.",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No)
+        if reply != QtWidgets.QMessageBox.Yes:
+            return
+        self._venv_bytes = None
+        self._setup_running = True
+        self._set_busy_ui(True)
+        self._set_setup_status(
+            f"Installing the GPU runtime for {probe.label} …")
+        self._start_env_setup_worker(gpu=True, then_run=False)
+
+    def _setup_choose_interpreter(self):
+        """Point WINMOL at an existing interpreter. Validated HERE,
+        synchronously (~1-2 s of subprocess probes on an explicit
+        click), so a wrong pick fails with a dialog now instead of a
+        broken run later; only a valid pick is written to
+        QgsSettings."""
+        if self._busy_kind():
+            self._refuse_busy()
+            return
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Choose a Python 3.11 interpreter with WINMOL's "
+            "dependencies installed", "", "All files (*)")
+        if not file_path:
+            return
+        self._set_setup_status(f"Checking {file_path} …")
+        version = installer._python_version(file_path)
+        low, high = installer.MIN_PY, installer.MAX_PY
+        if not (low <= version <= high):
+            problem = (
+                "could not be run"
+                if version == (0, 0) else
+                f"is Python {version[0]}.{version[1]}; WINMOL needs "
+                f"{low[0]}.{low[1]}")
+            QtWidgets.QMessageBox.warning(
+                self, "WINMOL Analyzer", f"{file_path}\n\n{problem}.")
+            self._set_setup_status("Interpreter not usable.")
+            return
+        if not installer._has_compute_deps(file_path):
+            QtWidgets.QMessageBox.warning(
+                self, "WINMOL Analyzer",
+                f"{file_path}\n\nis missing WINMOL's dependencies "
+                "(onnxruntime / rasterio / geopandas). Install "
+                "requirements/cpu.txt into it first, or let WINMOL "
+                "create its own environment.")
+            self._set_setup_status("Interpreter not usable.")
+            return
+        self._save_python_setting(file_path)
+        self._reresolve_env()
+        self._set_setup_status(f"Using your interpreter: {file_path}")
+        self._refresh_setup_tab()
+
+    def _save_python_setting(self, value):
+        """Write (or, with a falsy value, forget) the configured
+        interpreter. The QgsSettings write stays in the dialog —
+        installer/setup_state remain importable without QGIS."""
+        try:
+            from qgis.core import QgsSettings
+            if value:
+                QgsSettings().setValue(
+                    installer.QSETTINGS_PYTHON_KEY, value)
+            else:
+                QgsSettings().remove(installer.QSETTINGS_PYTHON_KEY)
+        except Exception as exc:
+            self._append_setup_detail(
+                f"Could not update the interpreter setting: {exc}")
+
+    def _setup_open_env_folder(self):
+        """Open the managed root — the folder a QGIS plugin uninstall
+        leaves behind (no uninstall hook exists; env_location_label
+        says so in words, this button shows it)."""
+        self._open_folder(installer.managed_root(self._plugin_dir()))
+
+    def _setup_open_models_folder(self):
+        self._open_folder(self.models_dir, create=True)
+
+    def _open_folder(self, path, create=False):
+        try:
+            if create:
+                os.makedirs(path, exist_ok=True)
+            if not os.path.isdir(path):
+                self._set_setup_status(f"No folder yet: {path}")
+                return
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+        except Exception as exc:                   # pragma: no cover - GUI
+            self._append_setup_detail(f"Could not open {path}: {exc}")
+
+    # --- delete environment ---------------------------------------------
+    #
+    # The cycle: scope dialog -> dry-run pricing ON A WORKER (the walk
+    # is seconds on a 2 GB venv) -> itemised confirmation whose figures
+    # come from the exact code path that deletes -> removal worker.
+    # _env_removing guards the whole cycle, both workers and the modal
+    # between them.
+
+    def _setup_delete_env(self):
+        if self._busy_kind():
+            self._refuse_busy()
+            return
+        plan = setup_state.deletion_plan(
+            self._plugin_dir(), configured_exe=self.python_exe)
+        if plan["kind"] == "byo":
+            self._offer_forget_interpreter()
+            return
+        flags = self._ask_deletion_scope()
+        if flags is None:
+            return
+        plan = setup_state.deletion_plan(
+            self._plugin_dir(), configured_exe=self.python_exe, **flags)
+        if plan["kind"] == "none" or not plan["paths"]:
+            QtWidgets.QMessageBox.information(
+                self, "Delete environment", "There is nothing to delete.")
+            return
+        self._env_removing = True
+        self._deletion_flags = flags
+        self._pending_deletion = None
+        self._set_busy_ui(True)
+        self._set_setup_status("Checking what would be removed …")
+        self._start_remove_worker(dry_run=True, flags=flags)
+
+    def _ask_deletion_scope(self):
+        """A small purpose-built dialog: venv on, models off. Returns
+        the flag dict for deletion_plan/EnvRemoveWorker, or None when
+        cancelled. (No runtime checkbox: this backend builds from a
+        system Python and never downloads one.)"""
+        box = QtWidgets.QDialog(self)
+        box.setWindowTitle("Delete WINMOL environment")
+        layout = QtWidgets.QVBoxLayout(box)
+        layout.addWidget(QtWidgets.QLabel(
+            "Choose what to remove. Your own files are never touched.",
+            box))
+        note = QtWidgets.QLabel(setup_state.env_location_text(
+            self._plugin_dir(), self._venv_bytes), box)
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        venv_cb = QtWidgets.QCheckBox("Virtual environment", box)
+        venv_cb.setChecked(True)
+        models_cb = QtWidgets.QCheckBox("Downloaded models", box)
+        layout.addWidget(venv_cb)
+        layout.addWidget(models_cb)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok
+            | QtWidgets.QDialogButtonBox.Cancel, box)
+        buttons.accepted.connect(box.accept)
+        buttons.rejected.connect(box.reject)
+        layout.addWidget(buttons)
+        accepted = box.exec_() if hasattr(box, "exec_") else box.exec()
+        if not accepted:
+            return None
+        return {"remove_venv": venv_cb.isChecked(),
+                "remove_runtime": False,
+                "remove_models": models_cb.isChecked()}
+
+    def _start_remove_worker(self, dry_run, flags):
+        """Launch EnvRemoveWorker. A dry run ends on ``priced`` (its
+        thread.finished then fires the confirmation — see
+        _on_deletion_priced for why not earlier); a real removal ends
+        on ``done``. ``failed`` ends both."""
+        self.remove_thread = QThread()
+        self.remove_worker = EnvRemoveWorker(
+            self._plugin_dir(), configured_exe=self.python_exe,
+            dry_run=dry_run, **flags)
+        self.remove_worker.moveToThread(self.remove_thread)
+        self.remove_thread.started.connect(self.remove_worker.run)
+        self.remove_worker.log.connect(self._on_setup_log)
+        self.remove_worker.failed.connect(self._on_env_remove_failed)
+        self.remove_worker.failed.connect(self.remove_thread.quit)
+        self.remove_worker.failed.connect(self.remove_worker.deleteLater)
+        if dry_run:
+            self.remove_worker.priced.connect(self._on_deletion_priced)
+            self.remove_worker.priced.connect(self.remove_thread.quit)
+            self.remove_worker.priced.connect(
+                self.remove_worker.deleteLater)
+            self.remove_thread.finished.connect(
+                self._confirm_pending_deletion)
+        else:
+            self.remove_worker.done.connect(self._on_env_removed)
+            self.remove_worker.done.connect(self.remove_thread.quit)
+            self.remove_worker.done.connect(self.remove_worker.deleteLater)
+        self.remove_thread.finished.connect(self.remove_thread.deleteLater)
+        self.remove_thread.start()
+
+    def _on_deletion_priced(self, plan):
+        """Arms the confirmation only. The modal question waits for
+        thread.finished (_confirm_pending_deletion): asking here and
+        starting the real removal from the answer would build the
+        second worker while the dry-run thread is still alive."""
+        self._pending_deletion = (plan, self._deletion_flags)
+
+    def _confirm_pending_deletion(self):
+        pending, self._pending_deletion = self._pending_deletion, None
+        if pending is None:
+            return      # dry run failed; _on_env_remove_failed cleaned up
+        plan, flags = pending
+        if not flags or not self._confirm_deletion(plan, flags):
+            self._env_removing = False
+            self._set_busy_ui(False)
+            self._set_setup_status("Deletion cancelled.")
+            self._refresh_setup_tab()
+            return
+        self._set_setup_status("Removing the WINMOL environment …")
+        self._start_remove_worker(dry_run=False, flags=flags)
+
+    def _confirm_deletion(self, plan, flags):
+        lines = [f"  • {path} ({setup_state.human_bytes(size)})"
+                 for path, size in plan.get("planned", [])]
+        if not lines:
+            QtWidgets.QMessageBox.information(
+                self, "Delete environment", "There is nothing to delete.")
+            return False
+        kept = ("Downloaded models will be removed too."
+                if flags.get("remove_models") else "Your models are kept.")
+        freed = setup_state.human_bytes(plan.get("freed_bytes", 0))
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Warning)
+        box.setWindowTitle("Delete the WINMOL environment?")
+        box.setText(
+            "This removes:\n" + "\n".join(lines)
+            + f"\n\nFrees {freed}. " + kept
+            + "\nYou will have to create the environment again before "
+              "the next detection.\nThis cannot be undone.")
+        box.setStandardButtons(QtWidgets.QMessageBox.Yes
+                               | QtWidgets.QMessageBox.Cancel)
+        box.setDefaultButton(QtWidgets.QMessageBox.Cancel)
+        reply = box.exec_() if hasattr(box, "exec_") else box.exec()
+        return reply == QtWidgets.QMessageBox.Yes
+
+    def _offer_forget_interpreter(self):
+        """A bring-your-own interpreter is never deleted — the only
+        offer is to forget the setting."""
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Information)
+        box.setWindowTitle("Your own interpreter")
+        box.setText(
+            f"{self.python_exe}\n\nis your own interpreter — WINMOL did "
+            "not create it and will not delete it.\n\nYou can forget "
+            "the setting, which only makes WINMOL stop using it.")
+        forget = box.addButton("Forget this interpreter",
+                               QtWidgets.QMessageBox.AcceptRole)
+        box.addButton("Cancel", QtWidgets.QMessageBox.RejectRole)
+        box.exec_() if hasattr(box, "exec_") else box.exec()
+        if box.clickedButton() is forget:
+            self._save_python_setting(None)
+            self._reresolve_env()
+            self._set_setup_status(
+                "Forgot the configured interpreter; nothing was deleted.")
+            self._refresh_setup_tab()
+
+    def _on_env_removed(self, result):
+        """Terminal slot for the REAL removal only. Honest partial
+        reporting: failures are listed, never dressed up as success."""
+        self._env_removing = False
+        self._venv_bytes = None
+        failures = result.get("failed", [])
+        for path, message in failures:
+            self._on_setup_log(f"Could NOT remove {path}: {message}")
+        if failures:
+            removed = len(result.get("removed", []))
+            total = removed + len(failures)
+            self._set_setup_status(
+                f"{removed} of {total} items removed — close QGIS and "
+                "delete the rest manually.")
+        else:
+            freed = setup_state.human_bytes(result.get("freed_bytes", 0))
+            self._set_setup_status(f"Environment removed ({freed} freed).")
+            self.update_output_log(
+                f"WINMOL environment removed ({freed} freed).")
+        # Cleared even on partial failure: the plugin must never keep
+        # pointing into a half-deleted venv.
+        if result.get("clear_setting"):
+            self._save_python_setting(None)
+        self._reresolve_env()
+        self._set_busy_ui(False)
+        self._go_to_setup()
+        self._refresh_setup_tab()
+
+    def _on_env_remove_failed(self, message):
+        self._env_removing = False
+        self._pending_deletion = None
+        self._venv_bytes = None
+        self._set_busy_ui(False)
+        self._set_setup_status(f"Environment removal failed: {message}")
+        self._append_setup_detail(message)
+        self._refresh_setup_tab()
+
+    # --- Step 2 slots: models -------------------------------------------
+
+    def _setup_rescan(self):
+        if self._busy_kind():
+            self._refuse_busy()
+            return
+        self._venv_bytes = None     # an honest rescan re-prices too
+        self._set_setup_status("Rescanned.")
+        self._refresh_setup_tab()
+
+    def _setup_download_selected(self, *_args):
+        # itemDoubleClicked lands here too (item, column absorbed by
+        # *_args) — same guard as the button, so no signal path gets
+        # around the interlock.
+        if self._busy_kind():
+            self._refuse_busy()
+            return
+        row = self._selected_model_row()
+        entry = (self.registry.entries.get(row.entry_id)
+                 if row is not None and self.registry is not None
+                 else None)
+        if entry is None:
+            self._set_setup_status("Select a model first.")
+            return
+        self._start_model_download(entry)
+
+    def _setup_download_default(self):
+        if self._busy_kind():
+            self._refuse_busy()
+            return
+        try:
+            entry = self.registry.default_entry(self._model_device())
+        except Exception:
+            entry = None
+        if entry is None:
+            self._set_setup_status("No default model for this machine.")
+            return
+        self._start_model_download(entry)
+
+    def _start_model_download(self, entry):
+        self._models_busy = True
+        self._start_model_job(
+            ModelEnsureWorker(entry, self.models_dir),
+            f"Downloading {entry.label} …",
+            self._on_model_downloaded)
+
+    def _on_model_downloaded(self, model_path):
+        self._models_busy = False
+        self._set_setup_status(f"Model ready: {model_path}")
+        self._set_busy_ui(False)
+        self._refresh_setup_tab()
+
+    def _setup_verify_all(self):
+        """Checksum every pinned model file on disk (worker-thread
+        territory — hashing a 100 MB file is not a click-time cost)."""
+        if self._busy_kind():
+            self._refuse_busy()
+            return
+        self._models_busy = True
+        self._start_model_job(
+            ModelMaintenanceWorker(
+                "verify-all", self.config_path, self.models_dir,
+                device=self._model_device()),
+            "Verifying model checksums …",
+            self._on_model_maintenance_done)
+
+    def _setup_delete_model(self):
+        if self._busy_kind():
+            self._refuse_busy()
+            return
+        row = self._selected_model_row()
+        if row is None or not row.installed:
+            self._set_setup_status("Select an installed model first.")
+            return
+        note = ""
+        if row.is_default:
+            note = ("\n\nThis is the default model for this machine; "
+                    "the next run will download it again.")
+        freed = setup_state.human_bytes(row.bytes_on_disk)
+        reply = QtWidgets.QMessageBox.question(
+            self, "Delete model",
+            f"Delete {row.file}?\n\n{freed} will be freed from:\n"
+            f"{row.path}{note}",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel,
+            QtWidgets.QMessageBox.Cancel)
+        if reply != QtWidgets.QMessageBox.Yes:
+            return
+        self._models_busy = True
+        # Off-thread deliberately: an unlink on an SMB home directory
+        # or a Windows-locked file blocks for seconds.
+        self._start_model_job(
+            ModelMaintenanceWorker(
+                "delete", self.config_path, self.models_dir,
+                entry_ids=[row.entry_id], device=self._model_device()),
+            f"Deleting {row.file} …",
+            self._on_model_maintenance_done)
+
+    def _start_model_job(self, worker, status, done_slot):
+        """The single launch site for Setup-tab model jobs (both worker
+        types share the log/done/failed signal shape). The caller set
+        _models_busy first, so a live maint_thread is never
+        reassigned."""
+        self._set_busy_ui(True)
+        self._set_setup_status(status)
+        self._append_setup_detail(status)
+        self.maint_thread = QThread()
+        self.maint_worker = worker
+        worker.moveToThread(self.maint_thread)
+        self.maint_thread.started.connect(worker.run)
+        worker.log.connect(self._on_setup_log)
+        worker.done.connect(done_slot)
+        worker.failed.connect(self._on_model_job_failed)
+        worker.done.connect(self.maint_thread.quit)
+        worker.failed.connect(self.maint_thread.quit)
+        worker.done.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        self.maint_thread.finished.connect(self.maint_thread.deleteLater)
+        self.maint_thread.start()
+
+    def _on_model_maintenance_done(self, result):
+        self._models_busy = False
+        action = result.get("action", "")
+        ok = result.get("ok") or []
+        failed = result.get("failed") or []
+        for entry_id, message in failed:
+            self._on_setup_log(f"{entry_id}: {message}")
+        if action == "verify-all":
+            if failed:
+                self._set_setup_status(
+                    f"Verification FAILED for {len(failed)} file(s) — "
+                    "corrupt files should be deleted and downloaded "
+                    "again.")
+            elif ok:
+                self._set_setup_status(
+                    f"Verification passed for {len(ok)} file(s).")
+            else:
+                self._set_setup_status(
+                    "No pinned model files on disk to verify.")
+        elif action == "delete":
+            status = f"Deleted {len(ok)} model file(s)."
+            if failed:
+                status += " Some could not be deleted — see details."
+            self._set_setup_status(status)
+        else:
+            self._set_setup_status("Model maintenance finished.")
+        self._set_busy_ui(False)
+        self._refresh_setup_tab()
+
+    def _on_model_job_failed(self, message):
+        self._models_busy = False
+        self._set_setup_status(f"Model operation failed: {message}")
+        self._append_setup_detail(message)
+        self._set_busy_ui(False)
+        self._refresh_setup_tab()
+
+    def _set_export_enabled(self, on):
+        btn = getattr(self, "export_button", None)
+        if btn is not None:
+            try:
+                btn.setEnabled(bool(on))
+            except Exception:
+                pass
+
+    def export_results(self):
+        """Copy the last run's outputs (stem map + any gpkg) to a folder
+        the user chooses. Lets runs default to a temp dir yet still be
+        saved."""
+        import shutil
+        outputs = [p for p in self._last_outputs if os.path.exists(p)]
+        if not outputs:
+            QtWidgets.QMessageBox.information(
+                self, "WINMOL Analyzer",
+                "No results to export yet. Run an analysis first.")
+            return
+        target_dir = QFileDialog.getExistingDirectory(
+            self, "Export results to folder", "")
+        if not target_dir:
+            return
+        copied = []
+        for src in outputs:
+            try:
+                dst = os.path.join(target_dir, os.path.basename(src))
+                shutil.copy2(src, dst)
+                copied.append(dst)
+                # bring along a sidecar stats file if the raster has one
+                sidecar = src + ".aux.xml"
+                if os.path.exists(sidecar):
+                    shutil.copy2(sidecar, dst + ".aux.xml")
+            except Exception as exc:
+                self.update_output_log(f"Export failed for {src}: {exc}")
+        if copied:
+            self.update_output_log("Exported:\n" + "\n".join(copied))
+            QtWidgets.QMessageBox.information(
+                self, "WINMOL Analyzer",
+                f"Exported {len(copied)} file(s) to:\n{target_dir}")
+
+    def load_layers_to_session(self):
+        """Load outputs after a successful run.
+
+        The stem map raster always; the GeoPackage layers per the output
+        checkboxes (Trees: stems; Nodes: stems + vectors + nodes,
+        computed as one list so a layer is never added twice when both
+        products are selected).
+        """
         print("Loading output layers into QGIS session...")
         self.load_raster(self.stem_path)
         gpkg = self._resolve_output_gpkg(self.trees_path)
@@ -815,13 +2328,12 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             print("No output GeoPackage found; skipping vector layer loading.")
             return
 
-        # Trees output: stems only
-        if self.output_checkBox_trees.isChecked():
-            self.load_gpkg_layers(gpkg, ["stems"])
-
-        # Nodes output: stems + nodes + vectors
-        if self.output_checkBox_nodes.isChecked():
-            self.load_gpkg_layers(gpkg, ["stems", "vectors", "nodes"])
+        layers = gpkg_layers_for(
+            self.output_checkBox_trees.isChecked(),
+            self.output_checkBox_nodes.isChecked(),
+        )
+        if layers:
+            self.load_gpkg_layers(gpkg, layers)
 
     def _resolve_output_gpkg(self, path_prefix: str):
         """Return an existing output GeoPackage path for a given prefix.
@@ -880,21 +2392,15 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         QgsProject.instance().addMapLayer(raster_layer)
         print(f"Raster layer loaded successfully from {path}")
 
-    def load_geojson(self, path):
-        # Extract the base name of the input image file
-        name = os.path.splitext(os.path.basename(path))[0]
-        # Load vector layer
-        vector_layer = QgsVectorLayer(path, name, "ogr")
-        if not vector_layer.isValid():
-            print(f"Error loading vector layer from {path}")
-        else:
-            # Add the vector layer to the map
-            QgsProject.instance().addMapLayer(vector_layer)
-
     def update_progress(self, value):
         self.progress_bar.setValue(value)
 
     def check_swap_memory(self):
+        # psutil is optional in QGIS's Python (see the guarded import at
+        # the top); without it, just skip the advisory rather than raising
+        # AttributeError on top of the MemoryError that got us here.
+        if psutil is None:
+            return
         swap = psutil.swap_memory()
         ram = psutil.virtual_memory()
 

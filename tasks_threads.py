@@ -1,6 +1,8 @@
 """GUI-thread-off workers for the WINMOL plugin: running the compute
-child process, and (first run only) building the compute environment.
+child process, building/removing the compute environment, and bulk
+model maintenance.
 """
+import os
 import subprocess
 import sys
 
@@ -12,10 +14,17 @@ from PyQt5.QtCore import (
 from .plugin_utils.childenv import child_env, safe_child_cwd
 from .plugin_utils.installer import (
     gpu_requested,
+    path_is_inside,
+    remove_environment,
     setup_environment,
     venv_location,
 )
-from .plugin_utils.model_registry import ensure_model
+from .plugin_utils.model_registry import (
+    ensure_model,
+    load_registry,
+    local_path,
+    verify_file,
+)
 
 
 class Worker(QObject):
@@ -103,23 +112,30 @@ class Worker(QObject):
 class EnvSetupWorker(QObject):
     """Builds the WINMOL compute environment off the GUI thread:
     creates the managed venv and pip-installs requirements/cpu.txt —
-    or gpu.txt when WINMOL_GPU=1 opts into the CUDA runtime
-    (idempotent via the sentinel, see plugin_utils/installer.py).
-    Keeps QGIS responsive during a multi-minute first-run install."""
+    or gpu.txt for the CUDA runtime (idempotent via the sentinel, see
+    plugin_utils/installer.py). Keeps QGIS responsive during a
+    multi-minute first-run install.
+
+    ``gpu`` selects the runtime variant: ``None`` (default) honors the
+    WINMOL_GPU env var (``installer.gpu_requested``), the pre-Setup-tab
+    opt-in; ``True``/``False`` is the Setup tab's explicit choice
+    (Install GPU runtime / repair-preserving-variant)."""
 
     log = pyqtSignal(str)
     done = pyqtSignal(str)      # interpreter path on success
     failed = pyqtSignal(str)    # error message
 
-    def __init__(self, plugin_dir):
+    def __init__(self, plugin_dir, gpu=None):
         super().__init__()
         self.plugin_dir = plugin_dir
+        self.gpu = gpu
 
     def run(self):
+        gpu = gpu_requested() if self.gpu is None else bool(self.gpu)
         try:
             info = setup_environment(
                 venv_location(self.plugin_dir), progress=self.log.emit,
-                gpu=gpu_requested())
+                gpu=gpu)
             self.done.emit(info["python"])
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -156,3 +172,130 @@ class ModelEnsureWorker(QObject):
             self.done.emit(path)
         except Exception as exc:
             self.failed.emit(str(exc))
+
+
+class EnvRemoveWorker(QObject):
+    """Prices and removes the managed environment off the GUI thread
+    (installer.remove_environment, which refuses anything outside the
+    managed tree). Always emits ``priced`` first — the SAME code path
+    that deletes produces the "frees N GB" figure — then, unless
+    constructed with ``dry_run=True``, performs the removal."""
+
+    log = pyqtSignal(str)
+    priced = pyqtSignal(dict)   # remove_environment(dry_run=True) result
+    done = pyqtSignal(dict)     # remove_environment() result
+    failed = pyqtSignal(str)    # unexpected error message
+
+    def __init__(self, plugin_dir, remove_venv=True, remove_runtime=False,
+                 remove_models=False, configured_exe=None, dry_run=False):
+        super().__init__()
+        self.plugin_dir = plugin_dir
+        self.dry_run = dry_run
+        self.kwargs = dict(remove_venv=remove_venv,
+                           remove_runtime=remove_runtime,
+                           remove_models=remove_models,
+                           configured_exe=configured_exe)
+
+    def run(self):
+        try:
+            plan = remove_environment(self.plugin_dir, dry_run=True,
+                                      **self.kwargs)
+            self.priced.emit(plan)
+            if self.dry_run:
+                return
+            result = remove_environment(self.plugin_dir,
+                                        progress=self.log.emit,
+                                        **self.kwargs)
+            self.done.emit(result)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class ModelMaintenanceWorker(QObject):
+    """Bulk model maintenance off the GUI thread. ``action`` is one of
+    ``download-all-recommended`` (ensure_model for the registry's
+    recommended list), ``verify-all`` (checksum every pinned file on
+    disk) or ``delete`` (remove ``entry_ids``' files under models_dir).
+    Emits ``done({'action', 'ok': [id], 'failed': [(id, msg)]})``."""
+
+    log = pyqtSignal(str)
+    done = pyqtSignal(dict)     # summary
+    failed = pyqtSignal(str)    # error message
+
+    ACTIONS = ("download-all-recommended", "verify-all", "delete")
+
+    def __init__(self, action, config_path, models_dir, entry_ids=None,
+                 device="auto"):
+        super().__init__()
+        self.action = action
+        self.config_path = config_path
+        self.models_dir = models_dir
+        self.entry_ids = list(entry_ids or [])
+        self.device = device
+
+    def run(self):
+        try:
+            if self.action not in self.ACTIONS:
+                raise ValueError(f"unknown action: {self.action}")
+            registry = load_registry(self.config_path)
+            handler = {"download-all-recommended": self._download_all,
+                       "verify-all": self._verify_all,
+                       "delete": self._delete}[self.action]
+            self.done.emit(handler(registry))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+    def _summary(self, ok, failed):
+        return {"action": self.action, "ok": ok, "failed": failed}
+
+    def _recommended(self, registry):
+        """Device-resolved recommended entries, deduplicated."""
+        ids = registry.recommended or []
+        entries, seen = [], set()
+        for mid in ids:
+            entry = registry.resolve(mid, device=self.device)
+            if entry.id not in seen:
+                seen.add(entry.id)
+                entries.append(entry)
+        return entries or [registry.default_entry(self.device)]
+
+    def _download_all(self, registry):
+        ok, failed = [], []
+        for entry in self._recommended(registry):
+            self.log.emit(f"Fetching {entry.label} …")
+            try:
+                ensure_model(entry, self.models_dir)
+                ok.append(entry.id)
+            except Exception as exc:
+                failed.append((entry.id, str(exc)))
+        return self._summary(ok, failed)
+
+    def _verify_all(self, registry):
+        ok, failed = [], []
+        for entry in registry.entries.values():
+            path = local_path(entry, self.models_dir)
+            if not os.path.exists(path) or not entry.sha256:
+                continue
+            self.log.emit(f"Verifying {entry.file} …")
+            if verify_file(path, entry.sha256):
+                ok.append(entry.id)
+            else:
+                failed.append((entry.id, "checksum mismatch"))
+        return self._summary(ok, failed)
+
+    def _delete(self, registry):
+        ok, failed = [], []
+        for eid in self.entry_ids:
+            try:
+                path = local_path(registry.get(eid), self.models_dir)
+                if not path_is_inside(path, self.models_dir):
+                    failed.append(
+                        (eid, "refused: outside the models directory"))
+                    continue
+                for victim in (path, path + ".part"):
+                    if os.path.exists(victim):
+                        os.remove(victim)
+                ok.append(eid)
+            except Exception as exc:
+                failed.append((eid, str(exc)))
+        return self._summary(ok, failed)
