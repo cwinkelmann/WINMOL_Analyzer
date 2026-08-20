@@ -5,6 +5,8 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import List
 
+from plugin_utils import container
+
 
 @dataclass
 class HardwareInfo:
@@ -16,7 +18,11 @@ class HardwareInfo:
 
     @classmethod
     def detect(cls) -> "HardwareInfo":
-        cpu_count = os.cpu_count() or 1
+        # Container-aware: inside a cgroup these must report what THIS
+        # process may use, not what the host has. Sizing the vector pool
+        # and prediction batch from host RAM inside `--memory=8g` is an
+        # OOM kill (see plugin_utils/container).
+        cpu_count = container.cpu_count()
         total_ram_gb = cls._detect_total_ram_gb()
         gpu_names = cls._detect_gpu_names_nvidia_smi()
         gpu_memory_gb = cls._detect_gpu_memory_gb_nvidia_smi()
@@ -44,8 +50,8 @@ class HardwareInfo:
     @staticmethod
     def _detect_total_ram_gb() -> float:
         try:
-            import psutil
-            return round(psutil.virtual_memory().total / (1024 ** 3), 2)
+            return round(
+                container.total_memory_bytes() / (1024 ** 3), 2)
         except Exception:
             return 0.0
 

@@ -38,7 +38,9 @@ def stub_onnx_segmenter(monkeypatch):
     return calls, FakeOnnxSegmenter
 
 
-def test_onnx_path_dispatches_to_onnx_segmenter(stub_onnx_segmenter):
+def test_onnx_path_dispatches_to_onnx_segmenter(stub_onnx_segmenter,
+                                                monkeypatch):
+    monkeypatch.setenv("WINMOL_BENCH_READ", "overview")
     calls, FakeOnnxSegmenter = stub_onnx_segmenter
     model = IO.load_model_from_path("/models/deeplabv3plus.onnx")
     assert isinstance(model, FakeOnnxSegmenter)
@@ -46,7 +48,8 @@ def test_onnx_path_dispatches_to_onnx_segmenter(stub_onnx_segmenter):
     assert hasattr(model, "predict_on_batch")
 
 
-def test_onnx_extension_is_case_insensitive(stub_onnx_segmenter):
+def test_onnx_extension_is_case_insensitive(stub_onnx_segmenter, monkeypatch):
+    monkeypatch.setenv("WINMOL_BENCH_READ", "overview")
     calls, FakeOnnxSegmenter = stub_onnx_segmenter
     model = IO.load_model_from_path("/models/MODEL.ONNX")
     assert isinstance(model, FakeOnnxSegmenter)
@@ -78,9 +81,11 @@ def test_non_onnx_model_raises_converter_naming_error(model_path):
     assert ("tensorflow" in sys.modules) == tf_loaded_before
 
 
-def test_tensorflow_never_imported_by_dispatch(stub_onnx_segmenter):
+def test_tensorflow_never_imported_by_dispatch(stub_onnx_segmenter,
+                                               monkeypatch):
     """Belt-and-suspenders: after exercising every load_model_from_path
     branch above, TensorFlow must still be absent from sys.modules."""
+    monkeypatch.setenv("WINMOL_BENCH_READ", "overview")
     IO.load_model_from_path("/models/deeplabv3plus.onnx")
     with pytest.raises(RuntimeError):
         IO.load_model_from_path("/models/legacy.hdf5")

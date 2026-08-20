@@ -2272,6 +2272,12 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.models_dir = os.path.join(
             os.path.dirname(self.venv_path), "models")
         self._venv_bytes = None     # stale after any env change
+        # _model_device now reads the venv's runtime variant, and
+        # installing the GPU runtime changes it mid-session -- so the
+        # cached verdict (and the model precision it selects) is stale
+        # here too. The card probe behind it stays cached; GPUs do not
+        # appear mid-session, runtimes do.
+        self._device = None
 
     def _gpu_probe_cached(self):
         """gpu_probe.probe() once per dialog, bounded to 2 s (vs the
@@ -2286,7 +2292,14 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         model_registry.detect_device (WINMOL_DEVICE override, Apple
         Silicon, NVIDIA probe) but rides the dialog's cached 2 s-bounded
         probe instead of detect_device's own 20 s nvidia-smi call —
-        this feeds every Setup-tab refresh on the GUI thread."""
+        this feeds every Setup-tab refresh on the GUI thread.
+
+        A present card is NOT enough for a "gpu" verdict: the managed
+        venv is CPU-only unless the user installed the GPU runtime, and
+        the verdict picks the model PRECISION (fp16 for gpu, int8 for
+        cpu). Judging by the card alone handed every default install on
+        an NVIDIA box the fp16 variant it cannot accelerate. The
+        sentinel read is pure file I/O, so it stays GUI-thread safe."""
         if self._device is None:
             forced = os.environ.get("WINMOL_DEVICE", "").strip().lower()
             if forced in ("cpu", "gpu", "coreml"):
@@ -2294,9 +2307,18 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             elif (platform.system() == "Darwin"
                     and platform.machine() == "arm64"):
                 self._device = "coreml"
+            elif not self._gpu_probe_cached().present:
+                self._device = "cpu"
             else:
+                venv = self.venv_path or installer.venv_location(
+                    self._plugin_dir())
+                variant = installer.installed_variant(venv)
+                # No sentinel yet (env not built) -> trust the card, so a
+                # first run still offers the GPU model it is about to be
+                # able to use.
                 self._device = (
-                    "gpu" if self._gpu_probe_cached().present else "cpu")
+                    "cpu" if variant is not None and variant != "gpu"
+                    else "gpu")
         return self._device
 
     # --- the single repaint entry point --------------------------------
@@ -2843,8 +2865,8 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         if not installer._has_compute_deps(file_path):
             reply = QtWidgets.QMessageBox.question(
                 self, "Missing dependencies",
-                f"{file_path}\n\nis missing WINMOL's dependencies "
-                "(onnxruntime / rasterio / geopandas).\n\n"
+                f"{file_path}\n\nis missing WINMOL's dependencies ("
+                + " / ".join(installer.REQUIRED_RUNTIME_MODULES) + ").\n\n"
                 "Install them into it now? pip runs in the "
                 "background and its output appears below; QGIS "
                 "stays usable.",

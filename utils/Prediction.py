@@ -48,11 +48,77 @@ def _suppress_native_stderr(enabled=True):
 """Prediction of the semantic stem map with U-Net"""
 
 
+#: Tile-read/resample strategies, selectable per run through
+#: ``Config.prediction_read_strategy`` (default `graph`) or, for A/B
+#: benchmarking, the WINMOL_BENCH_READ environment variable. They produce
+#: DIFFERENT pixels, so the choice is an accuracy question, not just a
+#: speed one -- compare them on real stem output (docs/resize-mechanics.md,
+#: benchmark/bench_resize_parity.py):
+#:   graph     : native uint8 reads; normalize + Catmull-Rom resize run
+#:               INSIDE the ONNX graph. v0.5.0-equivalent on every
+#:               execution provider. THE DEFAULT.
+#:   graph_aa  : `graph` with ONNX Resize antialias=1 -- GDAL-like AA
+#:               semantics, but deterministic and portable. For settling
+#:               the AA accuracy question, not v0.5-equivalent.
+#:   overview  : out_shape+cubic in the GDAL read (overview-served).
+#:               The flag-gated fast path: ~25% faster end-to-end on
+#:               R13-scale orthos but an anti-aliased kernel — measured
+#:               +20% stems / +26% volume vs v0.5 semantics at 2.29x,
+#:               validity unresolved. NOT the default for that reason.
+#:               (The `fullres`/`boundless` bench variants of this kernel
+#:               were removed 2026-08-11 after the investigation closed.)
+#:   native    : read at native resolution, resize in skimage downstream
+#:   native_producer : `native` pixels EXACTLY, resized in the producers
+#:   cupy      : rc12's CUDA/CuPy preprocessing (guarded until the port
+#:               is validated on a CUDA box)
+_READ_STRATEGIES = ("graph", "graph_aa", "overview",
+                    "native", "native_producer", "cupy")
+#: The in-graph path predates its promotion under the bench name
+#: `onnx_gpu`; keep the alias so existing bench scripts keep working.
+_STRATEGY_ALIASES = {"onnx_gpu": "graph"}
+
+
+def resolve_read_strategy(config=None):
+    """The feature-flag resolution: WINMOL_BENCH_READ (benching override)
+    beats ``config.prediction_read_strategy`` beats the `graph` default."""
+    raw = (os.environ.get("WINMOL_BENCH_READ") or "").lower()
+    if not raw and config is not None:
+        raw = str(getattr(config, "prediction_read_strategy", "")
+                  or "").lower()
+    raw = _STRATEGY_ALIASES.get(raw, raw) or "graph"
+    if raw not in _READ_STRATEGIES:
+        raise ValueError(
+            f"unknown read strategy {raw!r}; expected one of "
+            f"{_READ_STRATEGIES}")
+    if raw == "cupy":
+        # Recognized but unported. Raising HERE, at the single chokepoint
+        # every consumer calls, means no entry point can silently degrade
+        # `cupy` into a different strategy's code path.
+        raise RuntimeError(
+            "the CuPy read strategy (rc12's CUDA preprocessing) is not "
+            "ported yet -- it needs cupy-cuda12x and a CUDA device, and "
+            "validation on such a box. Use 'graph' for v0.5-equivalent "
+            "output; see docs/resize-mechanics.md.")
+    return raw
+
+
+def strategy_wraps_graph(strategy):
+    """True when the strategy loads a graph-wrapped model that takes raw
+    uint8 NHWC tiles. Model loading (utils.IO) and batch preparation
+    below MUST agree on this set, or the wrapped model's uint8 input
+    rejects every batch -- hence one shared predicate."""
+    return strategy in ("graph", "graph_aa")
+
+
 def _to_float32_image(arr):
     if arr.dtype == np.float32:
         return arr
     if np.issubdtype(arr.dtype, np.integer):
-        return (arr / 255.0).astype(np.float32, copy=False)
+        # NOT `(arr / 255.0).astype(np.float32)`: that promotes uint8 to
+        # float64 (a 6.3 MB temporary per 512x512x3 tile) only to round it
+        # back down, at 4.9x the cost. Dividing straight into float32 is
+        # one pass and BIT-IDENTICAL across all 256 uint8 values.
+        return np.divide(arr, np.float32(255.0), dtype=np.float32)
     return arr.astype(np.float32, copy=False)
 
 
@@ -151,18 +217,51 @@ def _resize_batch(batch_nhwc, size, order):
     return out
 
 
-def _prepare_inference_batch(raw_tiles, raw_masks, config):
-    batch = np.stack([_raw_tile_to_batchable(t) for t in raw_tiles], axis=0)
-    size = (config.img_height, config.img_width)
-    tile_batch = _resize_batch(batch, size, order=3)
+def _resize_like_consumer(tile, valid_mask, out_size):
+    """Producer-side twin of _prepare_inference_batch's resize.
 
+    Reproduces the consumer's operation order exactly -- uint8 -> float32
+    /255 via _to_float32_image, then skimage order=3 for imagery and
+    order=0 for the mask -- so a tile resized here is bit-comparable to
+    one resized there. The consumer's fast paths then short-circuit:
+    _to_float32_image passes float32 through untouched and _resize_batch
+    sees the batch already at target size.
+    """
+    size = (int(out_size[0]), int(out_size[1]))
+    tile_f = _raw_tile_to_batchable(tile)
+    tile_r = _resize_batch(tile_f[None, ...], size, order=3)[0]
+    mask_f = valid_mask.astype(np.float32)[:, :, None]
+    mask_r = _resize_batch(mask_f[None, ...], size, order=0)[0, :, :, 0]
+    return tile_r, mask_r > 0.5
+
+
+def _prepare_inference_batch(raw_tiles, raw_masks, config,
+                             read_strategy=None):
+    """read_strategy: pass the already-resolved strategy on hot paths (the
+    stream loop resolves once); None resolves from config. Callers that
+    load an UNWRAPPED model (wrap_preprocess=False) must pass a non-graph
+    strategy explicitly -- see PredictWorkers."""
+    if read_strategy is None:
+        read_strategy = resolve_read_strategy(config)
     if raw_masks is None:
         raw_masks = [_default_valid_mask(t) for t in raw_tiles]
-
     mask_batch = np.stack(
         [m.astype(np.float32)[:, :, None] for m in raw_masks],
         axis=0,
     )
+
+    if strategy_wraps_graph(read_strategy):
+        # The wrapped model normalizes and resizes in-graph: hand it the
+        # native uint8 batch untouched. Producers already resized the
+        # masks to the model grid, so only stacking remains. EVERY caller
+        # -- the consumer loop and the autotune probes alike -- must feed
+        # the model this way, or the uint8 graph input rejects the batch.
+        from utils.onnx_preprocess import as_uint8_nhwc
+        return as_uint8_nhwc(raw_tiles), mask_batch
+
+    batch = np.stack([_raw_tile_to_batchable(t) for t in raw_tiles], axis=0)
+    size = (config.img_height, config.img_width)
+    tile_batch = _resize_batch(batch, size, order=3)
     mask_resized = _resize_batch(mask_batch, size, order=0)
     return tile_batch, mask_resized
 
@@ -214,7 +313,12 @@ def _prediction_batch_candidates(config, initial_batch: int) -> list[int]:
         initial,
         int(max_batch_attr if max_batch_attr is not None else initial),
     )
-    return list(range(initial, max_batch + 1))
+    # Sweep from 1, not from the planner's `initial`. Starting at `initial`
+    # made the low end unreachable: a machine that cannot fit the planner's
+    # batch had no way to discover 1 or 2 and simply OOMed at run time.
+    # `initial` still seeds the planner and the cache; it is no longer the
+    # floor of the search.
+    return list(range(1, max_batch + 1))
 
 
 #: How far above the initial batch the sweep may go when free memory could
@@ -371,7 +475,8 @@ def _describe_memory_budget(budget: dict) -> str:
 
 class TileBatchProducer(threading.Thread):
     def __init__(self, uav_path, chunk_size, jobs, n_channels,
-                 out_queue, producer_id=0, out_size=None):
+                 out_queue, producer_id=0, out_size=None,
+                 read_strategy="overview"):
         super().__init__(daemon=True)
         self.uav_path = uav_path
         self.chunk_size = max(1, int(chunk_size))
@@ -379,14 +484,16 @@ class TileBatchProducer(threading.Thread):
         self.n_channels = n_channels
         self.out_queue = out_queue
         self.producer_id = producer_id
-        # (H, W) to resample each tile to *during* the GDAL read (fast, in
-        # C, and able to use overviews). None keeps the native-resolution
-        # read, leaving resizing to the (slow) skimage path downstream.
+        # (H, W) of the model grid. For the GDAL strategies the tile is
+        # resampled to it *during* the read; for `graph`/`cupy` the tile
+        # stays native and only the validity mask is resized to it here.
         self.out_size = tuple(out_size) if out_size else None
+        self.read_strategy = read_strategy
         self.error = None
 
     def run(self):
         try:
+            strat = self.read_strategy
             batch_items = []
             batch_read_s = 0.0
             with rasterio.open(self.uav_path) as src:
@@ -401,38 +508,36 @@ class TileBatchProducer(threading.Thread):
                     # mask at full-ortho scale -- nearest for the validity
                     # mask), replacing the slow per-tile skimage resize in
                     # the consumer (_resize_batch's identity fast path
-                    # then short-circuits). boundless+fill_value=0 keeps
-                    # the requested (oh, ow) shape even when the window
-                    # runs past the raster edge.
-                    if self.out_size is not None:
+                    # then short-circuits).
+                    # Only an edge window needs boundless -- it is what
+                    # keeps the returned shape correct there. Paying for it
+                    # on interior windows costs 3.2x on a native read
+                    # (47.3 -> 15.0 ms) for pixel-IDENTICAL output, and
+                    # on the out_shape path it also blocks overview use.
+                    # Applies to EVERY read strategy.
+                    bl = not (
+                        window.col_off >= 0
+                        and window.row_off >= 0
+                        and window.col_off + window.width <= src.width
+                        and window.row_off + window.height <= src.height
+                    )
+                    read_kw = {"boundless": bl,
+                               "fill_value": 0 if bl else None}
+                    mask_kw = {"boundless": bl}
+                    # `overview` resamples during the read; every other
+                    # strategy reads native and resizes downstream. The
+                    # native read is now the DEFAULT path, so the rule
+                    # above matters more here than on the overview branch.
+                    if self.out_size is not None and strat == "overview":
                         oh, ow = self.out_size
-                        tile = src.read(
-                            indexes,
-                            window=window,
-                            out_shape=(len(indexes), oh, ow),
-                            resampling=Resampling.cubic,
-                            boundless=True,
-                            fill_value=0,
-                        ).transpose(1, 2, 0)
-                        gdal_mask = src.read_masks(
-                            1,
-                            window=window,
-                            out_shape=(oh, ow),
-                            resampling=Resampling.nearest,
-                            boundless=True,
-                        ) > 0
-                    else:
-                        tile = src.read(
-                            indexes,
-                            window=window,
-                            boundless=True,
-                            fill_value=0,
-                        ).transpose(1, 2, 0)
-                        gdal_mask = src.read_masks(
-                            1,
-                            window=window,
-                            boundless=True,
-                        ) > 0
+                        read_kw.update(out_shape=(len(indexes), oh, ow),
+                                       resampling=Resampling.cubic)
+                        mask_kw.update(out_shape=(oh, ow),
+                                       resampling=Resampling.nearest)
+                    tile = src.read(
+                        indexes, window=window, **read_kw).transpose(1, 2, 0)
+                    gdal_mask = src.read_masks(
+                        1, window=window, **mask_kw) > 0
 
                     pixel_mask = np.any(tile != 0, axis=2)
 
@@ -443,6 +548,27 @@ class TileBatchProducer(threading.Thread):
                         valid_mask = pixel_mask
                     else:
                         valid_mask = gdal_mask & pixel_mask
+
+                    if strategy_wraps_graph(strat) and self.out_size:
+                        # The graph resizes the IMAGE on device; the mask
+                        # is only needed at model resolution for the
+                        # binarize step, and nearest on one channel is
+                        # cheap enough to keep here (and parallel).
+                        mk = valid_mask.astype(np.float32)[:, :, None]
+                        valid_mask = _resize_batch(
+                            mk[None, ...], (int(self.out_size[0]),
+                                            int(self.out_size[1])),
+                            order=0)[0, :, :, 0] > 0.5
+                    elif strat == "native_producer" and self.out_size:
+                        # Same skimage resize the consumer would do, but
+                        # run HERE so it parallelises across producers
+                        # instead of serialising on the GIL-holding
+                        # consumer. Order of operations matches
+                        # _prepare_inference_batch exactly -- float32
+                        # scale FIRST, then resize -- so the pixels are
+                        # identical to `native`, not merely similar.
+                        tile, valid_mask = _resize_like_consumer(
+                            tile, valid_mask, self.out_size)
 
                     batch_read_s += time.perf_counter() - t0
                     batch_items.append((job, tile, valid_mask))
@@ -479,6 +605,57 @@ def _write_prediction_core(dst, pred_core, job, layout):
     return time.perf_counter() - t0
 
 
+def _is_oom_error(exc) -> bool:
+    """True when ``exc`` is an out-of-memory failure from the backend.
+
+    onnx_runtime normalizes an onnxruntime OOM to MemoryError; the string
+    check is the fallback for a raw RuntimeError. The CUDA BFC-arena
+    wording ("Failed to allocate memory for requested buffer ...") carries
+    neither 'oom' nor 'out of memory' and so slipped past the back-off
+    before, aborting the run (issue #40).
+    """
+    if isinstance(exc, MemoryError):
+        return True
+    msg = str(exc).lower()
+    return ('oom' in msg or 'out of memory' in msg
+            or 'failed to allocate memory' in msg)
+
+
+def _predict_tensor_adaptive(tile_tensor, model, batch_size):
+    """Run the model over an already-prepared batch, halving on OOM.
+
+    Returns ``(pred, used)``. The ENTIRE tensor is always predicted: a
+    reduction re-runs it in slices and concatenates, so the caller gets one
+    row per input tile no matter how far the batch had to come down. This
+    is what the streaming loop calls -- it used to call
+    ``model.predict_on_batch`` directly, so the first steady-state OOM
+    killed the whole run even though the back-off below already existed
+    (it was reachable only from the autotune).
+    """
+    try:
+        return np.asarray(model.predict_on_batch(tile_tensor)), batch_size
+    except (RuntimeError, MemoryError) as exc:
+        if batch_size <= 1 or not _is_oom_error(exc):
+            raise
+        reduced = max(1, batch_size // 2)
+        print(f"Prediction batch too large; reducing micro-batch size from "
+              f"{batch_size} to {reduced}", flush=True)
+        # Carry the working size forward across slices: once a slice has
+        # backed off to N, start the next one at N rather than re-probing
+        # from `reduced` and paying another failed allocation. On a
+        # 99k-tile ortho that difference is the whole cost of the fallback.
+        parts = []
+        used = reduced
+        start = 0
+        while start < len(tile_tensor):
+            part, part_used = _predict_tensor_adaptive(
+                tile_tensor[start:start + used], model, used)
+            parts.append(part)
+            start += len(part)
+            used = min(used, part_used)
+        return np.concatenate(parts, axis=0), used
+
+
 def _predict_batch_adaptive(
     raw_tiles, raw_masks, model, config, batch_size
 ):
@@ -486,23 +663,33 @@ def _predict_batch_adaptive(
         return _predict_batch_core(
             raw_tiles, raw_masks, model, config), batch_size
     except (RuntimeError, MemoryError) as exc:
-        msg = str(exc).lower()
-        # onnx_runtime normalizes an onnxruntime OOM to MemoryError; this
-        # string check is the fallback for a raw RuntimeError. Match the CUDA
-        # BFC-arena wording too ("Failed to allocate memory for requested
-        # buffer ..."), which carries neither 'oom' nor 'out of memory' and so
-        # slipped past the back-off before, aborting the run (issue #40).
-        is_oom = isinstance(exc, MemoryError) or (
-            'oom' in msg or 'out of memory' in msg
-            or 'failed to allocate memory' in msg)
-        if batch_size <= 1 or not is_oom:
+        if batch_size <= 1 or not _is_oom_error(exc):
             raise
         reduced = max(1, batch_size // 2)
         print(f"Prediction batch too large; reducing micro-batch size from "
               f"{batch_size} to {reduced}", flush=True)
-        return _predict_batch_adaptive(raw_tiles[:reduced], raw_masks[:reduced]
-                                       if raw_masks is not None
-                                       else None, model, config, reduced)
+        # Re-run the WHOLE input in slices of `reduced` -- never just
+        # raw_tiles[:reduced]. Truncating here silently dropped every tile
+        # past the first slice: harmless while only the autotune called this
+        # (it keeps timings, not predictions), but the streaming loop writes
+        # what comes back, so a truncated result is a hole in the stem map
+        # with no error anywhere.
+        cores = []
+        used = reduced
+        start = 0
+        while start < len(raw_tiles):
+            stop = start + used
+            slice_masks = (
+                raw_masks[start:stop] if raw_masks is not None else None)
+            slice_cores, slice_used = _predict_batch_adaptive(
+                raw_tiles[start:stop], slice_masks, model, config, used)
+            cores.extend(slice_cores)
+            start += len(slice_cores)
+            # Report the SMALLEST size that worked: a later slice may have
+            # had to back off further, and the caller latches this value for
+            # the rest of the run.
+            used = min(used, slice_used)
+        return cores, used
 
 
 def _time_batch_candidate(
@@ -633,6 +820,25 @@ def _autotune_cache_persist(
             "the result will be re-measured next run.",
             flush=True,
         )
+
+
+def _persist_autotune_batch(key, cache_file, batch):
+    """Lower the cached batch after a steady-state OOM.
+
+    The sweep caches the size that fit a warm sample; once the real run
+    OOMs and backs off, that cached value is known-fatal for this
+    model/machine pair. Leaving it in place makes the NEXT run load it and
+    die exactly the same way without even re-probing -- which is what the
+    reported crash did.
+    """
+    if key is None:
+        return
+    stored = autotune_cache.store(
+        key, int(batch), meta={'lowered_after_oom': True}, path=cache_file)
+    if stored:
+        print(f"Prediction micro-batch autotune: lowered cached batch to "
+              f"{int(batch)} after an out-of-memory back-off "
+              f"(key {key[:8]}, {cache_file})", flush=True)
 
 
 def _autotune_batch_size(
@@ -767,13 +973,27 @@ def _autotune_batch_size(
         results.append((cand, used, per_tile, oomed))
 
         # A candidate only counts as progress if it clears BOTH bars: the
-        # existing relative one (min_improve) AND a new absolute floor
-        # (min_improve_s). 0.337 vs 0.340 s/tile is jitter, not a win, and
-        # treating it as one just chases noise to the top of the range.
+        # relative one (min_improve) AND a noise floor. 0.337 vs 0.340
+        # s/tile is jitter, not a win, and treating it as one just chases
+        # noise to the top of the range.
+        #
+        # The floor is RELATIVE to the measured baseline. A fixed
+        # min_improve_s (0.2 s/tile by default) is unreachable on a GPU,
+        # where per-tile times are 0.01-0.05 s: candidates[0] always wins
+        # on the isfinite() branch, every later candidate then needs
+        # per_tile <= best - 0.2 (negative), and the sweep could only ever
+        # return its own starting point -- timing 5 candidates x 5 repeats
+        # to re-derive the planner's value.
+        #
+        # min_improve_s stays as an upper bound, so the floor never gets
+        # LOOSER than the tuned value; on slow CPU tiles (~0.8 s) it does
+        # get tighter (0.2 -> ~0.04), which is the point: 5% of measured is
+        # a real win at any speed, 0.2 s absolute is not a scale-free test.
+        noise_floor = min(min_improve_s, max(0.002, 0.05 * best_per_tile))
         improved = (
             not np.isfinite(best_per_tile)
             or (per_tile < best_per_tile * (1.0 - min_improve)
-                and per_tile <= best_per_tile - min_improve_s)
+                and per_tile <= best_per_tile - noise_floor)
         )
 
         if improved:
@@ -883,6 +1103,9 @@ def predict_stream_to_raster(
     jobs_iter = list(_iter_tile_jobs(layout, config)) \
         if tile_jobs is None else list(tile_jobs)
 
+    read_strategy = resolve_read_strategy(config)
+    print(f"Tile read strategy: {read_strategy}")
+
     q = queue.Queue(maxsize=queue_depth)
     producer_job_lists = _split_jobs_for_producers(
         jobs_iter, producer_workers)
@@ -894,10 +1117,11 @@ def predict_stream_to_raster(
             n_channels=config.n_channels,
             out_queue=q,
             producer_id=idx,
-            # Tiles arrive on the model grid already; _resize_batch's
-            # identity fast path then makes _prepare_inference_batch a
-            # no-op for the resize step.
+            # For the GDAL strategies tiles arrive on the model grid
+            # already (identity fast path downstream); for `graph` the
+            # producers use it only to resize the validity mask.
             out_size=(config.img_height, config.img_width),
+            read_strategy=read_strategy,
         )
         for idx in range(len(producer_job_lists))
     ]
@@ -911,6 +1135,11 @@ def predict_stream_to_raster(
     total_infer_s = 0.0
     total_write_s = 0.0
     active_batch_size = initial_batch_size
+    # Resolved once so a steady-state OOM can lower the cached batch: the
+    # sweep caches what fit a warm sample, and if the real run then backs
+    # off, that cached value is known-fatal for this model/machine.
+    autotune_key, autotune_cache_file = _autotune_cache_key(
+        model, config, 'Prediction micro-batch')
     pending_items = []
     finished_producers = 0
 
@@ -963,12 +1192,21 @@ def predict_stream_to_raster(
 
             prep0 = time.perf_counter()
             tile_tensor, mask_resized = _prepare_inference_batch(
-                raw_tiles, raw_masks, config)
+                raw_tiles, raw_masks, config, read_strategy=read_strategy)
             total_prep_s += time.perf_counter() - prep0
 
             infer0 = time.perf_counter()
-            pred = model.predict_on_batch(tile_tensor)
+            pred, used_batch = _predict_tensor_adaptive(
+                tile_tensor, model, current_n)
             total_infer_s += time.perf_counter() - infer0
+            # Latch the reduction for the REST of the run. Without this every
+            # subsequent batch re-hits the same memory cliff, pays the failed
+            # allocation, and backs off again -- and a batch that OOMs at the
+            # very first tile would never make progress at all.
+            if used_batch < active_batch_size:
+                active_batch_size = used_batch
+                _persist_autotune_batch(autotune_key, autotune_cache_file,
+                                        used_batch)
 
             crop = config.overlap_pred // 2
             write_batch_s = 0.0

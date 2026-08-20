@@ -8,8 +8,9 @@ import os
 import subprocess
 import sys
 
-import numpy as np
 import pytest
+
+from conftest import build_test_geotiff, build_tiny_unet
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -26,52 +27,6 @@ class _TFBlocker:
 
 sys.meta_path.insert(0, _TFBlocker())
 '''
-
-
-def _build_model(path):
-    """1-conv sigmoid segmenter, NHWC [b,512,512,3] -> [b,512,512,1].
-    Channel axes stay static so utils.onnx_runtime._layout resolves."""
-    onnx = pytest.importorskip("onnx")
-    from onnx import TensorProto, helper
-    s = 512
-    rng = np.random.default_rng(0)
-    w = helper.make_tensor("w", TensorProto.FLOAT, [1, 3, 1, 1],
-                           rng.normal(size=3).astype(np.float32))
-    nodes = [
-        helper.make_node("Transpose", ["input"], ["nchw"], perm=[0, 3, 1, 2]),
-        helper.make_node("Conv", ["nchw", "w"], ["c"]),
-        helper.make_node("Sigmoid", ["c"], ["nchw_out"]),
-        helper.make_node("Transpose", ["nchw_out"], ["output"],
-                         perm=[0, 2, 3, 1]),
-    ]
-    graph = helper.make_graph(
-        nodes, "segmenter",
-        [helper.make_tensor_value_info(
-            "input", TensorProto.FLOAT, ["b", s, s, 3])],
-        [helper.make_tensor_value_info(
-            "output", TensorProto.FLOAT, ["b", s, s, 1])],
-        [w])
-    model = helper.make_model(
-        graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 9
-    onnx.save(model, str(path))
-    return str(path)
-
-
-def _build_geotiff(path):
-    """600x600 px, 3-band uint8, EPSG:32633, 5 cm pixels."""
-    rasterio = pytest.importorskip("rasterio")
-    from rasterio.transform import from_origin
-    rng = np.random.default_rng(42)
-    data = rng.integers(1, 255, size=(3, 600, 600), dtype=np.uint8)
-    profile = {
-        "driver": "GTiff", "width": 600, "height": 600, "count": 3,
-        "dtype": "uint8", "crs": rasterio.crs.CRS.from_epsg(32633),
-        "transform": from_origin(400000.0, 5900000.0, 0.05, 0.05),
-    }
-    with rasterio.open(str(path), "w", **profile) as dst:
-        dst.write(data)
-    return str(path)
 
 
 def test_stems_run_end_to_end_without_tensorflow(tmp_path):
@@ -94,8 +49,8 @@ def test_stems_run_end_to_end_without_tensorflow(tmp_path):
     assert probe.returncode != 0
     assert "TensorFlow blocked by contract test" in probe.stderr
 
-    model = _build_model(tmp_path / "segmenter.onnx")
-    image = _build_geotiff(tmp_path / "ortho.tif")
+    model = build_tiny_unet(tmp_path / "segmenter.onnx")
+    image = build_test_geotiff(tmp_path / "ortho.tif")
     stem_map = tmp_path / "out" / "stem_map.tif"
 
     proc = subprocess.run(

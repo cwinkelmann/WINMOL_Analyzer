@@ -32,7 +32,7 @@ EXCLUDE=(
   .github .gitignore
   Makefile setup.cfg
   startDocker.sh scripts
-  tests
+  tests benchmark docker
   docs documentation standalone
   resources.qrc
 )

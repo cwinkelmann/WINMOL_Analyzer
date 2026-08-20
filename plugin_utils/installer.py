@@ -187,10 +187,19 @@ def choose_base_python(progress=None) -> str:
     return managed_base_python(_PLUGIN_DIR, progress=progress)
 
 
+#: What a compute environment must be able to import for a real run.
+#: Single source of truth: the bring-your-own-interpreter probe below,
+#: the messages that name the deps, and the requirements guard in
+#: tests/test_plugin_installer.py all read it. `onnx` was declared in
+#: core.txt but not here, so a BYO interpreter passed this gate and then
+#: died at model load -- the exact failure the declaration fixed.
+REQUIRED_RUNTIME_MODULES = ("onnxruntime", "onnx", "rasterio", "geopandas")
+
+
 def _has_compute_deps(executable) -> bool:
     try:
         out = run_isolated(
-            executable, "import onnxruntime, rasterio, geopandas",
+            executable, "import " + ", ".join(REQUIRED_RUNTIME_MODULES),
             timeout=60)
         return out.returncode == 0
     except Exception:
@@ -225,12 +234,43 @@ def path_is_inside(path, root) -> bool:
 
 # --- sentinel (install once) ------------------------------------------------
 
-def _file_hash(path) -> str:
+def _requirements_closure(path, _seen=None):
+    """``path`` and every file it pulls in with ``-r``, in stable order.
+
+    cpu.txt and gpu.txt are thin: both are little more than ``-r
+    core.txt`` plus a runtime. Hashing only the named file therefore
+    misses every change to the shared stack -- a dependency added to
+    core.txt would leave the sentinel matching, and no existing install
+    would ever rebuild its venv. That is how the `onnx` requirement
+    reached users as a ModuleNotFoundError instead of a reinstall.
+    """
+    path = Path(path)
+    _seen = set() if _seen is None else _seen
+    if path in _seen:
+        return []
+    _seen.add(path)
+    found = [path]
     try:
-        data = Path(path).read_bytes()
+        lines = path.read_text().splitlines()
     except Exception:
-        data = b""
-    return hashlib.sha256(data).hexdigest()[:16]
+        return found
+    for line in lines:
+        line = line.strip()
+        if line.startswith("-r "):
+            found += _requirements_closure(path.parent / line[3:].strip(),
+                                           _seen)
+    return found
+
+
+def _file_hash(path) -> str:
+    """Hash of the whole requirements closure, not just the entry file."""
+    digest = hashlib.sha256()
+    for part in _requirements_closure(path):
+        try:
+            digest.update(part.read_bytes())
+        except Exception:
+            digest.update(b"")
+    return digest.hexdigest()[:16]
 
 
 def _marker_path(venv_path) -> str:
@@ -821,8 +861,8 @@ def resolve_environment(plugin_dir) -> dict:
             result.update(
                 status="error", python=byo,
                 message=(f"Configured interpreter {byo} is missing "
-                         "WINMOL deps (onnxruntime/rasterio/"
-                         "geopandas)."))
+                         "WINMOL deps ("
+                         + "/".join(REQUIRED_RUNTIME_MODULES) + ")."))
         return result
 
     # WINMOL_GPU=1 requires the gpu variant; otherwise any variant the

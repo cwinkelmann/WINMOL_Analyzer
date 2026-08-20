@@ -21,9 +21,10 @@ def fake_run(monkeypatch):
     calls = []
 
     def _run(input_image, model_path, output_folder, gpu_id=None,
-             cpu_budget=None):
+             cpu_budget=None, process_type="Nodes"):
         calls.append({"ortho": input_image, "gpu": gpu_id,
-                      "cpu_budget": cpu_budget})
+                      "cpu_budget": cpu_budget,
+                      "process_type": process_type})
         if "boom" in input_image:
             raise subprocess.CalledProcessError(1, "winmol_run.py")
 
@@ -88,7 +89,10 @@ def test_parallel_jobs_share_the_cpu_budget(fake_run, monkeypatch):
     """Each child plans against the whole machine, so N concurrent vector
     phases would oversubscribe the cores N-fold without a per-job cap."""
     monkeypatch.setattr(winmol_batch, "detect_gpu_count", lambda: 2)
-    monkeypatch.setattr(winmol_batch.os, "cpu_count", lambda: 16)
+    # container.cpu_count(), not os.cpu_count(): the budget is now derived
+    # from the cgroup-aware count so a limited container is not handed the
+    # host's cores.
+    monkeypatch.setattr(winmol_batch.container, "cpu_count", lambda: 16)
 
     winmol_batch.process_orthos(["/in/a.tif", "/in/b.tif"], "/m.onnx", "/out",
                                 jobs=2)

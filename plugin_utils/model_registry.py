@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import platform
+import sys
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -296,17 +297,62 @@ def local_path(entry, model_dir) -> str:
     return os.path.join(model_dir, entry.file)
 
 
-def detect_device() -> str:
+def gpu_runtime_installed(venv_path=None) -> bool:
+    """Whether the interpreter that will RUN the model has a CUDA EP.
+
+    A card is not the same thing as a runtime that can use it. The
+    managed venv is built from requirements/cpu.txt (plain
+    ``onnxruntime``) unless the user opts into the GPU variant, so on
+    any NVIDIA box a default install has a GPU present and a CPU-only
+    runtime. Choosing the model by the CARD alone hands that install the
+    fp16 GPU variant instead of the int8 CPU one -- it still runs (ORT
+    converts the fp16 weights to fp32 once at session load), just as the
+    wrong, slower variant.
+
+    Two contexts, two sources of truth:
+
+    * the compute child already has onnxruntime imported -- ask it;
+    * the QGIS-side plugin must never import it, so read the venv
+      sentinel instead (``installed_variant`` is pure file I/O).
+
+    Unknown (no marker, no imported runtime) stays True so the probe
+    alone decides, exactly as before.
+    """
+    ort = sys.modules.get("onnxruntime")
+    if ort is not None:
+        try:
+            return "CUDAExecutionProvider" in ort.get_available_providers()
+        except Exception:
+            pass
+    if venv_path:
+        try:
+            from .installer import installed_variant
+            variant = installed_variant(venv_path)
+        except Exception:
+            variant = None
+        if variant is not None:
+            return variant == "gpu"
+    return True
+
+
+def detect_device(venv_path=None) -> str:
     """"gpu" (CUDA), "coreml" (Apple Silicon) or "cpu".
 
     ``WINMOL_DEVICE`` env overrides; else Apple Silicon is recognised
     from the platform; else an ``nvidia-smi`` probe; default "cpu".
+
+    A GPU verdict additionally requires a runtime that can actually use
+    the card (``gpu_runtime_installed``) -- otherwise a CPU-only install
+    on an NVIDIA machine selects the fp16 variant it cannot accelerate.
+    Skipping the probe in that case also skips its 20 s timeout.
     """
     forced = os.environ.get("WINMOL_DEVICE", "").strip().lower()
     if forced in ("cpu", "gpu", "coreml"):
         return forced
     if platform.system() == "Darwin" and platform.machine() == "arm64":
         return "coreml"
+    if not gpu_runtime_installed(venv_path):
+        return "cpu"
     return _probe_nvidia()
 
 

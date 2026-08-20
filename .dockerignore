@@ -1,0 +1,19 @@
+# Keep the build context small and reproducible. The repo carries large
+# benchmark artefacts and local venvs that must never land in an image.
+.git
+.github
+**/__pycache__
+**/*.pyc
+benchmark/out
+winmol_venv
+standalone/model/*.hdf5
+standalone/model/*.onnx
+standalone/input
+standalone/output
+docs/img
+*.gpkg
+*.tif
+*.tiff
+.pytest_cache
+.idea
+.vscode

@@ -104,25 +104,24 @@ def test_stale_managed_pointer_falls_through_to_needs_setup(
     assert set(result) >= {"status", "python", "venv_path", "message"}
 
 
-# Files that run before/without the "does compute deps import" probe
-# (winmol_run.py -> utils.Prediction/PredictWorkers -> utils.IO), so a
-# module-level import missing from requirements crashes the first real
-# run even though the venv built successfully.
-_CLOSURE_FILES = (
-    "winmol_run.py",
-    "utils/IO.py",
-    "utils/Prediction.py",
-    "utils/PredictWorkers.py",
-    "utils/onnx_runtime.py",
-    # plugin-gui helper modules run inside the CHILD venv's python too
-    # (progress parsing happens in the QGIS process, but keep them
-    # runtime-clean anyway — they must never grow heavy imports)
-    "plugin_utils/run_progress.py",
-    "plugin_utils/setup_state.py",
-    "plugin_utils/model_status.py",
-    "plugin_utils/output_selection.py",
-    "plugin_utils/config_overrides.py",
-)
+# Everything the plugin ships that runs in the compute venv. Derived,
+# not enumerated: this used to be a hand-written tuple of ~12 files, and
+# utils/onnx_preprocess.py was not in it -- so when the graph read
+# strategy became the default and put its module-level `import onnx` on
+# the default path, this test stayed green and the user got a
+# ModuleNotFoundError at model load instead.
+_RUNTIME_DIRS = ("utils", "classes", "plugin_utils")
+_ENTRY_POINTS = ("winmol_run.py", "winmol_batch.py")
+
+
+def _closure_files():
+    found = [Path(name) for name in _ENTRY_POINTS]
+    for directory in _RUNTIME_DIRS:
+        found += sorted(
+            p.relative_to(REPO) for p in (REPO / directory).glob("*.py"))
+    return found
+
+
 _LOCAL_PACKAGES = {"utils", "classes", "plugin_utils"}
 # Import roots not literally named in requirements/*.txt because they
 # ride in as transitive deps of a package that IS: geopandas pulls in
@@ -158,7 +157,7 @@ def test_module_level_imports_are_covered_by_requirements():
             (REPO / "requirements" / "cpu.txt").read_text(encoding="utf-8")))
     stdlib = set(sys.stdlib_module_names)
     missing = []
-    for rel in _CLOSURE_FILES:
+    for rel in _closure_files():
         for root in _module_level_import_roots(REPO / rel):
             if root in stdlib or root in _LOCAL_PACKAGES:
                 continue
@@ -169,3 +168,22 @@ def test_module_level_imports_are_covered_by_requirements():
         "module-level imports uncovered by requirements/core.txt + "
         "cpu.txt (lazy-import inside the one function that needs it "
         "instead): " + ", ".join(missing))
+
+
+def test_marker_hash_covers_included_requirements(tmp_path):
+    """A change to core.txt must invalidate the sentinel.
+
+    cpu.txt is little more than `-r core.txt`, so hashing only the named
+    file left every existing install matching after a dependency was
+    added to the shared stack -- the venv would never rebuild and the
+    new package would never arrive.
+    """
+    core = tmp_path / "core.txt"
+    entry = tmp_path / "cpu.txt"
+    core.write_text("numpy==1.26.4\n")
+    entry.write_text("-r core.txt\nonnxruntime>=1.17\n")
+
+    before = installer._file_hash(entry)
+    core.write_text("numpy==1.26.4\nonnx>=1.15\n")
+
+    assert installer._file_hash(entry) != before

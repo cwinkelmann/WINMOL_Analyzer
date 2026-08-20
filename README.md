@@ -47,6 +47,119 @@ Once installed, the plugin will be available via the **Plugins** menu.
 
 Refer to the [documentation](https://stefanreder.github.io/WINMOL_Analyzer/) for further information.
 
+## 🖥️ Command-line and batch processing
+
+Besides the QGIS plugin, the pipeline runs headless — one orthomosaic at a
+time (`winmol_run.py`), a whole folder (`winmol_batch.py`), or in Docker.
+
+### ⚠️ Prepare your orthomosaics first: they need overviews
+
+**This is the single most important thing to get right for large
+orthomosaics.** Prediction resamples every tile to the model's grid during
+the GDAL read. When the file has overview levels, GDAL serves that read
+from an already-decimated level. When it does not, it must read *every
+source pixel* at full resolution and shrink it in RAM — roughly twice the
+read time and four times the bytes, per tile.
+
+On a small ortho this barely shows. On a large one it is the difference
+between a run that finishes and one that does not. Measured on a
+99231-tile orthomosaic (392558 × 335327 px):
+
+| input | throughput |
+|---|---|
+| COG **with** overviews | **~4200 tiles/min, flat for the whole run** |
+| same data, no overviews | starts ~2600, decays, collapses to **~80 tiles/min** |
+
+The decay is gradual and then sudden, which makes it easy to mistake for a
+hang. If a run starts fast and then gets slower and slower, check the
+overviews first.
+
+**Check whether a file has them:**
+
+```bash
+gdalinfo your_ortho.tif | grep -i overview
+```
+
+**Build them (once per file):**
+
+```bash
+gdaladdo -ro -r average your_ortho.tif 2 4 8 16 32 64 128
+```
+
+`-ro` writes a `.ovr` sidecar next to the file and leaves the original
+untouched — safe for read-only or shared data. QGIS display gets faster
+too.
+
+**Better still, produce a Cloud-Optimized GeoTIFF**, which carries
+overviews and is tiled for windowed reads:
+
+```bash
+gdal_translate input.tif output_cog.tif -of COG \
+    -co COMPRESS=DEFLATE -co BLOCKSIZE=512
+```
+
+The pipeline warns at startup when an input over 2 GB has no overviews. It
+will not build them for you unless asked (see `WINMOL_BUILD_OVERVIEWS`).
+
+### Single orthomosaic
+
+```bash
+python -u winmol_run.py <model.onnx> <input.tif> <stem_map.tif> <out_prefix> Nodes
+```
+
+`Stems` writes only the binary stem-map raster; `Trees` / `Nodes` also
+vectorise into a GeoPackage.
+
+### A folder of orthomosaics
+
+```bash
+python winmol_batch.py Spruce_Deadwood \
+    --input  ./orthos \
+    --output ./results \
+    --jobs 2
+```
+
+Models (`Spruce`, `Beech`, `Spruce_Deadwood`, `General`) are downloaded and
+checksum-verified into `--model-dir` on first use. `--jobs N` processes N
+orthomosaics concurrently, spreading them across the available GPUs; each
+job gets an equal share of the CPU budget. `--merge` stitches tiled outputs
+into a single GeoPackage.
+
+### Docker
+
+Two images, because `onnxruntime` and `onnxruntime-gpu` cannot be installed
+together:
+
+```bash
+docker build -f docker/Dockerfile --build-arg VARIANT=cpu -t winmol:cpu .
+docker build -f docker/Dockerfile --build-arg VARIANT=gpu -t winmol:gpu .
+```
+
+```bash
+docker run --rm --gpus all \
+  -v /path/to/orthos:/data/input:ro \
+  -v /path/to/results:/data/output \
+  -v /path/to/models:/data/models \
+  winmol:gpu Spruce_Deadwood
+```
+
+The container sizes itself to the resources **it** has rather than the
+host's, so `--memory` and `--cpus` are respected instead of ignored:
+
+```bash
+docker run --rm --memory=8g --cpus=4 ... winmol:cpu Spruce_Deadwood
+```
+
+Useful environment variables (all optional — everything is autodetected):
+
+| variable | meaning |
+|---|---|
+| `WINMOL_JOBS` | orthomosaics in parallel (default: from GPU count and memory) |
+| `WINMOL_PROCESS_TYPE` | `Stems`, `Trees` or `Nodes` (default `Nodes`) |
+| `WINMOL_BUILD_OVERVIEWS=1` | run `gdaladdo` on inputs that lack overviews (needs a writable input mount) |
+| `GDAL_CACHEMAX` | GDAL block cache in MB. Defaults to ~20% of the memory budget per job — **do not set this small**: a starved cache is what makes large runs collapse |
+| `WINMOL_MODEL_DIR` | where models are downloaded and cached |
+
 ## 📖 Related Publications
 
 Please cite the following peer-reviewed studies if you use WINMOL Analyzer in your work:

@@ -121,6 +121,12 @@ class ImageProcessing:
         print(f"  producer_workers = {plan.producer_workers}")
         print(f"  progress_interval_s = {plan.progress_interval_s}")
         print(f"  est_pred_tiles   = {plan.estimated_prediction_tiles}")
+        # Say so when the planner overrode a configured value. These caps
+        # used to be silent, which is how a configured
+        # prediction_producer_workers_gpu=6 ran as 3, and the vector pool
+        # ran on 2 of 12 cores, without anyone noticing they were capped.
+        for note in getattr(plan, 'capped', None) or []:
+            print(f"  WARNING: {note}")
         self._apply_plan_to_config(plan, hardware)
         return plan
 
@@ -167,7 +173,7 @@ class ImageProcessing:
                 os.environ["WINMOL_ONNX_FORCE_CPU"] = "1"
 
         print("\nLoading Model...")
-        model = IO.load_model_from_path(self.model_path)
+        model = IO.load_model_from_path(self.model_path, self.config)
         from utils.onnx_runtime import last_active_report
         report = last_active_report()
         if report:

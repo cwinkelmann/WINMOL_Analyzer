@@ -10,26 +10,22 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-        with:
-          path: WINMOL_Analyzer
 
-      - name: Update metadata.txt version inline
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          cd WINMOL_Analyzer
-          if grep -q '^version=' metadata.txt; then
-            sed -i "s/^version=.*/version=$VERSION/" metadata.txt
-          else
-            echo "version=$VERSION" >> metadata.txt
-          fi
+      # Same builder the "Build plugin ZIP" job runs on every PR, and the
+      # one tests/test_plugin_package.py asserts against. Releases used to
+      # do their own inline `zip -r` with a different exclude list, so what
+      # users installed was never the artifact CI validated.
+      # The version argument rewrites metadata.txt inside the archive.
+      - name: Build the plugin ZIP
+        run: >
+          bash scripts/build_plugin_zip.sh HEAD
+          WINMOL_Analyzer_QGIS_Plugin.zip "${GITHUB_REF_NAME#v}"
 
-      - name: Archive Release
-        uses: montudor/action-zip@v1
-        with:
-          args: zip -r WINMOL_Analyzer_QGIS_Plugin.zip WINMOL_Analyzer -x "*.git*" -x "*documentation/*" -x "*winmol_venv/*" -x "*Dockerfile" -x "*startDocker.sh" -x "*.github/*" -x "*standalone/input/*" -x "*standalone/output/*" -x "*standalone/model/*" -x "*standalone/pred/*" -x "*__pycache*" -x "*pylintrc"
       - name: Upload Release
         uses: ncipollo/release-action@v1.12.0
         with:
           artifacts: "WINMOL_Analyzer_QGIS_Plugin.zip"
           allowUpdates: true
+          # Every pre-1.0 tag so far is a candidate build (-rcN / -reimplN).
+          prerelease: ${{ contains(github.ref_name, '-') }}
           token: ${{ secrets.GITHUB_TOKEN }}

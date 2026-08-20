@@ -8,3 +8,12 @@ rasterio>=1.4,<1.5
 scikit-image==0.22.0
 scipy==1.11.3
 pyogrio>=0.9
+
+# The ONNX *authoring* library, not the runtime (that is onnxruntime,
+# in cpu.txt/gpu.txt, because the two variants must never mix).
+# utils/onnx_preprocess.py imports it at module scope to prepend the
+# normalize + Resize nodes that make prediction_read_strategy=graph --
+# the default -- v0.5-equivalent. Unpinned so it can track protobuf; the
+# numpy pin above is the guard, so an onnx release that demands numpy 2
+# fails the resolve loudly instead of swapping the geo stack's ABI.
+onnx>=1.15

@@ -34,12 +34,49 @@ from classes.Stem import Stem
 """Streaming and tiling operations"""
 
 
+#: Below this, a run is too short for the read cost to matter and the
+#: overview warning would just be noise.
+_OVERVIEW_WARN_GB = 2.0
+
+
+def _warn_if_no_overviews(src, estimated_input_gb):
+    """Tell the user when an ortho will be read the slow way.
+
+    Prediction resamples each tile to the model grid during the GDAL
+    read. When the file HAS overviews, GDAL serves that from a decimated
+    level -- measured 7.5 ms per tile on Tegel R13. Without them it must
+    read every source pixel and shrink in RAM: 13.9 ms per tile, and
+    ~4x the bytes through GDAL's global block cache (default 5% of RAM,
+    shared by every producer thread). On a large ortho that is what makes
+    throughput decay and then collapse (issue #43).
+
+    Building overviews once is the fix, and `-ro` keeps the original
+    file untouched by writing a .ovr sidecar.
+    """
+    try:
+        overviews = src.overviews(1)
+    except Exception:
+        return
+    if overviews or estimated_input_gb < _OVERVIEW_WARN_GB:
+        return
+    print(
+        f"WARNING: {src.name} has NO overviews and is "
+        f"{estimated_input_gb:.1f} GB. Every prediction tile will be read "
+        f"at full resolution and downsampled in RAM -- roughly 2x the read "
+        f"time and 4x the bytes through GDAL's shared cache, which makes "
+        f"throughput decay on large orthos. Build them once with:\n"
+        f"    gdaladdo -ro -r average {src.name} 2 4 8 16 32 64 128\n"
+        f"(-ro writes a .ovr sidecar and leaves the original file "
+        f"unchanged.)", flush=True)
+
+
 def get_raster_info(path) -> dict:
     with rasterio.open(path) as src:
         dtype = src.dtypes[0] if src.dtypes else 'unknown'
         estimated_input_gb = (
             src.width * src.height * src.count * np.dtype(dtype).itemsize
         ) / (1024 ** 3)
+        _warn_if_no_overviews(src, estimated_input_gb)
         return {
             'width': int(src.width),
             'height': int(src.height),
@@ -182,13 +219,17 @@ def load_raster_window_with_profile(path: str, window):
 """File operations"""
 
 
-def load_model_from_path(model_path):
+def load_model_from_path(model_path, config=None, wrap_preprocess=None):
     # ONNX models are architecture-agnostic: they are served by an
     # OnnxSegmenter adapter that duck-types the Keras model's
     # predict_on_batch(NHWC) interface, so no TensorFlow/Keras code is
     # needed here at all.
+    #
+    # wrap_preprocess: None resolves from the read-strategy flag (`graph`
+    # wraps); False forces the raw model for callers that feed
+    # pre-normalized float tiles themselves (PredictWorkers).
     if str(model_path).lower().endswith(".onnx"):
-        return _load_onnx_model(model_path)
+        return _load_onnx_model(model_path, config, wrap_preprocess)
 
     # The shipped runtime is TensorFlow-free: it loads only .onnx models
     # via onnxruntime. Legacy Keras/TensorFlow models (.hdf5/.h5/.keras)
@@ -201,7 +242,7 @@ def load_model_from_path(model_path):
         "the resulting .onnx file.")
 
 
-def _load_onnx_model(model_path):
+def _load_onnx_model(model_path, config=None, wrap_preprocess=None):
     """Load a .onnx segmenter via the vendored OnnxSegmenter.
 
     OnnxSegmenter exposes predict_on_batch(NHWC), so it is a drop-in for
@@ -218,6 +259,34 @@ def _load_onnx_model(model_path):
             "available (" + str(e) + "). Install it with "
             "'pip install onnxruntime' (or 'onnxruntime-gpu' for CUDA) "
             "and try again.") from e
+    antialias = False
+    if wrap_preprocess is None:
+        from utils.Prediction import (resolve_read_strategy,
+                                      strategy_wraps_graph)
+        strategy = resolve_read_strategy(config)
+        wrap_preprocess = strategy_wraps_graph(strategy)
+        antialias = strategy == "graph_aa"
+    if wrap_preprocess:
+        # Prepend normalize + bicubic resize to the graph so they run on
+        # the session's device instead of the CPU, and GDAL goes back to
+        # plain native reads. See utils/onnx_preprocess.
+        from utils.onnx_preprocess import build_preprocessed_model
+        target = (int(getattr(config, 'img_height', None) or 512),
+                  int(getattr(config, 'img_width', None) or 512))
+        wrapped = build_preprocessed_model(model_path, target,
+                                           antialias=antialias)
+        print(f"Loading ONNX model with IN-GRAPH preprocessing "
+              f"(normalize + bicubic resize on device): {wrapped}")
+        if antialias:
+            # onnxruntime's CUDA EP mis-executes the opset-18 antialias
+            # Resize (measured: 82 stems vs 478 on the CPU EP, same run).
+            # Pin the CPU provider until that is fixed upstream; graph_aa
+            # is a comparison mode, so correctness beats speed here.
+            print("graph_aa: pinning CPUExecutionProvider (CUDA EP "
+                  "computes antialias Resize incorrectly, ORT<=1.19)")
+            return OnnxSegmenter(wrapped,
+                                 providers=["CPUExecutionProvider"])
+        return OnnxSegmenter(wrapped)
     print(f"Loading ONNX model via OnnxSegmenter: {model_path}")
     return OnnxSegmenter(model_path)
 
