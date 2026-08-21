@@ -69,6 +69,13 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository_owner }}/winmol-analyzer-${{ matrix.variant }}
+          # metadata-action defaults to `latest=auto`, which appends
+          # `latest` on ANY git-tag event and ignores the enable= on the
+          # type=raw line below. Measured on v0.0.0-ghcr-test1: the raw
+          # entry resolved to `enable=false` and the flavor added `latest`
+          # anyway. Turning the flavor off makes the line below the single
+          # thing that decides it.
+          flavor: latest=false
           # A tag push yields the version tag; every other run gets a sha
           # tag that cannot be mistaken for a release.
           #
