@@ -1,0 +1,208 @@
+name: Container images
+
+# Builds the two compute images (docker/Dockerfile, VARIANT=cpu|gpu) and
+# publishes them to GHCR on a tag push.
+#
+# Ported from the superseded #10 (feat/gpu-container, .github/workflows/
+# gpu-image.yml), retargeted at the reimpl tree: one Dockerfile with a
+# VARIANT build-arg instead of docker/gpu/Dockerfile, and requirements/
+# core.txt instead of the legacy requirements/geo.txt. The plan doc
+# (docs/superpowers/plans/2026-07-29-reimpl-gpu-container-batch.md) deferred
+# this workflow until requirements/gpu.txt existed; it does now.
+#
+# BUILD -> SMOKE-TEST -> PUSH, in that order, and the push is a separate
+# step. #10 pushed first and smoke-tested afterwards, so a failing check
+# left a broken `latest` already public in GHCR. The second build is a
+# near-total cache hit, so the ordering costs almost nothing.
+#
+# pull_request builds and tests WITHOUT pushing, so a broken Dockerfile or
+# a bad dependency resolve fails in review rather than at release time.
+# That matters more than usual here: the GPU image cannot be built on an
+# arm64 Mac at all (onnxruntime-gpu ships only manylinux x86_64 wheels), so
+# CI is the first place the build is exercised.
+
+on:
+  push:
+    tags:
+      - "*"
+  pull_request:
+    paths:
+      - "docker/**"
+      - "requirements/**"
+      - ".dockerignore"
+      - ".github/workflows/images.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: ${{ matrix.variant }} image
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      # One variant failing must not hide the other's result: they have
+      # entirely separate dependency closures.
+      fail-fast: false
+      matrix:
+        variant: [cpu, gpu]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The GPU image carries ~2 GB of CUDA wheels and is loaded into the
+      # local daemon below before it is pushed, which a stock runner does
+      # not comfortably have room for.
+      - name: Reclaim runner disk
+        if: matrix.variant == 'gpu'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          df -h /
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Image name and tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/winmol-analyzer-${{ matrix.variant }}
+          # A tag push yields both the version and `latest`; every other
+          # run gets a sha tag that cannot be mistaken for a release.
+          tags: |
+            type=ref,event=tag
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
+            type=sha,format=short
+
+      # Build into the local daemon first so the smoke tests below have
+      # something to run before anything is published.
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          build-args: VARIANT=${{ matrix.variant }}
+          load: true
+          tags: winmol-smoke:${{ matrix.variant }}
+          # Scoped per variant: a shared scope would have the two builds
+          # evicting each other's layers on every run.
+          cache-from: type=gha,scope=${{ matrix.variant }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}
+
+      - name: Smoke-test the image
+        env:
+          IMG: winmol-smoke:${{ matrix.variant }}
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          set -euo pipefail
+
+          # The compute core and the batch CLI import cleanly.
+          docker run --rm --entrypoint python "$IMG" -c \
+            "import utils.IO, utils.onnx_runtime, utils.Prediction, utils.PredictWorkers, \
+                    classes.Config, winmol_batch; print('compute core + CLI OK')"
+          docker run --rm --entrypoint python "$IMG" winmol_batch.py --help > /dev/null
+          echo "CLI OK"
+
+          # The variant is what it claims to be. The Dockerfile already
+          # asserts onnxruntime XOR onnxruntime-gpu at BUILD time; this
+          # asserts the consequence at RUN time, which is what users see.
+          if [ "$VARIANT" = "cpu" ]; then
+            docker run --rm --entrypoint python "$IMG" -c \
+              "import onnxruntime as o; ps = o.get_available_providers(); print('providers:', ps); \
+               assert 'CUDAExecutionProvider' not in ps, 'CPU image ships a CUDA provider'"
+            exit 0
+          fi
+
+          # --- GPU only, from here down --------------------------------
+          #
+          # The runner has no GPU, so CUDA execution cannot be exercised.
+          # But the most common failure IS checkable here: the CUDA
+          # provider's shared libraries failing to resolve.
+          #
+          # An earlier version of this check asserted only that
+          # get_available_providers() listed CUDAExecutionProvider — which
+          # merely reads a list, and passed happily on an image where
+          # creating the provider died with "libcublasLt.so.12: cannot open
+          # shared object file", silently falling back to CPU on the
+          # target machine.
+          docker run --rm --entrypoint python "$IMG" -c \
+            "import onnxruntime as o; ps = o.get_available_providers(); print('providers:', ps); \
+             assert 'CUDAExecutionProvider' in ps, 'GPU build missing CUDA provider'"
+
+          # The one that actually matters: can the provider's deps load?
+          #
+          # preload_native_libs() FIRST, and that is not a formality. This
+          # image ships no LD_LIBRARY_PATH — the CUDA wheels live in
+          # site-packages/nvidia/*/lib, which ld.so does not search, and
+          # utils.onnx_runtime.preload_native_libs() is the thing that
+          # dlopens them by absolute path. Importing onnxruntime does NOT
+          # do it (measured: a session built without the preload comes back
+          # running CPUExecutionProvider and raises nothing at all).
+          #
+          # So a bare ctypes.CDLL without the preload fails here even
+          # though the image is perfectly good. If you see that, add the
+          # preload back rather than deleting the check.
+          #
+          # THE .so.12 / .so.9 SONAMES ARE LOAD-BEARING. They are the
+          # tripwire for requirements/gpu.txt's `<1.27` ceiling: 1.27 moved
+          # its extras to CUDA 13 (nvidia-*-cu13), so a resolve that
+          # escapes the pin lands libcudart.so.13 and these names vanish.
+          # Do not "fix" a failure here by relaxing the soname — check the
+          # pin first.
+          docker run --rm --entrypoint python "$IMG" -c \
+            "import utils.onnx_runtime as o; o.preload_native_libs(); \
+             import ctypes; \
+             [ctypes.CDLL(n) for n in ('libcublasLt.so.12','libcublas.so.12','libcudnn.so.9')]; \
+             print('CUDA runtime libraries resolve')"
+
+          # And that onnxruntime's own CUDA provider .so links cleanly.
+          docker run --rm --entrypoint python "$IMG" -c \
+            "import utils.onnx_runtime as o; o.preload_native_libs(); \
+             import ctypes, glob, onnxruntime, os; \
+             so = glob.glob(os.path.join(os.path.dirname(onnxruntime.__file__), \
+                            'capi', 'libonnxruntime_providers_cuda.so'))[0]; \
+             ctypes.CDLL(so); print('CUDA provider library links:', os.path.basename(so))"
+
+      # Only now, and only when this is not a PR. The layers are already in
+      # the gha cache, so this re-runs in seconds.
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          build-args: VARIANT=${{ matrix.variant }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.variant }}
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### ${{ matrix.variant }} image"
+            echo ""
+            echo '```'
+            echo '${{ steps.meta.outputs.tags }}'
+            echo '```'
+            echo ""
+            echo "Pushed: ${{ github.event_name != 'pull_request' }}"
+            if [ "${{ matrix.variant }}" = "gpu" ]; then
+              echo ""
+              echo "CUDA itself is NOT exercised here — the runner has no GPU."
+              echo "The image carries SASS for sm_60/70/75/80/86/90a and no PTX,"
+              echo "so Maxwell-and-older and Blackwell (sm_100/sm_120) will not run."
+              echo "Host needs an r525+ driver. Verify on the target machine."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

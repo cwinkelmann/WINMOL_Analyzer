@@ -128,12 +128,27 @@ into a single GeoPackage.
 ### Docker
 
 Two images, because `onnxruntime` and `onnxruntime-gpu` cannot be installed
-together:
+together. Every release tag publishes both to GHCR:
+
+```bash
+docker pull ghcr.io/cwinkelmann/winmol-analyzer-gpu:latest
+docker pull ghcr.io/cwinkelmann/winmol-analyzer-cpu:latest
+```
+
+Or build them yourself:
 
 ```bash
 docker build -f docker/Dockerfile --build-arg VARIANT=cpu -t winmol:cpu .
 docker build -f docker/Dockerfile --build-arg VARIANT=gpu -t winmol:gpu .
 ```
+
+The GPU image needs only an NVIDIA driver (**r525 or newer**) and
+`nvidia-container-toolkit` — no system CUDA toolkit, because the CUDA
+userspace ships inside the image as wheels. It carries compiled kernels for
+compute capabilities 6.0, 7.0, 7.5, 8.0, 8.6 and 9.0 and **no PTX**, so it
+covers Pascal through Hopper — GTX 10-series and RTX 20/30/40-series
+(desktop and laptop), T4, A100, H100 — but cannot run on Maxwell or older,
+nor on Blackwell (RTX 50-series, B200). Use the CPU image there.
 
 ```bash
 docker run --rm --gpus all \

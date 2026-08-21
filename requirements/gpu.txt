@@ -23,9 +23,22 @@
 #
 # The [cuda,cudnn] extras ship the CUDA userspace as wheels (cuBLAS,
 # cuDNN, cuFFT, cuRAND, nvrtc, cuda_runtime, nvJitLink), so the host
-# needs an NVIDIA DRIVER and nothing else — no system CUDA toolkit,
-# and no LD_LIBRARY_PATH: onnxruntime >= 1.26 preloads the wheel
-# libraries itself.
+# needs an NVIDIA DRIVER and nothing else — no system CUDA toolkit.
+#
+# No LD_LIBRARY_PATH either, but NOT because onnxruntime handles it:
+# it does not. The wheels land in site-packages/nvidia/*/lib, which
+# ld.so does not search, and `import onnxruntime` alone leaves the
+# sonames unresolvable. utils/onnx_runtime.preload_native_libs() is
+# what dlopens them by absolute path, and it must run before the
+# session is created. Measured in the CUDA image (2026-08-21):
+#
+#   without preload_native_libs():  session -> ['CPUExecutionProvider']
+#   with    preload_native_libs():  session -> ['CUDAExecutionProvider', ...]
+#
+# and the first case RAISES NOTHING — it is a silent, full-speed-looking
+# fallback to the CPU. So preload_native_libs() is not a workaround to
+# be tidied away; it is the mechanism. .github/workflows/images.yml
+# smoke-tests it on every build.
 #
 # CEILING (<1.27): onnxruntime-gpu 1.27 moved its extras to CUDA 13
 # (nvidia-*-cu13) and fails at import with `ImportError:
