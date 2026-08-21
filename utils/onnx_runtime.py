@@ -190,6 +190,60 @@ def _layout(shape, channels):
     return "NHWC"
 
 
+#: ORT graph transformer that rewrites a quantized model's NCHW ops into
+#: NHWC to reach the CPU EP's NHWC int8 kernels. It runs only at
+#: ORT_ENABLE_ALL, which is the default.
+_NHWC_TRANSFORMER = "NhwcTransformer"
+
+
+def _session_options():
+    """Session options that keep the in-graph resize legal on the CPU.
+
+    `graph` (the default read strategy) prepends a cubic Resize to the
+    model. The graph emits it in NCHW, which every provider accepts. But
+    with a QUANTIZED model attached, NhwcTransformer rewrites the whole
+    subgraph to NHWC -- the Resize with it -- and onnxruntime's cubic
+    Resize refuses NHWC downsampling without `antialias`:
+
+        upsamplebase.h:579 ScalesValidation 'Cubic' mode only supports:
+          ... the corresponding outermost and innermost scale values being
+          1 and other scales >= 1 without antialias attribute
+
+    So the failure needs three things at once, which is why it hid for so
+    long: the int8 model (the CPU default), the `graph` strategy, and an
+    orthomosaic FINER than the model's target GSD, so the resize is a
+    downscale. Bremerhagen (1.23 cm/px) hits all three and dies on tile
+    one; Barnekow (2.07 cm/px) upsamples and never notices. Measured:
+
+        input->512   scale   CPU EP   CUDA EP
+        256x256      2.00    OK       OK
+        400x400      1.28    OK       -
+        513x513      0.998   FAIL     -
+        1024x1024    0.50    FAIL     OK
+
+    CUDA's Resize has no such restriction, so this is a provider split in
+    a strategy documented as "v0.5.0-equivalent on EVERY execution
+    provider" -- the CPU image, the one recommended to anyone without a
+    GPU, was the half that broke.
+
+    Disabling that one transformer is the whole fix. Capping the level at
+    ORT_ENABLE_EXTENDED also works but gives up every other optimization
+    for it and measured ~11.5% slower (5012 vs 4494 ms/batch-of-4);
+    dropping only NhwcTransformer measured 4916 vs 4903 ms, i.e. free.
+    Verified against CUDA on identical input: max|diff| 2.4e-07, one ULP
+    of float32, mean 1.5e-08.
+
+    Applied unconditionally rather than only for CPU/int8: the
+    transformer is a no-op where it does not apply, and a session that
+    behaves the same everywhere is the property this strategy is
+    supposed to have.
+    """
+    opts = ort.SessionOptions()
+    opts.add_session_config_entry(
+        "optimization.disable_specified_optimizers", _NHWC_TRANSFORMER)
+    return opts
+
+
 class OnnxSegmenter:
     def __init__(self, model_path, providers=None):
         self.model_path = model_path
@@ -199,7 +253,7 @@ class OnnxSegmenter:
         # it as a warning on a session that otherwise looks fine.
         preload_native_libs(self.providers)
         self.session = ort.InferenceSession(
-            str(model_path), providers=self.providers)
+            str(model_path), _session_options(), providers=self.providers)
         self._verify_providers()
         inp = self.session.get_inputs()[0]
         out = self.session.get_outputs()[0]
