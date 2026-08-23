@@ -1,11 +1,11 @@
 {
     "_comment": [
-        "Schema 2. All models pinned (sha256 + size_mb) to release 'models-v1' on ",
-        "github.com/cwinkelmann/WINMOL_segmentor_pt. Families Spruce/Beech/",
-        "Spruce_Deadwood/General map to that release's timestamped Zenodo-flavour ",
-        "assets (model_UNet_<GenDS|SpecDS_*>_512_<timestamp>[_fp16|_int8].onnx); ",
-        "the beech_pytorch_* trio is our retrained PyTorch UNet (standalone, no ",
-        "family — resolve by explicit id)."
+        "Schema 2. Stock families Spruce/Beech/Spruce_Deadwood/General are the ",
+        "2023 release-'models-v1' models. Beech_4Site is the 2026 four-site beech ",
+        "corpus from release 'models-v2' (tile F1 0.7681 vs the 2023 beech model); ",
+        "it is a SEPARATE family because a family maps one entry per precision, so ",
+        "two beech models cannot share one. The beech_pytorch_* trio is our ",
+        "retrained PyTorch UNet (standalone, no family - resolve by explicit id)."
     ],
     "schema": 2,
     "gui_default": "spruce_deadwood_int8",
@@ -13,6 +13,7 @@
         "spruce_deadwood_int8",
         "beech_pytorch_int8",
         "spruce_int8",
+        "beech_4site_int8",
         "beech_int8",
         "general_int8"
     ],
@@ -32,6 +33,10 @@
         "General": {
             "label": "General (mixed species)",
             "default": "general_fp32"
+        },
+        "Beech_4Site": {
+            "label": "Beech (four-site, 2026)",
+            "default": "beech_4site_fp32"
         }
     },
     "models": {
@@ -93,6 +98,36 @@
             "file": "model_UNet_SpecDS_Beech_512_2023-02-28_042751_int8.onnx",
             "sha256": "a19501ea98e04e695d89cad55590f99225c927c749b6b3df610ca95f02ab8289",
             "size_mb": 29.91,
+            "lossless": false
+        },
+        "beech_4site_fp32": {
+            "label": "Beech four-site (fp32, reference)",
+            "family": "Beech_4Site",
+            "precision": "fp32",
+            "url": "https://github.com/cwinkelmann/WINMOL_segmentor_pt/releases/download/models-v2/model_UNet_Beech4Site_512_jitter.onnx",
+            "file": "model_UNet_Beech4Site_512_jitter.onnx",
+            "sha256": "40247e5c1bfa1a02993b360ab379a563b2716407e47f4755e9382c8016211800",
+            "size_mb": 118.38,
+            "lossless": true
+        },
+        "beech_4site_fp16": {
+            "label": "Beech four-site (fp16, GPU)",
+            "family": "Beech_4Site",
+            "precision": "fp16",
+            "url": "https://github.com/cwinkelmann/WINMOL_segmentor_pt/releases/download/models-v2/model_UNet_Beech4Site_512_jitter_fp16.onnx",
+            "file": "model_UNet_Beech4Site_512_jitter_fp16.onnx",
+            "sha256": "fc7b9261ab7d52de989942f40ac01aca1a4d6af8fd48e9a51cbb6de9b834853a",
+            "size_mb": 59.2,
+            "lossless": true
+        },
+        "beech_4site_int8": {
+            "label": "Beech four-site (int8, CPU)",
+            "family": "Beech_4Site",
+            "precision": "int8",
+            "url": "https://github.com/cwinkelmann/WINMOL_segmentor_pt/releases/download/models-v2/model_UNet_Beech4Site_512_jitter_int8.onnx",
+            "file": "model_UNet_Beech4Site_512_jitter_int8.onnx",
+            "sha256": "e0b778c2abecc43011fafec997a395f19c67d57122936d0ba7cc57d9f1204e55",
+            "size_mb": 29.73,
             "lossless": false
         },
         "spruce_deadwood_fp32": {
