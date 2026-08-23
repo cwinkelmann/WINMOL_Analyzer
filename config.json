@@ -8,12 +8,13 @@
         "retrained PyTorch UNet (standalone, no family - resolve by explicit id)."
     ],
     "schema": 2,
-    "gui_default": "spruce_deadwood_int8",
+    "gui_default": "allspecies_int8",
     "recommended": [
+        "allspecies_int8",
+        "beech_4site_int8",
         "spruce_deadwood_int8",
         "beech_pytorch_int8",
         "spruce_int8",
-        "beech_4site_int8",
         "beech_int8",
         "general_int8"
     ],
@@ -36,10 +37,44 @@
         },
         "Beech_4Site": {
             "label": "Beech (four-site, 2026)",
-            "default": "beech_4site_fp32"
+            "default": "beech_4site_fp16"
+        },
+        "AllSpecies": {
+            "label": "All species (2026)",
+            "default": "allspecies_fp16"
         }
     },
     "models": {
+        "allspecies_fp32": {
+            "label": "All species (fp32, reference)",
+            "family": "AllSpecies",
+            "precision": "fp32",
+            "url": "https://github.com/cwinkelmann/WINMOL_segmentor_pt/releases/download/models-v3/model_UNet_AllSpecies_512_jitter.onnx",
+            "file": "model_UNet_AllSpecies_512_jitter.onnx",
+            "sha256": "d97400885bd768a0df27b0c6df80b9725a728f45666089bf387be06958781686",
+            "size_mb": 118.38,
+            "lossless": true
+        },
+        "allspecies_fp16": {
+            "label": "All species (fp16, GPU)",
+            "family": "AllSpecies",
+            "precision": "fp16",
+            "url": "https://github.com/cwinkelmann/WINMOL_segmentor_pt/releases/download/models-v3/model_UNet_AllSpecies_512_jitter_fp16.onnx",
+            "file": "model_UNet_AllSpecies_512_jitter_fp16.onnx",
+            "sha256": "a240d32a99ae1ea42fea94d8f79ea2f4eaed772c17b039cccaafb7972b9cc70e",
+            "size_mb": 59.2,
+            "lossless": true
+        },
+        "allspecies_int8": {
+            "label": "All species (int8, CPU)",
+            "family": "AllSpecies",
+            "precision": "int8",
+            "url": "https://github.com/cwinkelmann/WINMOL_segmentor_pt/releases/download/models-v3/model_UNet_AllSpecies_512_jitter_int8.onnx",
+            "file": "model_UNet_AllSpecies_512_jitter_int8.onnx",
+            "sha256": "63ab08b946d4a3d5e7c489f5f522a9d63591fdc22874c22b8593c11f2a0fc702",
+            "size_mb": 29.73,
+            "lossless": false
+        },
         "spruce_fp32": {
             "label": "Spruce (fp32, reference)",
             "family": "Spruce",
