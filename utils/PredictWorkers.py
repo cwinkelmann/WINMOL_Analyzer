@@ -11,7 +11,8 @@ from rasterio.windows import Window
 
 from classes.Config import Config
 from utils import IO
-from utils.Prediction import _prepare_inference_batch
+from utils.Prediction import (_prepare_inference_batch, _resize_batch,
+                              resolve_read_strategy, strategy_wraps_graph)
 
 
 def _config_from_dict(config_dict: dict) -> Config:
@@ -97,13 +98,15 @@ def _format_eta(seconds: float) -> str:
 
 
 def _predict_batch(raw_tiles, raw_masks, model, config):
-    # This path loads the RAW model (wrap_preprocess=False) and supplies
-    # tiles already on the model grid, so batch preparation must take the
-    # float path regardless of the session-wide read-strategy flag --
-    # under the `graph` default it would otherwise feed uint8 to a model
-    # without the in-graph preprocessing.
+    # Follow the session-wide strategy, exactly as the stream loop does.
+    # This used to force "native" because the workers loaded the model
+    # unwrapped, which put the normalize + 1250^2 -> 512^2 resample of
+    # every tile on the CPU: measured on 8xH100 as 1.974 s per tile of
+    # "inference" for a model that runs in 2.97 ms, i.e. 106 tiles/min
+    # against the stream's 8569. The workers now load the wrapped model,
+    # so the resize happens on device and this hands it native uint8.
     tile_tensor, mask_resized = _prepare_inference_batch(
-        raw_tiles, raw_masks, config, read_strategy="native")
+        raw_tiles, raw_masks, config)
     pred = model.predict_on_batch(tile_tensor)
     crop = config.overlap_pred // 2
     threshold = float(getattr(config, 'stem_binary_threshold', 0.5))
@@ -129,7 +132,27 @@ def _group_jobs(jobs, batch_size):
         yield batch
 
 
-def _read_batch_jobs(src, indexes, batch_jobs):
+def _graph_out_size(config):
+    """Model grid when the wrapped graph will do the resize, else None.
+
+    None keeps the pre-existing behaviour for the non-graph strategies:
+    masks stay native and `_prepare_inference_batch` resizes both tile
+    and mask on the CPU, as it always did.
+    """
+    if not strategy_wraps_graph(resolve_read_strategy(config)):
+        return None
+    return (int(config.img_height), int(config.img_width))
+
+
+def _read_batch_jobs(src, indexes, batch_jobs, out_size=None):
+    """Read a batch of tiles at native resolution.
+
+    ``out_size`` is the model grid. When it is set the validity mask is
+    resized onto it here and the IMAGE is left native, which is the
+    contract the wrapped graph expects (it resizes the image on device).
+    Nearest on one channel is cheap; bicubic on three at 1250^2 is not,
+    which is the whole reason this path was slow.
+    """
     raw_tiles = []
     raw_masks = []
     stats = {
@@ -166,6 +189,15 @@ def _read_batch_jobs(src, indexes, batch_jobs):
             pixel_mask if np.all(gdal_mask) else (gdal_mask & pixel_mask)
         stats['prep_s'] += time.perf_counter() - t0
 
+        if out_size is not None:
+            t0 = time.perf_counter()
+            mk = valid_mask.astype(np.float32)[:, :, None]
+            valid_mask = _resize_batch(
+                mk[None, ...],
+                (int(out_size[0]), int(out_size[1])),
+                order=0)[0, :, :, 0] > 0.5
+            stats['prep_s'] += time.perf_counter() - t0
+
         raw_tiles.append(tile)
         raw_masks.append(valid_mask)
     stats['read_s'] = \
@@ -185,7 +217,10 @@ def prediction_worker(
     from utils.IO import load_model_from_path
 
     cfg = _config_from_dict(config_dict)
-    model = load_model_from_path(model_path, cfg, wrap_preprocess=False)
+    # Wrapped, so the normalize + resize run on THIS worker's GPU instead
+    # of on the CPU inside the timed inference block.
+    model = load_model_from_path(model_path, cfg)
+    out_size = _graph_out_size(cfg)
     batch_size = max(1, int(getattr(cfg, 'prediction_batch_size', None)
                             or getattr(cfg, 'prediction_batch_gpu', 4)))
 
@@ -193,7 +228,7 @@ def prediction_worker(
         indexes = list(range(1, min(cfg.n_channels, src.count) + 1))
         for batch_jobs in _group_jobs(jobs, batch_size):
             raw_tiles, raw_masks, read_stats = \
-                _read_batch_jobs(src, indexes, batch_jobs)
+                _read_batch_jobs(src, indexes, batch_jobs, out_size)
             infer0 = time.perf_counter()
             pred_cores = _predict_batch(raw_tiles, raw_masks, model, cfg)
             infer_s = time.perf_counter() - infer0
@@ -220,7 +255,10 @@ def prediction_service_worker(
     from utils.IO import load_model_from_path
 
     cfg = _config_from_dict(config_dict)
-    model = load_model_from_path(model_path, cfg, wrap_preprocess=False)
+    # Same reasoning as prediction_worker: wrapped so the preprocessing
+    # runs on device.
+    model = load_model_from_path(model_path, cfg)
+    out_size = _graph_out_size(cfg)
     batch_size = max(1, int(getattr(cfg, 'prediction_batch_size', None)
                             or getattr(cfg, 'prediction_batch_gpu', 4)))
 
@@ -245,7 +283,7 @@ def prediction_service_worker(
 
             for batch_jobs in _group_jobs(jobs, batch_size):
                 raw_tiles, raw_masks, read_stats = \
-                    _read_batch_jobs(src, indexes, batch_jobs)
+                    _read_batch_jobs(src, indexes, batch_jobs, out_size)
                 infer0 = time.perf_counter()
                 pred_cores = _predict_batch(raw_tiles, raw_masks, model, cfg)
                 stats['infer_s'] += time.perf_counter() - infer0
