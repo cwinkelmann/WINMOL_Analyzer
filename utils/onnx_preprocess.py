@@ -150,7 +150,21 @@ def build_preprocessed_model(model_path, target_hw, out_path=None,
         if op.domain in ("", "ai.onnx") and op.version < min_opset:
             op.version = min_opset
     onnx.checker.check_model(model)
-    onnx.save(model, out_path)
+    # Publish atomically. `--jobs N` points every job at one model dir and
+    # they all derive the SAME wrap hash, so a bare save lets one job load
+    # another's half-written file -- measured on 8 GPUs as
+    # "INVALID_PROTOBUF: Protobuf parsing failed". os.replace is atomic
+    # within a filesystem, so the os.path.exists cache check above only
+    # ever sees a complete model, and a job that dies mid-write leaves
+    # nothing behind to be mistaken for one.
+    tmp = f"{out_path}.{os.getpid()}.tmp"
+    try:
+        onnx.save(model, tmp)
+        os.replace(tmp, out_path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
     return out_path
 
 
