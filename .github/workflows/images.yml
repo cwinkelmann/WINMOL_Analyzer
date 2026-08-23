@@ -179,6 +179,124 @@ jobs:
                             'capi', 'libonnxruntime_providers_cuda.so'))[0]; \
              ctypes.CDLL(so); print('CUDA provider library links:', os.path.basename(so))"
 
+      # The smoke test above proves the image is WELL-FORMED: it imports
+      # cleanly and the variant is what it claims. It mounts no volume and
+      # runs no inference -- and six defects lived in exactly that gap,
+      # every one of them found by hand on real data in 2026-08 rather
+      # than here.
+      #
+      # What this step covers, with the pre-fix image checked to actually
+      # FAIL each one (a check that cannot fail on its bug is decoration):
+      #   * /app and /data owned by uid 1000 alone, so the
+      #     `--user $(id -u):$(id -g)` a bind mount needs left the
+      #     container able to write nothing  -> run 0
+      #   * winmol_batch printed "N of M FAILED" and exited 0  -> run 3
+      #   * a read-only models mount killed the run  -> run 2
+      #
+      # Deliberately NOT covered here, because a 2-core GPU-less runner
+      # cannot reach them -- they have deterministic unit tests instead:
+      # the zero-detection merge (needs the tiled vector path, i.e. a large
+      # ortho), the wrap race (needs real concurrency) and the multi-GPU
+      # CPU-preprocessing regression (needs several GPUs).
+      #
+      # CPU only: the runners have no GPU and none of the above needs one.
+      - name: End-to-end run with mounts and real inference
+        if: matrix.variant == 'cpu'
+        env:
+          IMG: winmol-smoke:cpu
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/e2e"
+          rm -rf "$W"; mkdir -p "$W/input" "$W/output" "$W/models" "$W/bad"
+          chmod -R 0777 "$W"
+
+          # Built BY the image, so the runner needs no GDAL or rasterio.
+          # 3000 px at 1.2 cm is ~36 m: several tiles at the 15 m tile
+          # size, and FINER than the model's 2.93 cm grid, so every tile
+          # takes the downscaling in-graph resize -- the path that used to
+          # die on tile one on the CPU provider. Two files, so the
+          # --jobs 2 below really runs two jobs against one models dir;
+          # with a single ortho it silently degrades to one.
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -v "$W/input":/data/input --entrypoint python "$IMG" -c "
+          import numpy as np, rasterio
+          from rasterio.transform import from_origin
+          rng = np.random.default_rng(0)
+          data = rng.integers(1, 255, size=(3, 3000, 3000), dtype=np.uint8)
+          for name in ('a', 'b'):
+              with rasterio.open('/data/input/synthetic_' + name + '.tif', 'w',
+                                 driver='GTiff', width=3000, height=3000,
+                                 count=3, dtype='uint8',
+                                 crs=rasterio.crs.CRS.from_epsg(32633),
+                                 transform=from_origin(4e5, 5.9e6, .012, .012),
+                                 tiled=True, compress='DEFLATE') as dst:
+                  dst.write(data)
+          print('inputs written')
+          "
+
+          # --- run 0: an arbitrary uid, with NOTHING mounted ------------
+          # Bind mounts hide this: the HOST's permissions decide, so the
+          # image's own ownership is only visible without them.
+          docker run --rm --user 12345:12345 --entrypoint python "$IMG" -c "
+          import os, sys
+          bad = []
+          for p in ('/data/input', '/data/output', '/data/models',
+                    os.environ.get('XDG_CACHE_HOME', '/tmp')):
+              try:
+                  os.makedirs(p, exist_ok=True)
+                  open(os.path.join(p, '.probe'), 'w').write('x')
+              except OSError as e:
+                  bad.append(p + ': ' + type(e).__name__)
+          if bad:
+              sys.exit('arbitrary --user cannot write ' + '; '.join(bad))
+          print('arbitrary uid OK')
+          "
+
+          # --- run 1: the documented invocation, real inference ---------
+          # Random pixels yield no stems, and that is fine: an
+          # orthomosaic with no detections is a RESULT, so this must still
+          # exit 0 and write a stem map.
+          docker run --rm --user "$(id -u):$(id -g)" -e WINMOL_JOBS=2 \
+            -v "$W/input":/data/input:ro \
+            -v "$W/output":/data/output \
+            -v "$W/models":/data/models \
+            "$IMG" Spruce_Deadwood 2>&1 | tee "$W/r1.log"
+          test -f "$W/output/synthetic_a_stem_map.tif" \
+            || { echo "FAIL: no stem map written"; exit 1; }
+          ! grep -qi "Permission denied" "$W/r1.log" \
+            || { echo "FAIL: permission denied on a mounted run"; exit 1; }
+          echo "mounted run OK"
+
+          # --- run 2: read-only models mount ----------------------------
+          # Clearing the wrap is load-bearing. Leave run 1's behind and the
+          # cache-hit short-circuit means nothing needs writing, so this
+          # passes on a BROKEN image -- measured.
+          rm -rf "$W/output"; mkdir -p "$W/output"; chmod 0777 "$W/output"
+          rm -f "$W/models"/.winmol_pre_*
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -v "$W/input":/data/input:ro \
+            -v "$W/output":/data/output \
+            -v "$W/models":/data/models:ro \
+            "$IMG" Spruce_Deadwood 2>&1 | tee "$W/r2.log"
+          # Assert on the MESSAGE, not the exit status: the pre-fix image
+          # failed this ortho with exactly this error and still exited 0,
+          # so an exit-code gate alone was worthless here.
+          ! grep -qi "Read-only file system" "$W/r2.log" \
+            || { echo "FAIL: read-only models mount broke the run"; exit 1; }
+          echo "read-only models OK"
+
+          # --- run 3: a failed ortho must be a non-zero exit ------------
+          rm -rf "$W/output"; mkdir -p "$W/output"; chmod 0777 "$W/output"
+          head -c 4096 /dev/urandom > "$W/bad/broken.tif"
+          rc=0
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -v "$W/bad":/data/input:ro \
+            -v "$W/output":/data/output \
+            -v "$W/models":/data/models \
+            "$IMG" Spruce_Deadwood || rc=$?
+          [ "$rc" -ne 0 ] || { echo "FAIL: a failed ortho exited 0"; exit 1; }
+          echo "failure exit code OK (exit $rc)"
+
       # Only now, and only when this is not a PR. The layers are already in
       # the gha cache, so this re-runs in seconds.
       - name: Log in to GHCR
