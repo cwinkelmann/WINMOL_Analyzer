@@ -65,15 +65,29 @@ COPY . /app
 
 # Mount points. Models persist here so they are downloaded (and
 # checksum-verified by plugin_utils/model_registry) only once.
+#
+# Group 0 + g=u, not winmol:winmol. A bind mount is governed by the HOST's
+# ownership, so anyone whose host uid is not 1000 -- most users of a shared
+# server -- has to run `--user $(id -u):$(id -g)` to write to /data/output.
+# Measured 2026-08-23: under the old ownership that user could then write
+# NOTHING, not /app, not /data, not $HOME, because every path belonged to
+# uid 1000 alone. Owning them by group 0 and granting the group what the
+# owner has makes an arbitrary --user work; 1777 on the mount points covers
+# the case where one of them is left unmounted.
 RUN mkdir -p /data/input /data/output /data/models \
     && useradd -m -u 1000 winmol \
-    && chown -R winmol:winmol /app /data
+    && chown -R winmol:0 /app /data \
+    && chmod -R g=u /app /data \
+    && chmod 1777 /data/input /data/output /data/models
 USER winmol
 
+# XDG_CACHE_HOME: $HOME belongs to uid 1000, so an arbitrary --user cannot
+# cache the prediction autotune there. /tmp is writable by every uid.
 ENV WINMOL_INPUT=/data/input \
     WINMOL_OUTPUT=/data/output \
     WINMOL_MODEL_DIR=/data/models \
-    WINMOL_VARIANT=${VARIANT}
+    WINMOL_VARIANT=${VARIANT} \
+    XDG_CACHE_HOME=/tmp/winmol-cache
 
 ENTRYPOINT ["/app/docker/entrypoint.sh"]
 # Model family from config.json: Spruce | Beech | Spruce_Deadwood | General

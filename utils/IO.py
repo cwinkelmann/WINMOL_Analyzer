@@ -1610,7 +1610,14 @@ def merge_and_filter_tiled_results(
     for candidate in recursive_candidates[:5]:
         print(f'MERGE INPUT | {candidate}', flush=True)
     if not tiles:
-        raise FileNotFoundError(f"No .gpkg files found in: {work_dir}")
+        # No tiles wrote a GeoPackage. That is what an orthomosaic with no
+        # detections looks like, and it used to raise here -- marking the
+        # whole ortho FAILED for the crime of containing no trees. Fall
+        # through to the zero-feature summary below instead; the MERGE
+        # DISCOVERY line above still shows the root that came up empty, so
+        # a genuinely wrong work_dir stays diagnosable.
+        print(f"No .gpkg files found in: {work_dir} (0 detections)",
+              flush=True)
 
     merged_stems = []
     merged_nodes = []

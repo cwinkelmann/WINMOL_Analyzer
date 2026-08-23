@@ -327,6 +327,11 @@ def main(argv: List[str]) -> int:
 
     failures = process_orthos(orthos, model_path, args.output, args.jobs,
                               process_type=args.process_type)
+    # A failed ortho has to reach the caller as a non-zero status. Printing
+    # it is not enough: a scheduler driving the container image reads the
+    # exit code, and this returned 0 on a run where every ortho failed.
+    # Merge below still runs, so partial results are not thrown away.
+    exit_code = 1 if failures else 0
     if failures:
         print(f"\n{len(failures)} of {len(orthos)} orthomosaics FAILED:")
         for path, reason in failures:
@@ -344,7 +349,7 @@ def main(argv: List[str]) -> int:
             print(f"Merge failed: {e}")
             return 3
 
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

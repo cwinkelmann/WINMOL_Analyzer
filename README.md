@@ -151,12 +151,26 @@ covers Pascal through Hopper — GTX 10-series and RTX 20/30/40-series
 nor on Blackwell (RTX 50-series, B200). Use the CPU image there.
 
 ```bash
-docker run --rm --gpus all \
+docker run --rm --gpus all --user $(id -u):$(id -g) \
   -v /path/to/orthos:/data/input:ro \
   -v /path/to/results:/data/output \
   -v /path/to/models:/data/models \
   winmol:gpu Spruce_Deadwood
 ```
+
+`--user` is what makes the output land as **you** rather than as the image's
+uid 1000: a bind mount is governed by the host's ownership, so without it
+anyone whose host uid is not 1000 gets `Permission denied` writing results.
+It is also why the results are yours to delete afterwards.
+
+The models mount must be **writable**. Weights are immutable, so `:ro` is the
+natural instinct, but the first run also writes a small derived graph
+(`.winmol_pre_<hash>.onnx`, the in-graph resize) next to them; on a read-only
+mount that falls back to a temp dir and is rebuilt every run.
+
+On a **rootless** Docker daemon, container uids map into your subuid range
+instead, so `--user $(id -u)` does not name your host account — run as
+`--user 0:0` there, which maps to the host user who owns the daemon.
 
 The container sizes itself to the resources **it** has rather than the
 host's, so `--memory` and `--cpus` are respected instead of ignored:

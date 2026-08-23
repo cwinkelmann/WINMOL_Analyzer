@@ -164,3 +164,21 @@ def test_edge_buffer_default_reaches_merge_as_zero(monkeypatch, tmp_path):
 
     assert rc == 0
     assert captured["edge_buffer_m"] == 0.0
+
+
+def test_batch_exits_non_zero_when_an_ortho_fails(fake_run, monkeypatch):
+    """A failed ortho must reach the caller as a non-zero exit code.
+
+    Measured on carrot 2026-08-23: the container printed "1 of 1
+    orthomosaics FAILED" and still exited 0, so a scheduler driving the
+    image read a total failure as success.
+    """
+    monkeypatch.setattr(winmol_batch, "detect_gpu_count", lambda: 1)
+    monkeypatch.setattr(winmol_batch, "list_orthomosaics",
+                        lambda _folder: ["/in/boom.tif"])
+    monkeypatch.setattr(winmol_batch, "resolve_model_path",
+                        lambda *a, **k: "/m.onnx")
+
+    rc = winmol_batch.main(["Spruce", "--input", "/in", "--output", "/out"])
+
+    assert rc != 0
