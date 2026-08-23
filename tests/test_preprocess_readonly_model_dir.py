@@ -25,6 +25,16 @@ def readonly_model_dir(tmp_path):
     model_dir.mkdir()
     model = build_tiny_unet(model_dir / "m.onnx")
     os.chmod(model_dir, 0o555)
+    # chmod does not make a DIRECTORY read-only on Windows -- it only
+    # touches the read-only attribute on files -- and root ignores the
+    # bits anyway. Check that the precondition actually holds instead of
+    # asserting behaviour the platform cannot produce: measured on
+    # windows-latest, the wrap simply landed in the models dir and the
+    # fallback assertion failed on a perfectly correct build.
+    if os.access(model_dir, os.W_OK):
+        os.chmod(model_dir, 0o755)
+        pytest.skip("cannot make a directory read-only here "
+                    "(Windows, or running as root)")
     yield model, model_dir
     os.chmod(model_dir, 0o755)
 
