@@ -3,6 +3,7 @@
 docs/resize-mechanics.md is the why. These tests pin the wiring: the
 config default, the WINMOL_BENCH_READ override kept for benchmarking,
 model wrapping at load time, and the stream feeding native uint8 tiles
+in NCHW -- GDAL's own layout, which the graph now takes directly
 to the wrapped model when nothing is overridden.
 """
 import os
@@ -54,7 +55,7 @@ def test_graph_aa_wraps_antialiased_and_pins_cpu(tiny_unet_file, monkeypatch):
     monkeypatch.setenv("WINMOL_BENCH_READ", "graph")
     seg = load_model_from_path(tiny_unet_file)
     rng = np.random.default_rng(1)
-    x = rng.integers(0, 256, (1, 1024, 1024, 3), dtype=np.uint8)
+    x = rng.integers(0, 256, (1, 3, 1024, 1024), dtype=np.uint8)
     d = float(np.abs(seg_aa.predict_on_batch(x)
                      - seg.predict_on_batch(x)).max())
     assert d > 1e-4, "antialias attribute had no effect on the wrapped graph"
@@ -74,14 +75,14 @@ def test_cupy_strategy_is_recognized_but_guarded(monkeypatch):
 
 def test_load_wraps_model_for_uint8_any_size_input(tiny_unet_file,
                                                    monkeypatch):
-    """By default the loaded segmenter takes NHWC uint8 at ANY tile size
+    """By default the loaded segmenter takes NCHW uint8 at ANY tile size
     and resizes in-graph -- the wrapped contract, not the raw model's."""
     pytest.importorskip("onnxruntime")
     monkeypatch.delenv("WINMOL_BENCH_READ", raising=False)
     from utils.IO import load_model_from_path
     seg = load_model_from_path(tiny_unet_file)
     out = seg.predict_on_batch(
-        np.zeros((1, 299, 299, 3), dtype=np.uint8))
+        np.zeros((1, 3, 299, 299), dtype=np.uint8))
     assert out.shape[1:3] == (512, 512)
 
 
@@ -119,4 +120,15 @@ def test_stream_feeds_model_per_strategy(tmp_path, test_geotiff_file,
     assert spy.batches, "model was never called"
     dtype, shape = spy.batches[0]
     assert dtype == want_dtype
-    assert shape[1] == want_h
+    # Layout differs BY STRATEGY, which is the point of this check:
+    # the graph strategies take GDAL's native NCHW uint8 straight
+    # through, while the GDAL strategies still hand over NHWC float32
+    # on the model grid. Asserting the channel position pins the
+    # layout, so a regression either way trips here rather than deep
+    # in onnxruntime with a dimension error.
+    if want_dtype == np.uint8:
+        assert shape[1] == 3, f"graph path must be NCHW, got {shape}"
+        assert shape[2] == want_h
+    else:
+        assert shape[3] == 3, f"GDAL path must be NHWC, got {shape}"
+        assert shape[1] == want_h

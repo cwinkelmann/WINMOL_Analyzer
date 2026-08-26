@@ -306,14 +306,21 @@ class OnnxSegmenter:
     def predict_on_batch(self, x):
         """x: NHWC [N,512,512,3] -> NHWC [N,512,512,1].
 
-        With an in-graph preprocessing head the input is instead raw
-        uint8 NHWC at NATIVE tile size, and the graph resizes it."""
+        EXCEPT on the in-graph preprocessing path, where x is raw uint8
+        in the GRAPH'S OWN layout (NCHW) at native tile size and the graph
+        does the normalize+resize. That batch is already correct, so it is
+        fed through untouched -- transposing it here would undo the very
+        copy the NCHW contract exists to avoid, and (measured) hand the
+        session an NHWC array it rejects outright.
+        """
         if getattr(self, 'input_is_uint8', False):
-            x = np.ascontiguousarray(x, dtype=np.uint8)
+            # Already in the graph's layout; np.stack upstream made it
+            # contiguous, so this is a no-op rather than a copy.
+            feed = np.ascontiguousarray(x, dtype=np.uint8)
         else:
             x = self._as_numpy(x)
-        feed = x if self.input_layout == "NHWC" else \
-            np.ascontiguousarray(np.transpose(x, (0, 3, 1, 2)))
+            feed = x if self.input_layout == "NHWC" else \
+                np.ascontiguousarray(np.transpose(x, (0, 3, 1, 2)))
         try:
             out = self.session.run(
                 [self.output_name], {self.input_name: feed})[0]
