@@ -217,6 +217,41 @@ def _resize_batch(batch_nhwc, size, order):
     return out
 
 
+def _nearest_indices(n_in: int, n_out: int) -> np.ndarray:
+    """Source indices skimage's order=0 resize would sample.
+
+    ``skimage.transform.resize`` maps an output centre back with
+    ``src = (dst + 0.5) * (n_in / n_out) - 0.5`` and, at order=0, hands
+    that to ``ndi.map_coordinates``, which rounds half UP (not numpy's
+    banker's rounding -- hence ``floor(x + 0.5)``) and clamps at the edge
+    under ``mode='edge'``. Reproducing that here is what makes the
+    indexing path below pixel-IDENTICAL rather than merely similar.
+    """
+    coords = (np.arange(n_out) + 0.5) * (float(n_in) / float(n_out)) - 0.5
+    return np.clip(np.floor(coords + 0.5).astype(np.intp), 0, n_in - 1)
+
+
+def _resize_mask_nearest(mask: np.ndarray, out_size) -> np.ndarray:
+    """Nearest-neighbour resize of a BOOLEAN mask, by indexing.
+
+    The old path cast the mask to float32, wrapped it into an NHWC batch
+    and pushed it through ``_resize_batch(order=0)`` -- i.e. skimage's
+    full ``warp`` machinery -- to do what is only an index selection.
+    Measured on a 1217x1217 tile from R13: 10.6 ms -> 1.7 ms, and the
+    output is bit-identical on every real tile tested.
+
+    That 10.6 ms was the single largest item in the producer, and it
+    holds the GIL: the producers are threads, so it did not parallelise.
+    Per tile the loop was 14.36 ms of which 82.9% was GIL-held, capping
+    threaded speed-up at 1.21x however many producers were configured --
+    which is why raising ``prediction_producer_workers_gpu`` never moved
+    throughput and why the GPU sat starved on ~2 of 12 cores.
+    """
+    rows = _nearest_indices(mask.shape[0], int(out_size[0]))
+    cols = _nearest_indices(mask.shape[1], int(out_size[1]))
+    return mask[rows[:, None], cols[None, :]]
+
+
 def _resize_like_consumer(tile, valid_mask, out_size):
     """Producer-side twin of _prepare_inference_batch's resize.
 
@@ -245,10 +280,10 @@ def _prepare_inference_batch(raw_tiles, raw_masks, config,
         read_strategy = resolve_read_strategy(config)
     if raw_masks is None:
         raw_masks = [_default_valid_mask(t) for t in raw_tiles]
-    mask_batch = np.stack(
-        [m.astype(np.float32)[:, :, None] for m in raw_masks],
-        axis=0,
-    )
+    # Stack the bools, then cast ONCE. Casting each mask first allocated a
+    # float32 temporary per tile before the stack copied it again: 0.908 ms
+    # -> 0.074 ms per batch, same array out.
+    mask_batch = np.stack(raw_masks, axis=0).astype(np.float32)[..., None]
 
     if strategy_wraps_graph(read_strategy):
         # The wrapped model normalizes and resizes in-graph: hand it the
@@ -256,8 +291,8 @@ def _prepare_inference_batch(raw_tiles, raw_masks, config,
         # masks to the model grid, so only stacking remains. EVERY caller
         # -- the consumer loop and the autotune probes alike -- must feed
         # the model this way, or the uint8 graph input rejects the batch.
-        from utils.onnx_preprocess import as_uint8_nhwc
-        return as_uint8_nhwc(raw_tiles), mask_batch
+        from utils.onnx_preprocess import as_uint8_nchw
+        return as_uint8_nchw(raw_tiles), mask_batch
 
     batch = np.stack([_raw_tile_to_batchable(t) for t in raw_tiles], axis=0)
     size = (config.img_height, config.img_width)
@@ -534,12 +569,25 @@ class TileBatchProducer(threading.Thread):
                                        resampling=Resampling.cubic)
                         mask_kw.update(out_shape=(oh, ow),
                                        resampling=Resampling.nearest)
-                    tile = src.read(
-                        indexes, window=window, **read_kw).transpose(1, 2, 0)
+                    # GDAL returns (C, H, W). The graph strategies now take
+                    # NCHW straight through, so the transpose to HWC happens
+                    # only for the strategies that genuinely need it. Keeping
+                    # the native layout is what makes the consumer's stack a
+                    # memcpy instead of a 29x strided gather.
+                    tile = src.read(indexes, window=window, **read_kw)
+                    if not strategy_wraps_graph(strat):
+                        tile = tile.transpose(1, 2, 0)
                     gdal_mask = src.read_masks(
                         1, window=window, **mask_kw) > 0
 
-                    pixel_mask = np.any(tile != 0, axis=2)
+                    # `!= 0` materialises a full HxWx3 bool temporary (4.4 MB
+                    # per tile) that `any` does not need -- it already treats
+                    # non-zero as true. Identical output, 1.77 ms -> 0.68 ms,
+                    # and this runs under the GIL so the saving is real
+                    # parallel capacity, not just CPU time.
+                    # channel axis: 0 while CHW (graph), 2 once HWC
+                    pixel_mask = np.any(
+                        tile, axis=0 if strategy_wraps_graph(strat) else 2)
 
                     # If GDAL mask is effectively all valid, it is not helping.
                     # Fall back to pixel-based validity for
@@ -554,11 +602,8 @@ class TileBatchProducer(threading.Thread):
                         # is only needed at model resolution for the
                         # binarize step, and nearest on one channel is
                         # cheap enough to keep here (and parallel).
-                        mk = valid_mask.astype(np.float32)[:, :, None]
-                        valid_mask = _resize_batch(
-                            mk[None, ...], (int(self.out_size[0]),
-                                            int(self.out_size[1])),
-                            order=0)[0, :, :, 0] > 0.5
+                        valid_mask = _resize_mask_nearest(
+                            valid_mask, self.out_size)
                     elif strat == "native_producer" and self.out_size:
                         # Same skimage resize the consumer would do, but
                         # run HERE so it parallelises across producers

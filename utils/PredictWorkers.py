@@ -11,8 +11,10 @@ from rasterio.windows import Window
 
 from classes.Config import Config
 from utils import IO
-from utils.Prediction import (_prepare_inference_batch, _resize_batch,
-                              resolve_read_strategy, strategy_wraps_graph)
+from utils.Prediction import (_prepare_inference_batch,
+                              _resize_mask_nearest,
+                              resolve_read_strategy,
+                              strategy_wraps_graph)
 
 
 def _config_from_dict(config_dict: dict) -> Config:
@@ -183,19 +185,20 @@ def _read_batch_jobs(src, indexes, batch_jobs, out_size=None):
         stats['read_mask_s'] += time.perf_counter() - t0
 
         t0 = time.perf_counter()
-        tile = tile.transpose(1, 2, 0)
-        pixel_mask = np.any(tile != 0, axis=2)
+        # out_size set == the wrapped graph will resize on device, which is
+        # exactly when it wants NCHW. Keep GDAL's layout then; transpose
+        # only for the CPU-resize path, which is NHWC throughout.
+        keep_chw = out_size is not None
+        if not keep_chw:
+            tile = tile.transpose(1, 2, 0)
+        pixel_mask = np.any(tile, axis=0 if keep_chw else 2)
         valid_mask = \
             pixel_mask if np.all(gdal_mask) else (gdal_mask & pixel_mask)
         stats['prep_s'] += time.perf_counter() - t0
 
         if out_size is not None:
             t0 = time.perf_counter()
-            mk = valid_mask.astype(np.float32)[:, :, None]
-            valid_mask = _resize_batch(
-                mk[None, ...],
-                (int(out_size[0]), int(out_size[1])),
-                order=0)[0, :, :, 0] > 0.5
+            valid_mask = _resize_mask_nearest(valid_mask, out_size)
             stats['prep_s'] += time.perf_counter() - t0
 
         raw_tiles.append(tile)

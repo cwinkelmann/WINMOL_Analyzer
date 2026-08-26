@@ -51,7 +51,7 @@ def build_preprocessed_model(model_path, target_hw, out_path=None,
                              antialias=False):
     """Return a path to `model_path` with uint8 -> normalize -> resize in front.
 
-    The wrapped model takes NHWC uint8 tiles at ANY spatial size (dims stay
+    The wrapped model takes NCHW uint8 tiles at ANY spatial size (dims stay
     dynamic) and resizes them to ``target_hw`` inside the graph.
 
     antialias=True widens the kernel with the downsampling factor (ONNX
@@ -69,6 +69,7 @@ def build_preprocessed_model(model_path, target_hw, out_path=None,
         key = hashlib.sha256(
             f"{os.path.realpath(model_path)}|{os.path.getmtime(model_path)}"
             f"|{th}x{tw}|{nchw}|{TF_CUBIC_COEFF_A}|aa{int(bool(antialias))}"
+            f"|in=nchw"
             .encode()
         ).hexdigest()[:16]
         name = f".winmol_pre_{key}.onnx"
@@ -89,17 +90,16 @@ def build_preprocessed_model(model_path, target_hw, out_path=None,
 
     src = "winmol_pre_input"
     nodes = [
-        # NHWC uint8 -> NCHW uint8. Resize needs NCHW regardless of what
-        # the wrapped model wants; we transpose back below if it is NHWC.
-        helper.make_node("Transpose", [src], ["pre_nchw"],
-                         perm=[0, 3, 1, 2], name="winmol_pre_transpose"),
-        helper.make_node("Cast", ["pre_nchw"], ["pre_f32"],
+        # The input IS NCHW now, which is what Resize needs; only a NHWC
+        # wrapped model needs transposing, and that happens after the
+        # resize (winmol_pre_untranspose below).
+        helper.make_node("Cast", [src], ["pre_f32"],
                          to=TensorProto.FLOAT, name="winmol_pre_cast"),
         helper.make_node("Div", ["pre_f32", "winmol_pre_255"], ["pre_norm"],
                          name="winmol_pre_div"),
         # Target size is built from the RUNTIME batch/channel dims so the
         # graph stays valid for any batch size.
-        helper.make_node("Shape", ["pre_nchw"], ["pre_shape"],
+        helper.make_node("Shape", [src], ["pre_shape"],
                          name="winmol_pre_shape"),
         helper.make_node("Slice", ["pre_shape", "winmol_pre_0",
                                    "winmol_pre_2", "winmol_pre_ax0"],
@@ -133,8 +133,13 @@ def build_preprocessed_model(model_path, target_hw, out_path=None,
                            [th, tw]),
     ]
 
+    # NCHW, not NHWC. GDAL hands us (C, H, W) already; the old contract
+    # took NHWC and the graph's first node transposed it straight back, so
+    # the pipeline paid a strided CPU gather (8.7 ms/tile, measured, on the
+    # single consumer thread) to undo a layout it never had to leave -- and
+    # then paid the GPU to undo that. Taking NCHW deletes both.
     new_input = helper.make_tensor_value_info(
-        src, TensorProto.UINT8, ["N", "H", "W", 3])
+        src, TensorProto.UINT8, ["N", 3, "H", "W"])
     model.graph.input.remove(inp)
     model.graph.input.insert(0, new_input)
     model.graph.initializer.extend(inits)
@@ -168,11 +173,18 @@ def build_preprocessed_model(model_path, target_hw, out_path=None,
     return out_path
 
 
-def as_uint8_nhwc(tiles):
-    """Stack raw tiles into the NHWC uint8 batch the wrapped graph wants."""
+def as_uint8_nchw(tiles):
+    """Stack raw (C, H, W) uint8 tiles into the NCHW batch the graph wants.
+
+    Tiles arrive exactly as GDAL returned them, so the stack is a memcpy.
+    The NHWC predecessor stacked ``.transpose(1, 2, 0)`` VIEWS, which made
+    every element a strided gather: 8.737 ms/tile against 0.297 ms/tile
+    contiguous, 29x, and it ran on the single consumer thread holding the
+    GIL. That one call was the whole of the consumer's `prep` time.
+    """
     batch = np.stack([np.ascontiguousarray(t) for t in tiles], axis=0)
     if batch.ndim == 3:
-        batch = batch[..., None]
-    if batch.shape[-1] > 3:
-        batch = batch[..., :3]
+        batch = batch[:, None, :, :]
+    if batch.shape[1] > 3:
+        batch = batch[:, :3, :, :]
     return np.ascontiguousarray(batch, dtype=np.uint8)
