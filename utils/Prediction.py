@@ -666,6 +666,104 @@ def _is_oom_error(exc) -> bool:
             or 'failed to allocate memory' in msg)
 
 
+class _CoreWriter(threading.Thread):
+    """Crops, binarises and writes finished predictions off the GPU thread.
+
+    The consumer loop used to do this inline, so the GPU idled through it.
+    Measured at b1 on R13: 13.5 ms of wall per tile against `infer` of
+    10.0 ms -- the GPU was busy 74% of the time and the other 26% was this
+    work, with the device parked. Moving it here lets it run DURING the
+    next inference.
+
+    That overlap is real only because onnxruntime releases the GIL inside
+    ``session.run``; NumPy here holds it, so the two interleave rather
+    than contend. If a future runtime stopped releasing it this would
+    degrade to the old serial cost rather than break.
+
+    Ordering does not matter: every core goes to its own
+    ``Window(col_off, row_off, ...)`` and tiles do not overlap in the
+    destination, so out-of-order writes give a bit-identical raster. The
+    queue is bounded so a slow disk applies backpressure instead of
+    growing the backlog without limit.
+
+    ONE writer only -- a rasterio dataset is not safe for concurrent
+    writes, and `dst` is owned exclusively by this thread once started.
+    """
+
+    _SENTINEL = object()
+
+    def __init__(self, dst, layout, config, maxsize=2):
+        super().__init__(daemon=True)
+        self.dst = dst
+        self.layout = layout
+        self.crop = config.overlap_pred // 2
+        self.img_width = config.img_width
+        self.threshold = float(getattr(
+            config, 'stem_binary_threshold', 0.5))
+        self.queue = queue.Queue(maxsize=maxsize)
+        self.write_s = 0.0
+        self.written = 0
+        self.error = None
+
+    def _put(self, payload):
+        """Block for space, but NEVER unconditionally.
+
+        A bare ``queue.put`` deadlocks the entire run the moment the
+        writer dies: the queue is bounded, nothing drains it any more, and
+        the GPU thread waits forever on a consumer that is gone. Polling
+        with a timeout lets us notice the corpse and re-raise its
+        exception instead of hanging. Caught by the regression test, which
+        hung for two minutes before this existed.
+        """
+        while True:
+            if self.error is not None:
+                raise self.error
+            if not self.is_alive():
+                raise RuntimeError(
+                    "prediction writer thread died without reporting an "
+                    "error; the stem map would be incomplete")
+            try:
+                self.queue.put(payload, timeout=0.25)
+                return
+            except queue.Full:
+                continue
+
+    def submit(self, pred, mask_resized, items):
+        self._put((pred, mask_resized, items))
+
+    def close(self):
+        """Drain, stop, and re-raise anything the thread swallowed."""
+        if self.is_alive():
+            try:
+                self._put(self._SENTINEL)
+            except Exception:
+                pass                    # dead already; self.error re-raised
+        self.join()
+        if self.error is not None:
+            raise self.error
+
+    def run(self):
+        try:
+            while True:
+                payload = self.queue.get()
+                if payload is self._SENTINEL:
+                    return
+                pred, mask_resized, items = payload
+                lo, hi = self.crop, self.img_width - self.crop
+                for idx, (job, _, _) in enumerate(items):
+                    pred_core = pred[idx, lo:hi, lo:hi, 0]
+                    mask_core = mask_resized[idx, lo:hi, lo:hi, 0] > 0.5
+                    core = _binarize_prediction_core(
+                        pred_core, mask_core, threshold=self.threshold)
+                    self.write_s += _write_prediction_core(
+                        self.dst, core, job, self.layout)
+                    self.written += 1
+        except BaseException as exc:            # surfaced by close()
+            # Never swallow: a dropped write is a hole in the stem map
+            # with nothing in the log to say so.
+            self.error = exc
+
+
 def _predict_tensor_adaptive(tile_tensor, model, batch_size):
     """Run the model over an already-prepared batch, halving on OOM.
 
@@ -1192,6 +1290,11 @@ def predict_stream_to_raster(
         producer.start()
 
     with rasterio.open(tmp_path, 'w', **out_profile) as dst:
+        # Owned exclusively by this thread from here on: a rasterio
+        # dataset is not safe for concurrent writes, so exactly one
+        # writer, started inside the `with` and drained before it closes.
+        writer = _CoreWriter(dst, layout, config)
+        writer.start()
         while finished_producers < len(producers) or pending_items:
             while (finished_producers < len(producers)
                    and len(pending_items) < chunk_size
@@ -1253,25 +1356,15 @@ def predict_stream_to_raster(
                 _persist_autotune_batch(autotune_key, autotune_cache_file,
                                         used_batch)
 
-            crop = config.overlap_pred // 2
-            write_batch_s = 0.0
-            for idx, (job, _, _) in enumerate(items):
-                pred_core = pred[idx, crop:(
-                    config.img_width - crop), crop:(
-                        config.img_width - crop), 0]
-                mask_core = mask_resized[idx, crop:(
-                    config.img_width - crop), crop:(
-                        config.img_width - crop), 0] > 0.5
-                pred_core = _binarize_prediction_core(
-                    pred_core,
-                    mask_core,
-                    threshold=float(getattr(
-                        config, 'stem_binary_threshold', 0.5)),
-                )
-                write_batch_s += _write_prediction_core(
-                    dst, pred_core, job, layout)
-                done += 1
-            total_write_s += write_batch_s
+            # Hand the batch to the writer and go straight back to the
+            # GPU. `done` counts SUBMITTED tiles so the ETA still tracks
+            # progress; the writer is bounded to 2 batches, so it can
+            # never fall more than that behind.
+            writer.submit(pred, mask_resized, items)
+            if writer.error is not None:        # fail fast, not at the end
+                raise writer.error
+            done += len(items)
+            total_write_s = writer.write_s
 
             now = time.monotonic()
             if (
@@ -1303,6 +1396,14 @@ def predict_stream_to_raster(
                     flush=True,
                 )
                 last_report = now
+
+        # Drain INSIDE the `with`, while dst is still open: the writer
+        # holds up to two batches, and flushing them into a closed
+        # dataset would lose the last tiles of every run. close() also
+        # re-raises whatever the thread caught, so a failed write ends
+        # the run instead of silently leaving holes in the stem map.
+        writer.close()
+        total_write_s = writer.write_s
 
     for producer in producers:
         producer.join()
