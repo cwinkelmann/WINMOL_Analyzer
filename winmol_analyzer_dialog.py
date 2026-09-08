@@ -304,9 +304,14 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self._deletion_flags = None
         # Model rows from the last model_status.scan (stat-only).
         self._model_rows = []
-        # Lazy caches: gpu_probe.probe() and the model-device verdict
-        # both shell out (bounded), so they run at most once per dialog.
+        # Lazy caches: gpu_probe and the model-device verdict both
+        # shell out (bounded), so they run at most once per dialog. The
+        # card probe was started at plugin load (initGui); this only
+        # picks up the running handle, because every reader below is
+        # reached from THIS constructor — starting it here would just
+        # block on a probe launched a few lines earlier.
         self._gpu_probe = None
+        self._gpu_probe_handle = gpu_probe.prefetch()
         self._device = None
         # Force-CPU retry (issue #24): once the user accepts "run on the CPU"
         # after a GPU/cuDNN device failure, _force_cpu makes _start_analysis
@@ -782,7 +787,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             # resolve via the FAMILY so the variant selector applies;
             # an entry id would (deliberately) never be
             # variant-rewritten. _model_device: the dialog's cached
-            # 2 s-bounded probe, never detect_device's 20 s nvidia-smi
+            # background probe, never detect_device's blocking nvidia-smi
             # on the GUI thread.
             return reg.resolve(fam.id, device=self._model_device(),
                                variant=self._variant_value())
@@ -1719,9 +1724,8 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
     def _run_env_setup(self):
         """Build the compute venv off the GUI thread, then run the
         analysis once it reports a usable interpreter (run_process's
-   first-run path; the caller set _setup_running and busy UI).
-        Use the same pre-build accelerator choice as the Setup tab.
-        """
+        first-run path; the caller set _setup_running and busy UI).
+        Use the same pre-build accelerator choice as the Setup tab."""
         gpu = self._confirm_gpu_for_create()
         self._start_env_setup_worker(gpu=gpu, then_run=True)
 
@@ -2289,18 +2293,20 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self._device = None
 
     def _gpu_probe_cached(self):
-        """gpu_probe.probe() once per dialog, bounded to 2 s (vs the
-        module's 8 s default) because it runs on the GUI thread. GPUs
-        do not appear mid-session; reopening the dialog re-probes."""
+        """The background probe's verdict, once per dialog. Started in
+        __init__, so this GUI-thread read is normally instant and the
+        generous gpu_probe.COLD_PROBE_TIMEOUT is affordable — a slow
+        driver is waited out off the GUI thread, not while a tab
+        repaints. GPUs do not appear mid-session; reopening re-probes."""
         if self._gpu_probe is None:
-            self._gpu_probe = gpu_probe.probe(timeout=20.0)
+            self._gpu_probe = self._gpu_probe_handle.result()
         return self._gpu_probe
 
     def _model_device(self):
         """Which device rule marks the default model row. Mirrors
         model_registry.detect_device (WINMOL_DEVICE override, Apple
-        Silicon, NVIDIA probe) but rides the dialog's cached 2 s-bounded
-        probe instead of detect_device's own 20 s nvidia-smi call —
+        Silicon, NVIDIA probe) but rides the dialog's cached background
+        probe instead of detect_device's own blocking nvidia-smi call —
         this feeds every Setup-tab refresh on the GUI thread.
 
         A present card is NOT enough for a "gpu" verdict: the managed
@@ -2746,14 +2752,18 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         bolted on afterwards — an NVIDIA box that gets the CPU runtime
         here has to download the whole environment twice. No usable
         GPU: no question, and None keeps honoring the WINMOL_GPU env
-        var. Reads the cached 2 s-bounded probe — nothing here blocks
+        var. A probe that could not answer still asks — reading a
+        timeout as "no GPU" is issue #55, a CPU install on a GPU box. Reads the cached background probe — nothing here blocks
         the GUI thread."""
         probe = self._gpu_probe_cached()
-        if not probe.present:
+        if not probe.present and not probe.inconclusive:
             return None
+        detected = ("Could not tell whether this machine has an NVIDIA "
+                    "GPU — nvidia-smi did not answer in time."
+                    if probe.inconclusive else f"{probe.label} detected.")
         reply = QtWidgets.QMessageBox.question(
             self, "Install the GPU runtime?",
-            f"{probe.label} detected.\n\n"
+            f"{detected}\n\n"
             "Build the environment with the GPU runtime "
             "(onnxruntime-gpu, roughly 2 GB more to download)?\n\n"
             "Detection is several hundred times faster on it. 'No' "
@@ -2763,7 +2773,8 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             QtWidgets.QMessageBox.Yes)
         gpu = reply == QtWidgets.QMessageBox.Yes
         self._append_setup_detail(
-            f"Building the GPU runtime for {probe.label}."
+            f"Building the GPU runtime for "
+            f"{probe.label if probe.present else 'this machine'}."
             if gpu else
             "Building the CPU-only runtime. You can add the GPU "
             "runtime later from the Setup tab.")
@@ -2773,12 +2784,19 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
     def _setup_repair_env(self):
         """Reinstall the dependencies. The variant is read BEFORE the
         sentinel is dropped: a repair must reinstall what the user
-        chose, never silently downgrade a GPU environment to CPU. And
+        chose, never silently downgrade a GPU environment to CPU — and
+        when there is no sentinel left to read (an interrupted repair
+        deleted it) that means asking, not defaulting. And
         invalidating the marker first is mandatory — setup_environment
         short-circuits on a valid sentinel, so the repair would
         otherwise be a no-op."""
         venv = self.venv_path or installer.venv_location(self._plugin_dir())
-        gpu = installer.installed_variant(venv) == "gpu"
+        gpu = setup_state.repair_variant(installer.installed_variant(venv))
+        if gpu is None:
+            # No readable sentinel — usually an earlier repair that died
+            # after invalidate_marker(). Ask; assuming CPU here is how a
+            # GPU environment silently became a CPU one.
+            gpu = self._confirm_gpu_for_create()
         installer.invalidate_marker(venv)
         self._venv_bytes = None
         self._setup_running = True

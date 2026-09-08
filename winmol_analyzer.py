@@ -37,6 +37,7 @@ except Exception:
     pass
 
 # Import the code for the dialog
+from .plugin_utils import gpu_probe
 from .winmol_analyzer_dialog import WINMOLAnalyzerDialog
 
 
@@ -187,6 +188,12 @@ class WINMOLAnalyzer:
             text=self.tr(u'Detects stems from UAV images'),
             callback=self.run,
             parent=self.iface.mainWindow())
+
+        # Ask nvidia-smi now, on a daemon thread, so the dialog can read
+        # the verdict without waiting: QGIS starts the plugin long before
+        # the user clicks the toolbar button. A machine with no NVIDIA
+        # driver pays nothing (the probe never spawns anything).
+        gpu_probe.prefetch()
 
         # will be set False in run()
         self.first_start = True

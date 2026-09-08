@@ -18,14 +18,30 @@ child the same sanitized environment the real run uses.
 import platform
 import re
 import subprocess
+import threading
 from dataclasses import dataclass, field
 from typing import List, Optional
 
 from .childenv import run_isolated
 
-#: Seconds before a wedged ``nvidia-smi`` is given up on. A healthy
-#: driver answers in ~50 ms; a broken one costs a pause, not a hang.
+#: Seconds before a wedged ``nvidia-smi`` is given up on -- the WARM
+#: budget, for synchronous callers that already know there is a GPU (a
+#: healthy driver answers in ~50 ms; a broken one costs a pause, not a
+#: hang). Deliberately shorter than :data:`COLD_PROBE_TIMEOUT`: giving
+#: up here is a graceful fallback, not a wrong verdict. Any caller that
+#: DECIDES whether a GPU exists must use the cold budget instead.
 NVIDIA_SMI_TIMEOUT = 8.0
+
+#: The budget for any caller that can afford to WAIT OUT A COLD DRIVER
+#: -- the GUI's background probe (:func:`start_probe`), and the child
+#: process's device/GPU-count queries. A cold driver can take 6-8 s to
+#: answer its first query; anything stingier reads that as "no GPU".
+#:
+#: That misread was a real bug: a 2 s GUI-thread probe and a 20 s
+#: model_registry probe disagreed about the same card, so a first run
+#: installed the CPU environment while the log printed the GPU. One
+#: name, so the two cannot drift apart again.
+COLD_PROBE_TIMEOUT = 20.0
 
 #: Minimum NVIDIA driver for the CUDA 12.x runtime the wheels carry.
 #: Below this the wheels load but every CUDA call fails.
@@ -57,6 +73,15 @@ class GpuProbe:
     def present(self) -> bool:
         """True when a GPU exists AND the GPU runtime can serve it."""
         return self.status == STATUS_OK
+
+    @property
+    def inconclusive(self) -> bool:
+        """The probe could not answer — a wedged or slow nvidia-smi.
+
+        NOT the same as "no GPU". Reading a timeout as absence is how a
+        GPU machine got the CPU runtime installed (issue #55): the
+        answer is unknown, so the caller must ask rather than decide."""
+        return self.status == STATUS_TIMEOUT
 
     @property
     def label(self) -> str:
@@ -96,6 +121,23 @@ def driver_new_enough(driver_version, system=None) -> bool:
     return parsed >= minimum
 
 
+def hidden_window_kwargs(system=None) -> dict:
+    """``subprocess`` kwargs that keep a child's console off the screen.
+
+    Windows gives every console child its own window, so an unadorned
+    ``nvidia-smi`` flashes a black box over QGIS — at startup now that
+    :func:`prefetch` runs there. Empty everywhere else; ``tasks_threads``
+    has hidden its own child this way since rr6."""
+    if (system or platform.system()) != "Windows":
+        return {}
+    if not hasattr(subprocess, "STARTUPINFO"):     # non-Windows CPython
+        return {}
+    info = subprocess.STARTUPINFO()
+    info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    info.wShowWindow = subprocess.SW_HIDE
+    return {"startupinfo": info}
+
+
 def _run_nvidia_smi(timeout, fields="name,driver_version", nounits=False):
     """``(None, stdout)`` on success, ``(status, stdout)`` on failure.
     The one place that builds and runs an ``nvidia-smi --query-gpu``
@@ -108,7 +150,8 @@ def _run_nvidia_smi(timeout, fields="name,driver_version", nounits=False):
              "--query-gpu=" + fields,
              "--format=" + fmt],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, check=False, timeout=timeout)
+            text=True, check=False, timeout=timeout,
+            **hidden_window_kwargs())
     except subprocess.TimeoutExpired:
         return STATUS_TIMEOUT, ""
     except (OSError, ValueError):
@@ -182,6 +225,70 @@ def probe(system=None, machine=None, timeout=NVIDIA_SMI_TIMEOUT,
                     f"{low[0]}.{low[1]} the CUDA 12 wheels need."))
     return GpuProbe(status=STATUS_OK, names=names, driver_version=driver,
                     detail=f"driver {driver}" if driver else "")
+
+
+class ProbeHandle:
+    """A :func:`probe` running on a daemon thread.
+
+    :meth:`result` blocks only for whatever the caller still has to
+    spare and answers ``STATUS_TIMEOUT`` rather than hanging, so a
+    wedged driver can never freeze a GUI that asks early."""
+
+    def __init__(self, thread, cell):
+        self._thread = thread
+        self._cell = cell
+
+    def done(self) -> bool:
+        """True once the probe has answered; :meth:`result` won't block."""
+        return bool(self._cell)
+
+    def result(self, timeout=None) -> GpuProbe:
+        """The :class:`GpuProbe`, waiting at most ``timeout`` seconds.
+        ``None`` waits for the probe's own bound, which always expires."""
+        self._thread.join(timeout)
+        if self._cell:
+            return self._cell[0]
+        waited = "the wait" if timeout is None else f"{timeout:.1f}s"
+        return GpuProbe(
+            status=STATUS_TIMEOUT,
+            detail=f"the GPU probe did not answer within {waited}; "
+                   "treating this machine as CPU-only.")
+
+
+def start_probe(system=None, machine=None, timeout=COLD_PROBE_TIMEOUT,
+                runner=None) -> ProbeHandle:
+    """:func:`probe` on a daemon thread, returning at once.
+
+    The dialog starts one at construction, so by the time the Setup tab
+    or the pre-run modal reads the verdict, ``nvidia-smi`` answered
+    seconds ago. That is what lets ``timeout`` be generous: the cost of
+    a slow driver is paid off the GUI thread, where it is free."""
+    cell = []
+    thread = threading.Thread(
+        target=lambda: cell.append(
+            probe(system=system, machine=machine, timeout=timeout,
+                  runner=runner)),
+        name="winmol-gpu-probe", daemon=True)
+    thread.start()
+    return ProbeHandle(thread, cell)
+
+
+#: The process-wide probe started by :func:`prefetch`.
+_PREFETCHED = None
+
+
+def prefetch(**kwargs) -> ProbeHandle:
+    """Start the process-wide probe, or hand back the running one.
+
+    Called from the plugin's ``initGui`` (QGIS startup) so the answer is
+    minutes old by the time the dialog is built and read. Starting it in
+    the dialog instead would be far too late: every reader of the
+    verdict is reached from that constructor, which would then simply
+    block on the probe it had just launched."""
+    global _PREFETCHED
+    if _PREFETCHED is None:
+        _PREFETCHED = start_probe(**kwargs)
+    return _PREFETCHED
 
 
 def wants_gpu_runtime(probe_result=None) -> bool:
