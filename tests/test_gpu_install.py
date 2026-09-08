@@ -6,9 +6,12 @@ so the installer must — these tests pin that behavior.
 import ast
 import importlib
 import json
+import subprocess
 import sys
 import threading
 from pathlib import Path
+
+import pytest
 
 REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
@@ -172,6 +175,38 @@ def test_start_probe_result_is_cached_not_re_run():
     assert handle.result().present
     assert handle.result().present
     assert len(calls) == 1
+
+
+# --- Windows: nvidia-smi must not flash a console window ---------------------
+# The probe now runs at QGIS startup, so an unhidden console would pop up
+# on every launch. tasks_threads.py has hidden its child since rr6; this
+# is the same treatment for the one plugin_utils spawn the GUI triggers.
+
+def test_hidden_window_kwargs_are_empty_off_windows():
+    assert gpu_probe.hidden_window_kwargs(system="Linux") == {}
+    assert gpu_probe.hidden_window_kwargs(system="Darwin") == {}
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only API")
+def test_hidden_window_kwargs_hide_the_console_on_windows():
+    kwargs = gpu_probe.hidden_window_kwargs(system="Windows")
+    info = kwargs["startupinfo"]
+    assert info.dwFlags & subprocess.STARTF_USESHOWWINDOW
+    assert info.wShowWindow == subprocess.SW_HIDE
+
+
+def test_nvidia_smi_spawn_forwards_the_hidden_window_kwargs(monkeypatch):
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen.update(kwargs)
+        raise FileNotFoundError("nvidia-smi")
+
+    monkeypatch.setattr(gpu_probe, "hidden_window_kwargs",
+                        lambda system=None: {"startupinfo": "SENTINEL"})
+    monkeypatch.setattr(gpu_probe.subprocess, "run", fake_run)
+    gpu_probe._run_nvidia_smi(1.0)
+    assert seen.get("startupinfo") == "SENTINEL"
 
 
 # --- prefetch: started at plugin load, not dialog construction ----------------

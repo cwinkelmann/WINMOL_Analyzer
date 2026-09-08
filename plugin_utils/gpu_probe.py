@@ -103,6 +103,23 @@ def driver_new_enough(driver_version, system=None) -> bool:
     return parsed >= minimum
 
 
+def hidden_window_kwargs(system=None) -> dict:
+    """``subprocess`` kwargs that keep a child's console off the screen.
+
+    Windows gives every console child its own window, so an unadorned
+    ``nvidia-smi`` flashes a black box over QGIS — at startup now that
+    :func:`prefetch` runs there. Empty everywhere else; ``tasks_threads``
+    has hidden its own child this way since rr6."""
+    if (system or platform.system()) != "Windows":
+        return {}
+    if not hasattr(subprocess, "STARTUPINFO"):     # non-Windows CPython
+        return {}
+    info = subprocess.STARTUPINFO()
+    info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    info.wShowWindow = subprocess.SW_HIDE
+    return {"startupinfo": info}
+
+
 def _run_nvidia_smi(timeout, fields="name,driver_version", nounits=False):
     """``(None, stdout)`` on success, ``(status, stdout)`` on failure.
     The one place that builds and runs an ``nvidia-smi --query-gpu``
@@ -115,7 +132,8 @@ def _run_nvidia_smi(timeout, fields="name,driver_version", nounits=False):
              "--query-gpu=" + fields,
              "--format=" + fmt],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, check=False, timeout=timeout)
+            text=True, check=False, timeout=timeout,
+            **hidden_window_kwargs())
     except subprocess.TimeoutExpired:
         return STATUS_TIMEOUT, ""
     except (OSError, ValueError):
