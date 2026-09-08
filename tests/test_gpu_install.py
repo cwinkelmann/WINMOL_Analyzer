@@ -177,6 +177,34 @@ def test_start_probe_result_is_cached_not_re_run():
     assert len(calls) == 1
 
 
+# --- a timed-out probe is UNKNOWN, not "no GPU" (issue #55) -------------------
+
+def test_timeout_is_inconclusive_not_absent():
+    """#55: a 6 s nvidia-smi timed the probe out, present went False,
+    and the setup installed the CPU runtime on a GPU machine."""
+    result = _probe(lambda timeout: (gpu_probe.STATUS_TIMEOUT, ""))
+    assert not result.present
+    assert result.inconclusive
+
+
+def test_a_real_absence_is_conclusive():
+    for status in (gpu_probe.STATUS_NO_DRIVER, gpu_probe.STATUS_NONE):
+        result = _probe(lambda timeout: (status, ""))
+        assert not result.present
+        assert not result.inconclusive
+
+
+def test_unsupported_platform_is_conclusive():
+    result = gpu_probe.probe(system="Darwin", machine="arm64")
+    assert not result.present
+    assert not result.inconclusive
+
+
+def test_create_asks_instead_of_assuming_cpu_when_the_probe_is_unsure():
+    text = (REPO / "winmol_analyzer_dialog.py").read_text()
+    assert "inconclusive" in text
+
+
 # --- Windows: nvidia-smi must not flash a console window ---------------------
 # The probe now runs at QGIS startup, so an unhidden console would pop up
 # on every launch. tasks_threads.py has hidden its child since rr6; this

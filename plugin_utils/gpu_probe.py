@@ -66,6 +66,15 @@ class GpuProbe:
         return self.status == STATUS_OK
 
     @property
+    def inconclusive(self) -> bool:
+        """The probe could not answer — a wedged or slow nvidia-smi.
+
+        NOT the same as "no GPU". Reading a timeout as absence is how a
+        GPU machine got the CPU runtime installed (issue #55): the
+        answer is unknown, so the caller must ask rather than decide."""
+        return self.status == STATUS_TIMEOUT
+
+    @property
     def label(self) -> str:
         """'NVIDIA GeForce RTX 4080 SUPER', or 'NVIDIA GPU' fallback."""
         if not self.names:

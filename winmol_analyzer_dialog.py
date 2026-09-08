@@ -2752,14 +2752,18 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         bolted on afterwards — an NVIDIA box that gets the CPU runtime
         here has to download the whole environment twice. No usable
         GPU: no question, and None keeps honoring the WINMOL_GPU env
-        var. Reads the cached 2 s-bounded probe — nothing here blocks
+        var. A probe that could not answer still asks — reading a
+        timeout as "no GPU" is issue #55, a CPU install on a GPU box. Reads the cached background probe — nothing here blocks
         the GUI thread."""
         probe = self._gpu_probe_cached()
-        if not probe.present:
+        if not probe.present and not probe.inconclusive:
             return None
+        detected = ("Could not tell whether this machine has an NVIDIA "
+                    "GPU — nvidia-smi did not answer in time."
+                    if probe.inconclusive else f"{probe.label} detected.")
         reply = QtWidgets.QMessageBox.question(
             self, "Install the GPU runtime?",
-            f"{probe.label} detected.\n\n"
+            f"{detected}\n\n"
             "Build the environment with the GPU runtime "
             "(onnxruntime-gpu, roughly 2 GB more to download)?\n\n"
             "Detection is several hundred times faster on it. 'No' "
@@ -2769,7 +2773,8 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             QtWidgets.QMessageBox.Yes)
         gpu = reply == QtWidgets.QMessageBox.Yes
         self._append_setup_detail(
-            f"Building the GPU runtime for {probe.label}."
+            f"Building the GPU runtime for "
+            f"{probe.label if probe.present else 'this machine'}."
             if gpu else
             "Building the CPU-only runtime. You can add the GPU "
             "runtime later from the Setup tab.")
@@ -2779,12 +2784,19 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
     def _setup_repair_env(self):
         """Reinstall the dependencies. The variant is read BEFORE the
         sentinel is dropped: a repair must reinstall what the user
-        chose, never silently downgrade a GPU environment to CPU. And
+        chose, never silently downgrade a GPU environment to CPU — and
+        when there is no sentinel left to read (an interrupted repair
+        deleted it) that means asking, not defaulting. And
         invalidating the marker first is mandatory — setup_environment
         short-circuits on a valid sentinel, so the repair would
         otherwise be a no-op."""
         venv = self.venv_path or installer.venv_location(self._plugin_dir())
-        gpu = installer.installed_variant(venv) == "gpu"
+        gpu = setup_state.repair_variant(installer.installed_variant(venv))
+        if gpu is None:
+            # No readable sentinel — usually an earlier repair that died
+            # after invalidate_marker(). Ask; assuming CPU here is how a
+            # GPU environment silently became a CPU one.
+            gpu = self._confirm_gpu_for_create()
         installer.invalidate_marker(venv)
         self._venv_bytes = None
         self._setup_running = True
