@@ -306,11 +306,12 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self._model_rows = []
         # Lazy caches: gpu_probe and the model-device verdict both
         # shell out (bounded), so they run at most once per dialog. The
-        # card probe starts NOW, on its own thread — every reader
-        # below sits on the GUI thread and a cold nvidia-smi takes
-        # seconds to answer.
+        # card probe was started at plugin load (initGui); this only
+        # picks up the running handle, because every reader below is
+        # reached from THIS constructor — starting it here would just
+        # block on a probe launched a few lines earlier.
         self._gpu_probe = None
-        self._gpu_probe_handle = gpu_probe.start_probe()
+        self._gpu_probe_handle = gpu_probe.prefetch()
         self._device = None
         # Force-CPU retry (issue #24): once the user accepts "run on the CPU"
         # after a GPU/cuDNN device failure, _force_cpu makes _start_analysis

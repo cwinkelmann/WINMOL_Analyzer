@@ -237,6 +237,24 @@ def start_probe(system=None, machine=None, timeout=GUI_PROBE_TIMEOUT,
     return ProbeHandle(thread, cell)
 
 
+#: The process-wide probe started by :func:`prefetch`.
+_PREFETCHED = None
+
+
+def prefetch(**kwargs) -> ProbeHandle:
+    """Start the process-wide probe, or hand back the running one.
+
+    Called from the plugin's ``initGui`` (QGIS startup) so the answer is
+    minutes old by the time the dialog is built and read. Starting it in
+    the dialog instead would be far too late: every reader of the
+    verdict is reached from that constructor, which would then simply
+    block on the probe it had just launched."""
+    global _PREFETCHED
+    if _PREFETCHED is None:
+        _PREFETCHED = start_probe(**kwargs)
+    return _PREFETCHED
+
+
 def wants_gpu_runtime(probe_result=None) -> bool:
     """True when this machine should get onnxruntime-gpu. Never
     raises."""

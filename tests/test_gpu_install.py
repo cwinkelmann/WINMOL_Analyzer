@@ -3,6 +3,7 @@ verdicts, and the conflict-safe runtime swap. onnxruntime and
 onnxruntime-gpu ship the SAME module; pip never uninstalls the other,
 so the installer must — these tests pin that behavior.
 """
+import ast
 import importlib
 import json
 import sys
@@ -171,6 +172,71 @@ def test_start_probe_result_is_cached_not_re_run():
     assert handle.result().present
     assert handle.result().present
     assert len(calls) == 1
+
+
+# --- prefetch: started at plugin load, not dialog construction ----------------
+# Every reader of the verdict is reached from the dialog's __init__ (via
+# populate_model_combo_box -> _model_device), so starting the probe there
+# buys nothing. It has to start when the plugin loads.
+
+def _fresh_prefetch(monkeypatch):
+    monkeypatch.setattr(gpu_probe, "_PREFETCHED", None, raising=False)
+
+
+def test_prefetch_runs_the_probe_once_per_process(monkeypatch):
+    _fresh_prefetch(monkeypatch)
+    calls = []
+
+    def counting(timeout):
+        calls.append(timeout)
+        return None, "NVIDIA GeForce RTX 4080 SUPER, 580.65.06\n"
+
+    first = gpu_probe.prefetch(system="Linux", machine="x86_64",
+                               runner=counting)
+    second = gpu_probe.prefetch(system="Linux", machine="x86_64",
+                                runner=counting)
+    assert first is second
+    assert first.result().present
+    assert len(calls) == 1
+
+
+def test_prefetch_does_not_block_its_caller(monkeypatch):
+    _fresh_prefetch(monkeypatch)
+    started, release = threading.Event(), threading.Event()
+
+    def slow(timeout):
+        started.set()
+        release.wait(5)
+        return None, "NVIDIA GeForce RTX 4080 SUPER, 580.65.06\n"
+
+    handle = gpu_probe.prefetch(system="Linux", machine="x86_64",
+                                runner=slow)
+    assert started.wait(5)
+    assert not handle.done()
+    release.set()
+    assert handle.result().present
+
+
+def _self_calls(path, func_name):
+    """Attribute calls made inside ``func_name`` of ``path``."""
+    tree = ast.parse(Path(path).read_text())
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == func_name)
+    return {ast.unparse(n.func) for n in ast.walk(fn)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+
+
+def test_plugin_initgui_starts_the_probe():
+    """The head start is the whole fix: initGui runs at QGIS startup,
+    the dialog is built when the user clicks, seconds to minutes later."""
+    assert "gpu_probe.prefetch" in _self_calls(
+        REPO / "winmol_analyzer.py", "initGui")
+
+
+def test_dialog_never_calls_the_blocking_probe_directly():
+    text = (REPO / "winmol_analyzer_dialog.py").read_text()
+    assert "gpu_probe.probe(" not in text
+    assert "gpu_probe.prefetch()" in text
 
 
 # --- variant-aware sentinel --------------------------------------------------
