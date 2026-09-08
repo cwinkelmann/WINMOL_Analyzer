@@ -6,6 +6,7 @@ so the installer must — these tests pin that behavior.
 import importlib
 import json
 import sys
+import threading
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -117,6 +118,59 @@ def test_probe_old_driver_is_refused():
     result = _probe(lambda timeout: (None, "NVIDIA T400, 470.10\n"))
     assert result.status == gpu_probe.STATUS_OLD_DRIVER
     assert not result.present
+
+
+# --- start_probe: the same verdict, off the GUI thread -----------------------
+# The dialog calls this at construction so nvidia-smi is already answered
+# by the time the Setup tab or the pre-run modal asks. A slow driver must
+# cost the QGIS GUI thread nothing.
+
+
+def test_start_probe_returns_before_a_slow_nvidia_smi_finishes():
+    started, release = threading.Event(), threading.Event()
+
+    def slow(timeout):
+        started.set()
+        release.wait(5)
+        return None, "NVIDIA GeForce RTX 4080 SUPER, 580.65.06\n"
+
+    handle = gpu_probe.start_probe(system="Linux", machine="x86_64",
+                                   runner=slow)
+    assert started.wait(5), "probe never started"
+    assert not handle.done()          # still running: we did not block
+    release.set()
+    assert handle.result().present
+
+
+def test_start_probe_result_matches_the_synchronous_probe():
+    out = "NVIDIA GeForce RTX 4080 SUPER, 580.65.06\n"
+    runner = lambda timeout: (None, out)          # noqa: E731
+    handle = gpu_probe.start_probe(system="Linux", machine="x86_64",
+                                   runner=runner)
+    assert handle.result() == _probe(runner)
+
+
+def test_start_probe_result_is_bounded_and_reports_a_timeout():
+    handle = gpu_probe.start_probe(system="Linux", machine="x86_64",
+                                   runner=lambda timeout: (
+                                       threading.Event().wait(30), None)[1])
+    result = handle.result(timeout=0.1)
+    assert result.status == gpu_probe.STATUS_TIMEOUT
+    assert not result.present
+
+
+def test_start_probe_result_is_cached_not_re_run():
+    calls = []
+
+    def counting(timeout):
+        calls.append(timeout)
+        return None, "NVIDIA GeForce RTX 4080 SUPER, 580.65.06\n"
+
+    handle = gpu_probe.start_probe(system="Linux", machine="x86_64",
+                                   runner=counting)
+    assert handle.result().present
+    assert handle.result().present
+    assert len(calls) == 1
 
 
 # --- variant-aware sentinel --------------------------------------------------

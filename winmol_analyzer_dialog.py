@@ -304,9 +304,13 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self._deletion_flags = None
         # Model rows from the last model_status.scan (stat-only).
         self._model_rows = []
-        # Lazy caches: gpu_probe.probe() and the model-device verdict
-        # both shell out (bounded), so they run at most once per dialog.
+        # Lazy caches: gpu_probe and the model-device verdict both
+        # shell out (bounded), so they run at most once per dialog. The
+        # card probe starts NOW, on its own thread — every reader
+        # below sits on the GUI thread and a cold nvidia-smi takes
+        # seconds to answer.
         self._gpu_probe = None
+        self._gpu_probe_handle = gpu_probe.start_probe()
         self._device = None
         # Force-CPU retry (issue #24): once the user accepts "run on the CPU"
         # after a GPU/cuDNN device failure, _force_cpu makes _start_analysis
@@ -782,7 +786,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             # resolve via the FAMILY so the variant selector applies;
             # an entry id would (deliberately) never be
             # variant-rewritten. _model_device: the dialog's cached
-            # 2 s-bounded probe, never detect_device's 20 s nvidia-smi
+            # background probe, never detect_device's blocking nvidia-smi
             # on the GUI thread.
             return reg.resolve(fam.id, device=self._model_device(),
                                variant=self._variant_value())
@@ -1719,9 +1723,8 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
     def _run_env_setup(self):
         """Build the compute venv off the GUI thread, then run the
         analysis once it reports a usable interpreter (run_process's
-   first-run path; the caller set _setup_running and busy UI).
-        Use the same pre-build accelerator choice as the Setup tab.
-        """
+        first-run path; the caller set _setup_running and busy UI).
+        Use the same pre-build accelerator choice as the Setup tab."""
         gpu = self._confirm_gpu_for_create()
         self._start_env_setup_worker(gpu=gpu, then_run=True)
 
@@ -2289,18 +2292,20 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self._device = None
 
     def _gpu_probe_cached(self):
-        """gpu_probe.probe() once per dialog, bounded to 2 s (vs the
-        module's 8 s default) because it runs on the GUI thread. GPUs
-        do not appear mid-session; reopening the dialog re-probes."""
+        """The background probe's verdict, once per dialog. Started in
+        __init__, so this GUI-thread read is normally instant and the
+        generous gpu_probe.GUI_PROBE_TIMEOUT is affordable — a slow
+        driver is waited out off the GUI thread, not while a tab
+        repaints. GPUs do not appear mid-session; reopening re-probes."""
         if self._gpu_probe is None:
-            self._gpu_probe = gpu_probe.probe(timeout=20.0)
+            self._gpu_probe = self._gpu_probe_handle.result()
         return self._gpu_probe
 
     def _model_device(self):
         """Which device rule marks the default model row. Mirrors
         model_registry.detect_device (WINMOL_DEVICE override, Apple
-        Silicon, NVIDIA probe) but rides the dialog's cached 2 s-bounded
-        probe instead of detect_device's own 20 s nvidia-smi call —
+        Silicon, NVIDIA probe) but rides the dialog's cached background
+        probe instead of detect_device's own blocking nvidia-smi call —
         this feeds every Setup-tab refresh on the GUI thread.
 
         A present card is NOT enough for a "gpu" verdict: the managed

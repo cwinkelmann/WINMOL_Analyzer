@@ -18,6 +18,7 @@ child the same sanitized environment the real run uses.
 import platform
 import re
 import subprocess
+import threading
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -26,6 +27,12 @@ from .childenv import run_isolated
 #: Seconds before a wedged ``nvidia-smi`` is given up on. A healthy
 #: driver answers in ~50 ms; a broken one costs a pause, not a hang.
 NVIDIA_SMI_TIMEOUT = 8.0
+
+#: The GUI's budget for its BACKGROUND probe (:func:`start_probe`).
+#: Generous where the GUI-thread call had to be stingy: a cold driver
+#: can take seconds to answer, and waiting for it costs the GUI nothing
+#: once the probe no longer runs on that thread.
+GUI_PROBE_TIMEOUT = 20.0
 
 #: Minimum NVIDIA driver for the CUDA 12.x runtime the wheels carry.
 #: Below this the wheels load but every CUDA call fails.
@@ -182,6 +189,52 @@ def probe(system=None, machine=None, timeout=NVIDIA_SMI_TIMEOUT,
                     f"{low[0]}.{low[1]} the CUDA 12 wheels need."))
     return GpuProbe(status=STATUS_OK, names=names, driver_version=driver,
                     detail=f"driver {driver}" if driver else "")
+
+
+class ProbeHandle:
+    """A :func:`probe` running on a daemon thread.
+
+    :meth:`result` blocks only for whatever the caller still has to
+    spare and answers ``STATUS_TIMEOUT`` rather than hanging, so a
+    wedged driver can never freeze a GUI that asks early."""
+
+    def __init__(self, thread, cell):
+        self._thread = thread
+        self._cell = cell
+
+    def done(self) -> bool:
+        """True once the probe has answered; :meth:`result` won't block."""
+        return bool(self._cell)
+
+    def result(self, timeout=None) -> GpuProbe:
+        """The :class:`GpuProbe`, waiting at most ``timeout`` seconds.
+        ``None`` waits for the probe's own bound, which always expires."""
+        self._thread.join(timeout)
+        if self._cell:
+            return self._cell[0]
+        waited = "the wait" if timeout is None else f"{timeout:.1f}s"
+        return GpuProbe(
+            status=STATUS_TIMEOUT,
+            detail=f"the GPU probe did not answer within {waited}; "
+                   "treating this machine as CPU-only.")
+
+
+def start_probe(system=None, machine=None, timeout=GUI_PROBE_TIMEOUT,
+                runner=None) -> ProbeHandle:
+    """:func:`probe` on a daemon thread, returning at once.
+
+    The dialog starts one at construction, so by the time the Setup tab
+    or the pre-run modal reads the verdict, ``nvidia-smi`` answered
+    seconds ago. That is what lets ``timeout`` be generous: the cost of
+    a slow driver is paid off the GUI thread, where it is free."""
+    cell = []
+    thread = threading.Thread(
+        target=lambda: cell.append(
+            probe(system=system, machine=machine, timeout=timeout,
+                  runner=runner)),
+        name="winmol-gpu-probe", daemon=True)
+    thread.start()
+    return ProbeHandle(thread, cell)
 
 
 def wants_gpu_runtime(probe_result=None) -> bool:
