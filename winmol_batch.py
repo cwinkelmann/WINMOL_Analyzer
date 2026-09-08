@@ -16,7 +16,7 @@ from typing import List, Optional
 
 from plugin_utils import container
 from plugin_utils.config_overrides import set_default
-from plugin_utils.gpu_probe import run_nvidia_smi_query
+from plugin_utils.gpu_probe import COLD_PROBE_TIMEOUT, run_nvidia_smi_query
 from plugin_utils.model_registry import (
     ModelDownloadError,
     Registry,
@@ -77,7 +77,7 @@ def list_orthomosaics(input_folder: str) -> List[str]:
 
 def detect_gpu_count() -> int:
     """Number of visible NVIDIA GPUs, or 0 if none / nvidia-smi unavailable."""
-    lines = run_nvidia_smi_query("index", timeout=20)
+    lines = run_nvidia_smi_query("index", timeout=COLD_PROBE_TIMEOUT)
     return len(lines) if lines else 0
 
 

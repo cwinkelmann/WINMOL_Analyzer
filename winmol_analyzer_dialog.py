@@ -2295,7 +2295,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
     def _gpu_probe_cached(self):
         """The background probe's verdict, once per dialog. Started in
         __init__, so this GUI-thread read is normally instant and the
-        generous gpu_probe.GUI_PROBE_TIMEOUT is affordable — a slow
+        generous gpu_probe.COLD_PROBE_TIMEOUT is affordable — a slow
         driver is waited out off the GUI thread, not while a tab
         repaints. GPUs do not appear mid-session; reopening re-probes."""
         if self._gpu_probe is None:

@@ -25,7 +25,7 @@ import sys
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-from .gpu_probe import run_nvidia_smi_query
+from .gpu_probe import COLD_PROBE_TIMEOUT, run_nvidia_smi_query
 
 _CHUNK_BYTES = 1024 * 1024
 #: device -> the precision its family variant must carry.
@@ -344,7 +344,8 @@ def detect_device(venv_path=None) -> str:
     A GPU verdict additionally requires a runtime that can actually use
     the card (``gpu_runtime_installed``) -- otherwise a CPU-only install
     on an NVIDIA machine selects the fp16 variant it cannot accelerate.
-    Skipping the probe in that case also skips its 20 s timeout.
+    Skipping the probe in that case also skips its COLD_PROBE_TIMEOUT
+    wait.
     """
     forced = os.environ.get("WINMOL_DEVICE", "").strip().lower()
     if forced in ("cpu", "gpu", "coreml"):
@@ -358,7 +359,8 @@ def detect_device(venv_path=None) -> str:
 
 def _probe_nvidia() -> str:
     """"gpu" if ``nvidia-smi`` lists at least one GPU, else "cpu"."""
-    return "gpu" if run_nvidia_smi_query("index", timeout=20) else "cpu"
+    return ("gpu" if run_nvidia_smi_query(
+        "index", timeout=COLD_PROBE_TIMEOUT) else "cpu")
 
 
 # --- integrity verification -----------------------------------------------

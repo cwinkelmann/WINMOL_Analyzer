@@ -24,15 +24,24 @@ from typing import List, Optional
 
 from .childenv import run_isolated
 
-#: Seconds before a wedged ``nvidia-smi`` is given up on. A healthy
-#: driver answers in ~50 ms; a broken one costs a pause, not a hang.
+#: Seconds before a wedged ``nvidia-smi`` is given up on -- the WARM
+#: budget, for synchronous callers that already know there is a GPU (a
+#: healthy driver answers in ~50 ms; a broken one costs a pause, not a
+#: hang). Deliberately shorter than :data:`COLD_PROBE_TIMEOUT`: giving
+#: up here is a graceful fallback, not a wrong verdict. Any caller that
+#: DECIDES whether a GPU exists must use the cold budget instead.
 NVIDIA_SMI_TIMEOUT = 8.0
 
-#: The GUI's budget for its BACKGROUND probe (:func:`start_probe`).
-#: Generous where the GUI-thread call had to be stingy: a cold driver
-#: can take seconds to answer, and waiting for it costs the GUI nothing
-#: once the probe no longer runs on that thread.
-GUI_PROBE_TIMEOUT = 20.0
+#: The budget for any caller that can afford to WAIT OUT A COLD DRIVER
+#: -- the GUI's background probe (:func:`start_probe`), and the child
+#: process's device/GPU-count queries. A cold driver can take 6-8 s to
+#: answer its first query; anything stingier reads that as "no GPU".
+#:
+#: That misread was a real bug: a 2 s GUI-thread probe and a 20 s
+#: model_registry probe disagreed about the same card, so a first run
+#: installed the CPU environment while the log printed the GPU. One
+#: name, so the two cannot drift apart again.
+COLD_PROBE_TIMEOUT = 20.0
 
 #: Minimum NVIDIA driver for the CUDA 12.x runtime the wheels carry.
 #: Below this the wheels load but every CUDA call fails.
@@ -246,7 +255,7 @@ class ProbeHandle:
                    "treating this machine as CPU-only.")
 
 
-def start_probe(system=None, machine=None, timeout=GUI_PROBE_TIMEOUT,
+def start_probe(system=None, machine=None, timeout=COLD_PROBE_TIMEOUT,
                 runner=None) -> ProbeHandle:
     """:func:`probe` on a daemon thread, returning at once.
 

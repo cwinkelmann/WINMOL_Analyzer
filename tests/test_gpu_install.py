@@ -302,6 +302,61 @@ def test_dialog_never_calls_the_blocking_probe_directly():
     assert "gpu_probe.prefetch()" in text
 
 
+#: Where production code lives. An explicit list, not a REPO-wide glob:
+#: the glob walked .claude/worktrees (whole extra checkouts) and would
+#: fail the build over vendored code the repo does not own.
+_SOURCE_ROOTS = ("plugin_utils", "utils", "classes", "qgisutil", "standalone")
+
+
+def _production_sources():
+    """Every production ``.py``: the source packages plus top-level
+    modules. Tests and tooling are excluded -- a literal is fine there."""
+    paths = sorted(REPO.glob("*.py"))
+    for root in _SOURCE_ROOTS:
+        paths.extend(sorted((REPO / root).rglob("*.py")))
+    return paths
+
+
+def _smi_timeout_args(path):
+    """``(lineno, unparsed timeout arg)`` for every
+    ``run_nvidia_smi_query`` call in ``path`` that passes one."""
+    tree = ast.parse(Path(path).read_text(encoding="utf-8"))
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else \
+            getattr(func, "id", None)
+        if name != "run_nvidia_smi_query":
+            continue
+        for kw in node.keywords:
+            if kw.arg == "timeout":
+                found.append((node.lineno, ast.unparse(kw.value)))
+    return found
+
+
+def test_no_caller_hard_codes_an_nvidia_smi_timeout():
+    """ONE budget per kind of caller, named in gpu_probe -- never a
+    literal at the call site.
+
+    Stefan's first-run bug WAS this defect: the dialog probed with a
+    hard-coded 2 s while model_registry probed the same card with 20 s,
+    so a driver that answers in 6-8 s made the two disagree -- a CPU
+    environment installed while the run log printed the GPU. The 2 s
+    literal is gone; these are the ones still able to reintroduce it.
+    """
+    offenders = []
+    for path in _production_sources():
+        for lineno, arg in _smi_timeout_args(path):
+            if arg.replace(".", "", 1).isdigit():
+                offenders.append(
+                    f"{path.relative_to(REPO)}:{lineno} timeout={arg}")
+    assert offenders == [], (
+        "hard-coded nvidia-smi timeouts must reference a gpu_probe "
+        "constant:\n  " + "\n  ".join(offenders))
+
+
 # --- variant-aware sentinel --------------------------------------------------
 
 def _patched_requirements(tmp_path, monkeypatch):
