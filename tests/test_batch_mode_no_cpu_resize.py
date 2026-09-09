@@ -49,7 +49,8 @@ def test_batch_mode_feeds_native_uint8_to_the_wrapped_model():
     cfg = Config()
     native = 1250
     model = RecordingModel((cfg.img_height, cfg.img_width))
-    tiles = [np.zeros((native, native, 3), dtype=np.uint8)]
+    # NCHW, as GDAL returns it and as the wrapped graph now takes it
+    tiles = [np.zeros((3, native, native), dtype=np.uint8)]
     # Producer-resized, as the graph contract requires.
     masks = [np.ones((cfg.img_height, cfg.img_width), dtype=bool)]
 
@@ -57,8 +58,10 @@ def test_batch_mode_feeds_native_uint8_to_the_wrapped_model():
 
     assert model.seen_dtype == np.uint8, (
         f"batch mode CPU-converted the tile to {model.seen_dtype}")
-    assert tuple(model.seen_shape[1:3]) == (native, native), (
-        f"batch mode CPU-resized the tile to {model.seen_shape[1:3]}")
+    assert tuple(model.seen_shape[2:4]) == (native, native), (
+        f"batch mode CPU-resized the tile to {model.seen_shape[2:4]}")
+    assert model.seen_shape[1] == 3, (
+        f"batch mode must feed NCHW, got {model.seen_shape}")
 
 
 def test_producer_resizes_only_the_mask_under_the_graph_strategy(
@@ -87,7 +90,8 @@ def test_producer_resizes_only_the_mask_under_the_graph_strategy(
         indexes = [1, 2, 3]
         tiles, masks, _ = PW._read_batch_jobs(src, indexes, [job], out_size)
 
-    assert tiles[0].shape[:2] == (300, 300), "the image must stay native"
+    assert tiles[0].shape[1:3] == (300, 300), "the image must stay native"
+    assert tiles[0].shape[0] == 3, "the producer must keep GDAL's NCHW"
     assert masks[0].shape == out_size, "the mask must be on the model grid"
 
 
