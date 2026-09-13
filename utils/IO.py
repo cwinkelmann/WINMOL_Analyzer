@@ -185,7 +185,14 @@ def write_tile_raster(pred_tile, tile_profile, output_path: str):
         width=pred_tile.shape[1],
         height=pred_tile.shape[0],
         transform=tile_profile['transform'],
-        compress=None,
+        # DEFLATE, not None. These are sparse binary masks: a 5260^2 halo
+        # tile is 27.7 MB raw and a few tens of KB compressed. Uncompressed,
+        # the split of a full R13 ortho pushed ~15-28 GB of dirty pages
+        # through the page cache (8.2 GB apparent for the first 440 tiles,
+        # 30 MB on disk once ZFS had compressed them) and was killed for
+        # memory with process RSS at 3.8 GB -- in the loop BEFORE the vector
+        # pool ever started. Lossless, so the tiles are bit-identical.
+        compress='DEFLATE',
     )
     with rasterio.open(output_path, 'w', **prof) as dst:
         dst.write(pred_tile.astype(np.uint8), 1)
