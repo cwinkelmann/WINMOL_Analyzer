@@ -13,6 +13,7 @@ from classes.Config import Config
 from utils.IO import (
     load_raster_window_with_profile,
     load_stem_map,
+    load_stem_map_profile,
     write_all_layers_to_gpkg,
     write_stems_to_gpkg,
     write_tile_raster,
@@ -298,6 +299,14 @@ def process_prediction_array_to_gpkg(
     )
 
 
+def _has_foreground(arr) -> bool:
+    """np.any(arr >= 1) without the comparison pass: for bool and
+    unsigned data, `>= 1` is `!= 0`, which any() tests directly."""
+    if arr.dtype == np.bool_ or arr.dtype.kind == 'u':
+        return bool(arr.any())
+    return bool(np.any(arr >= 1))
+
+
 def process_prediction_tile(
     pred_tile_path: str,
     config,
@@ -319,14 +328,24 @@ def process_prediction_tile(
         if (
             pred_arr is None
             or pred_arr.size == 0
-            or not (pred_arr >= 1).any()
+            or not _has_foreground(pred_arr)
         ):
             return None
         write_tile_raster(pred_tile, tile_profile, pred_tile_path)
-        del pred_tile, pred_arr
-    pred, profile = load_stem_map(pred_tile_path)
+        if pred_arr.dtype == np.uint8:
+            # The raster just written IS this array (uint8 in, uint8
+            # out, lossless codec), so reading it back would only be a
+            # second decompression pass; the profile is still taken
+            # from the file, as load_stem_map takes it.
+            pred = pred_arr
+            profile = load_stem_map_profile(pred_tile_path)
+        else:
+            del pred_tile, pred_arr
+            pred, profile = load_stem_map(pred_tile_path)
+    else:
+        pred, profile = load_stem_map(pred_tile_path)
     pred_arr = np.asarray(pred)
-    if pred_arr.size == 0 or not np.any(pred_arr >= 1):
+    if pred_arr.size == 0 or not _has_foreground(pred_arr):
         return None
     tile_label = os.path.splitext(os.path.basename(pred_tile_path))[0]
     try:

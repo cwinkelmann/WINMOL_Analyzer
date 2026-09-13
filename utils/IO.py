@@ -346,6 +346,15 @@ def load_stem_map(path):
     raise ValueError(f'Unsupported stem map path: {path}')
 
 
+def load_stem_map_profile(path):
+    """The profile load_stem_map would return for `path`, without reading
+    the pixels -- for a caller that already holds the array it wrote."""
+    if path.endswith('.tif') or path.endswith('.tiff'):
+        with rasterio.open(path) as src:
+            return src.profile
+    raise ValueError(f'Unsupported stem map path: {path}')
+
+
 def export_stem_map(pred, profile, pred_dir, pred_name, compress="DEFLATE"):
     final_path = os.path.join(pred_dir, f'{pred_name}.tiff')
     tmp_path = atomic_tmp_path(final_path)
