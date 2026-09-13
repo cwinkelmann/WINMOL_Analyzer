@@ -8,13 +8,12 @@ import multiprocessing as mp
 from multiprocessing.pool import ThreadPool
 from typing import List, Tuple
 
-import geopandas as gpd
 import numpy as np
 import rasterio.features
 import scipy.ndimage as ndi
 import shapely
 from shapely import STRtree
-from shapely.geometry import LineString, Point
+from shapely.geometry import LineString, Point, shape
 
 from classes.Stem import Stem
 from classes.Timer import Timer
@@ -100,7 +99,15 @@ def quantify_stems(stems: List[Stem], pred, profile, config=None):
 
 def get_diameters(stems: List[Stem], pred, profile, config=None):
     transform = profile['transform']
-    pred_bin = _as_binary_mask(pred).astype(np.int16, copy=False)
+    # rasterio.features.shapes polygonises every integer type through the
+    # same GDAL Int32 path, so a uint8 0/1 tile can go in as it is. The
+    # bool -> int16 round trip it replaces was two full passes and a
+    # 48 MB temporary per tile, for the same polygons.
+    arr = np.asarray(pred)
+    if arr.dtype == np.uint8 and arr.size and arr.max() <= 1:
+        pred_bin = arr
+    else:
+        pred_bin = _as_binary_mask(arr).astype(np.int16, copy=False)
 
     diameter_method = str(getattr(config, 'diameter_method', 'contour'))\
         .lower() if config is not None else 'contour'
@@ -137,20 +144,25 @@ def get_diameters(stems: List[Stem], pred, profile, config=None):
                 except Exception as error:
                     error_callback(error)
     else:
-        mask = None
-        pred_shapes_ = (
-            {'properties': {'raster_val': value}, 'geometry': geom}
+        # Only the foreground is polygonised. Unmasked, GDAL also built the
+        # background as one polygon with a hole per stem -- for a whole
+        # tile -- which was then converted to shapely, put in a
+        # GeoDataFrame and dropped by the raster_val filter. Masking to
+        # the foreground leaves the value-1 regions, and their polygons,
+        # exactly as they were; the features go straight to shapely
+        # (shape(), which is what GeoDataFrame.from_features called).
+        mask = pred_bin if pred_bin.dtype == np.uint8 else pred_bin != 0
+        geoms = [
+            shape(geom)
             for geom, value in rasterio.features.shapes(
                 pred_bin,
                 mask=mask,
                 transform=transform,
             )
-        )
-        pred_shapes = list(pred_shapes_)
-        pred_shapes = gpd.GeoDataFrame.from_features(pred_shapes)
-        pred_shapes = pred_shapes[pred_shapes['raster_val'] == 1]
+            if value == 1
+        ]
         # One STRtree for the whole stage instead of one per calc_d call.
-        pred_shapes = ContourIndex(pred_shapes)
+        pred_shapes = ContourIndex(geoms)
 
         if workers <= 1 or len(stems) <= 1:
             for stem in stems:
@@ -180,10 +192,11 @@ def get_diameters(stems: List[Stem], pred, profile, config=None):
 def quantify_stem(stem: Stem):
     stem.segment_length_list = []
     stem.segment_volume_list = []
-    for i in range(0, len(stem.path.coords) - 1):
+    coords = list(stem.path.coords)    # one sequence, not two per segment
+    for i in range(0, len(coords) - 1):
         seg_l, seg_vol = calc_l_v(
-            stem.path.coords[i],
-            stem.path.coords[i + 1],
+            coords[i],
+            coords[i + 1],
             stem.segment_diameter_list[i],
             stem.segment_diameter_list[i + 1]
         )
@@ -209,18 +222,17 @@ def clean_diameter(stem):
     lw = q1 - 1.5 * iqr
     uw = q3 + 1.5 * iqr
     if len(stem.segment_diameter_list) > 4:
+        coords = list(stem.path.coords)
         for i in range(1, len(stem.segment_diameter_list) - 2):
             i_uw = stem.segment_diameter_list[i] > uw
             i_lw = stem.segment_diameter_list[i] < lw
             if i_uw or i_lw:
                 wd1 = stem.segment_diameter_list[i - 1] * abs(
-                    Point(stem.path.coords[i]).distance(Point(
-                        stem.path.coords[i + 1])))
+                    Point(coords[i]).distance(Point(coords[i + 1])))
                 wd2 = stem.segment_diameter_list[i + 1] * abs(
-                    Point(stem.path.coords[i - 1]).distance(Point(
-                        stem.path.coords[i])))
-                d12 = abs(Point(stem.path.coords[i - 1]).distance(
-                    Point(stem.path.coords[i + 1])))
+                    Point(coords[i - 1]).distance(Point(coords[i])))
+                d12 = abs(Point(coords[i - 1]).distance(
+                    Point(coords[i + 1])))
                 if d12 > epsilon:
                     stem.segment_diameter_list[i] = (wd1 + wd2) / d12
         if (
@@ -332,7 +344,11 @@ class ContourIndex:
     __slots__ = ("geoms", "tree")
 
     def __init__(self, contours):
-        self.geoms = np.asarray(contours.geometry.values)
+        if hasattr(contours, 'geometry'):          # a GeoDataFrame
+            self.geoms = np.asarray(contours.geometry.values)
+        else:                                      # a sequence of geometries
+            self.geoms = np.empty(len(contours), dtype=object)
+            self.geoms[:] = list(contours)
         self.tree = STRtree(self.geoms)
 
 
