@@ -105,10 +105,19 @@ def _remove_duplicates_against_base(
         return remaining, 0
     base = cycle_stems[base_idx]
     buffer_geom = base.path.buffer(0.3)
+    # A path the buffer contains lies inside the buffer's envelope, so
+    # only stems whose envelope intersects it can qualify: an STRtree
+    # over the remaining paths (a few hundred, built in well under a
+    # millisecond) replaces the contains() test against every one of
+    # them. Same set, since to_remove is a set.
+    others = [idx for idx in remaining if idx != base_idx]
+    if not others:
+        return remaining, 0
+    paths = [cycle_stems[idx].path for idx in others]
+    tree = STRtree(paths)
     to_remove = set()
-    for idx in remaining:
-        if idx == base_idx:
-            continue
+    for pos in _query_tree_indices(tree, buffer_geom, paths):
+        idx = others[pos]
         try:
             if buffer_geom.contains(cycle_stems[idx].path):
                 to_remove.add(idx)
@@ -265,54 +274,63 @@ def calc_connectivity_votes(
     candidates = []
     slaves = []
 
-    if len(stem.path.coords) < 4:
-        e_line_start = LineString([stem.path.coords[0], stem.path.coords[-1]])
-        e_line_stop = LineString([stem.path.coords[0], stem.path.coords[-1]])
+    # Every `.coords` access builds a fresh CoordinateSequence (a shapely
+    # call, a has_z check, a get_coordinates copy). This function read
+    # `stem.path.coords` and `stems0.path.coords` about fifteen times per
+    # candidate pair -- 220k sequence constructions on one dense tile,
+    # most of connect_stems' time. Read each path once; the tuples are the
+    # same floats, and LineString([tuples]) is the same geometry.
+    sc = list(stem.path.coords)
+    s0c = list(stems0.path.coords)
+    n_sc = len(sc)
+    n_s0c = len(s0c)
+    line_start_c = list(line_start.coords)
+    line_stop_c = list(line_stop.coords)
+
+    if n_sc < 4:
+        e_line_start_c = [sc[0], sc[-1]]
+        e_line_stop_c = [sc[0], sc[-1]]
     else:
-        if len(stem.path.coords) < 8:
-            k = len(stem.path.coords) - 2
+        if n_sc < 8:
+            k = n_sc - 2
         else:
             k = 6
-        e_line_start = LineString([stem.path.coords[1], stem.path.coords[k]])
-        e_line_stop = LineString(
-            [stem.path.coords[-(k + 1)], stem.path.coords[-2]])
+        e_line_start_c = [sc[1], sc[k]]
+        e_line_stop_c = [sc[-(k + 1)], sc[-2]]
 
-    ang_l_sp_el_st = abs(ang(line_stop.coords, e_line_start.coords))
-    ang_el_sp_l_st = abs(ang(e_line_stop.coords, line_start.coords))
+    ang_l_sp_el_st = abs(ang(line_stop_c, e_line_start_c))
+    ang_el_sp_l_st = abs(ang(e_line_stop_c, line_start_c))
 
-    has_length_2 = len(stem.path.coords) == 2
+    has_length_2 = n_sc == 2
     if end_buffer.contains(stem.start) and ang_l_sp_el_st < tolerance_angle:
-        missing_part_ = LineString(
-            [stems0.path.coords[-2],
-             stem.path.coords[1]]
-        )
+        missing_part_c = [s0c[-2], sc[1]]
+        missing_part_ = LineString(missing_part_c)
         dist_f = 1 - (
             1 / (3 + max_distance - stems0.stop.distance(stem.start))
             ** 0.5
         )
-        ang_l_sp_mp = abs(ang(line_stop.coords, missing_part_.coords))
-        ang_mp_el_st = abs(ang(missing_part_.coords, e_line_start.coords))
+        ang_l_sp_mp = abs(ang(line_stop_c, missing_part_c))
+        ang_mp_el_st = abs(ang(missing_part_c, e_line_start_c))
 
         if (ang_l_sp_el_st < (tolerance_angle * dist_f) and ang_l_sp_mp < (
                 tolerance_angle * dist_f) and ang_mp_el_st < (
                 tolerance_angle * dist_f) and stems0.start.distance(
                 stem.stop) < max_tree_height):
 
-            if len(stems0.path.coords) > 2 and len(stem.path.coords) > 2:
-                start = LineString(stems0.path.coords[:-1])
-                end = LineString(stem.path.coords[1:])
+            if n_s0c > 2 and n_sc > 2:
+                start = LineString(s0c[:-1])
+                end = LineString(sc[1:])
                 new_path = linemerge([start, missing_part_, end])
             else:
-                if len(stems0.path.coords) > 2 and has_length_2:
-                    start = LineString(stems0.path.coords[:-1])
+                if n_s0c > 2 and has_length_2:
+                    start = LineString(s0c[:-1])
                     new_path = linemerge([start, missing_part_])
                 else:
-                    if (len(stems0.path.coords) == 2 and len(
-                            stem.path.coords) > 2):
-                        end = LineString(stem.path.coords[1:])
+                    if (n_s0c == 2 and n_sc > 2):
+                        end = LineString(sc[1:])
                         new_path = linemerge([missing_part_, end])
                     else:
-                        if (len(stems0.path.coords) == 2 and has_length_2):
+                        if (n_s0c == 2 and has_length_2):
                             new_path = missing_part_
 
             change = True
@@ -335,35 +353,34 @@ def calc_connectivity_votes(
             slaves.append(slave)
 
     if start_buffer.contains(stem.stop) and ang_el_sp_l_st < tolerance_angle:
-        missing_part_ = LineString(
-            [stem.path.coords[-2], stems0.path.coords[1]])
+        missing_part_c = [sc[-2], s0c[1]]
+        missing_part_ = LineString(missing_part_c)
         dist_f = 1 - (
             1 / (3 + max_distance - stem.stop.distance(stems0.start))
             ** 0.5
         )
-        ang_el_sp_mp = abs(ang(e_line_stop.coords, missing_part_.coords))
-        ang_mp_l_st = abs(ang(missing_part_.coords, line_start.coords))
+        ang_el_sp_mp = abs(ang(e_line_stop_c, missing_part_c))
+        ang_mp_l_st = abs(ang(missing_part_c, line_start_c))
 
         if (ang_el_sp_l_st < (tolerance_angle * dist_f) and ang_el_sp_mp < (
                 tolerance_angle * dist_f) and abs(
-                ang(missing_part_.coords, line_start.coords)) < (
+                ang(missing_part_c, line_start_c)) < (
                 tolerance_angle * dist_f) and stem.start.distance(
                 stems0.stop) < max_tree_height):
-            if len(stem.path.coords) > 2 and len(stems0.path.coords) > 2:
-                start = LineString(stem.path.coords[:-1])
-                end = LineString(stems0.path.coords[1:])
+            if n_sc > 2 and n_s0c > 2:
+                start = LineString(sc[:-1])
+                end = LineString(s0c[1:])
                 new_path = linemerge([start, missing_part_, end])
             else:
-                if len(stem.path.coords) > 2 and len(stems0.path.coords) == 2:
-                    start = LineString(stem.path.coords[:-1])
+                if n_sc > 2 and n_s0c == 2:
+                    start = LineString(sc[:-1])
                     new_path = linemerge([start, missing_part_])
                 else:
-                    if has_length_2 and len(stems0.path.coords) > 2:
-                        end = LineString(stems0.path.coords[1:])
+                    if has_length_2 and n_s0c > 2:
+                        end = LineString(s0c[1:])
                         new_path = linemerge([missing_part_, end])
                     else:
-                        if (has_length_2 and len(
-                                stems0.path.coords) == 2):
+                        if (has_length_2 and n_s0c == 2):
                             new_path = missing_part_
 
             change = True
