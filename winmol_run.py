@@ -49,6 +49,35 @@ def _cpu_stream_forces_onnx_cpu(prediction_backend, selected_providers):
     return not any(p in _ACCELERATOR_PROVIDERS for p in selected_providers)
 
 
+def _release_prediction_memory(model=None):
+    """Free what prediction held, before anything forks.
+
+    Ordered cheapest-to-most-invasive so a failure in one step cannot
+    strand the others: drop the session, shrink GDAL's block cache (it is
+    sized for streaming tile reads and is dead weight afterwards), then
+    collect. Never raises -- reclaiming memory must not be able to fail a
+    run that has already produced its raster.
+    """
+    try:
+        if model is not None and hasattr(model, "close"):
+            model.close()
+    except Exception:
+        pass
+    try:
+        from osgeo import gdal
+        # Setting the cache max below its current fill forces GDAL to
+        # drop blocks immediately rather than at the next allocation.
+        gdal.SetCacheMax(0)
+        gdal.SetCacheMax(64 * 1024 * 1024)
+    except Exception:
+        pass
+    try:
+        import gc
+        gc.collect()
+    except Exception:
+        pass
+
+
 class ImageProcessing:
     def __init__(self, model_path, uav_path, stem_path,
                  trees_path, process_type):
@@ -188,6 +217,17 @@ class ImageProcessing:
             model,
             self.config,
         )
+        # Hand the memory back BEFORE the vector phase forks its pool.
+        #
+        # multiprocessing.Pool forks, so every page still resident in this
+        # process is inherited copy-on-write by each of N workers. After a
+        # full-ortho prediction this process is holding an onnxruntime
+        # arena, a CUDA context and a GDAL block cache the entrypoint
+        # sized at 20% of the container -- and none of that is needed
+        # again. Measured on R13 (99,231 tiles): the vector phase ALONE
+        # peaks at 4.95 GiB and prediction alone completes, but the two in
+        # sequence were killed at the fork every time.
+        _release_prediction_memory(model)
         return (None, profile, self.stem_path)
 
     def trees_processing(self, pred, profile):

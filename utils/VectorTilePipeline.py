@@ -492,7 +492,21 @@ def process_prediction_tiles(
         )
         return results
 
-    with mp.Pool(tile_workers) as pool:
+    # SPAWN, not the platform default (fork on Linux). This pool starts
+    # AFTER prediction, so under fork every worker inherits the parent's
+    # address space copy-on-write -- including the ~9.3 GB of VIRTUAL
+    # memory a CUDA onnxruntime session maps and never returns (measured:
+    # VmSize 10.3 GB after one inference, still 9.3 GB after close() and
+    # cudaDeviceReset(); the driver holds those reservations for the
+    # process lifetime). RSS stays small, but with vm.overcommit_memory=0
+    # the kernel counts committed virtual, so forking N workers pushes
+    # Committed_AS past CommitLimit and the run is killed at the fork --
+    # with plenty of real RAM free. This was invisible until the pipeline
+    # moved to onnxruntime-gpu; the CPU runtime maps almost no virtual.
+    # Spawned workers start clean and inherit none of it. (PredictWorkers
+    # already uses spawn, for the sibling CUDA-in-a-fork hazard.)
+    ctx = mp.get_context('spawn')
+    with ctx.Pool(tile_workers) as pool:
         for idx, result in enumerate(
             pool.imap_unordered(_process_prediction_tile_star, tasks),
             start=1,

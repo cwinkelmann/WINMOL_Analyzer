@@ -6,6 +6,7 @@ TensorFlow. Layout-aware: it reads the model's declared I/O shapes from the
 session, so it handles both NHWC and NCHW exports. The external contract is
 always NHWC: ``predict_on_batch([N,512,512,3]) -> [N,512,512,1]``.
 """
+import gc
 import os
 import platform
 
@@ -410,6 +411,36 @@ class OnnxSegmenter:
     @staticmethod
     def _as_numpy(x):
         return np.ascontiguousarray(np.asarray(x, dtype=np.float32))
+
+    def close(self):
+        """Drop the session and its allocator arena.
+
+        onnxruntime holds a BFC-style arena plus a CUDA context for the
+        life of the session, and neither is returned when the Python
+        reference merely goes out of scope inside a long-lived process.
+        That matters here because the vector phase forks its worker pool
+        AFTER prediction: every page the parent still holds is inherited
+        copy-on-write by each worker, so a fat parent is multiplied by
+        the pool size. Measured on R13: the vector phase alone peaks at
+        4.95 GiB, prediction alone completes fine, and only the two in
+        sequence exhaust the budget -- at the fork, every time.
+
+        Safe to call twice; a closed segmenter simply has no session.
+        """
+        sess = getattr(self, "session", None)
+        if sess is None:
+            return False
+        self.session = None
+        del sess
+        gc.collect()
+        return True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
 
     def predict_on_batch(self, x):
         """x: NHWC [N,512,512,3] -> NHWC [N,512,512,1].
