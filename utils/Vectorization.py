@@ -8,6 +8,7 @@ import multiprocessing as mp
 from typing import List, Sequence, Set
 
 import numpy as np
+import shapely
 from shapely.geometry import LineString, Point
 from shapely.ops import linemerge
 from shapely.strtree import STRtree
@@ -164,6 +165,10 @@ def connect_stems(stems: List[Stem], config) -> List[Stem]:
         stop_tree = STRtree(stop_points)
         remaining = set(range(len(cycle_stems)))
         connected_stems = []
+        # Candidate path coordinates, read once per cycle instead of
+        # once per (base, candidate) pair; keyed by identity, with the
+        # object kept so a recycled id() cannot alias a new stem.
+        coords_cache = {}
 
         while remaining:
             base_idx = next(iter(remaining))
@@ -175,6 +180,11 @@ def connect_stems(stems: List[Stem], config) -> List[Stem]:
                     max_distance, resolution=32)
                 end_buffer = base_stem.stop.buffer(
                     max_distance, resolution=32)
+                base_coords = (
+                    list(base_stem.path.coords),
+                    list(line_start.coords),
+                    list(line_stop.coords),
+                )
 
                 candidate_indices = set(
                     _query_tree_indices(stop_tree, start_buffer, stop_points))
@@ -183,21 +193,31 @@ def connect_stems(stems: List[Stem], config) -> List[Stem]:
                 candidate_indices.intersection_update(remaining)
                 candidate_indices.discard(base_idx)
 
-                # exact endpoint filter
-                filtered_indices = []
-                for idx in candidate_indices:
-                    candidate = cycle_stems[idx]
-                    if (
-                        start_buffer.contains(candidate.stop)
-                        or end_buffer.contains(candidate.start)
-                    ):
-                        filtered_indices.append(idx)
+                # exact endpoint filter -- the same two predicates
+                # calc_connectivity_votes evaluated again per candidate,
+                # so they are computed once here (vectorised over the
+                # candidates, in the set's own order, which decides ties
+                # below) and handed down. Only the base stem changes
+                # within a cycle, so stop_points/start_points still hold
+                # the candidates' endpoints.
+                ordered = list(candidate_indices)
+                filtered = []
+                if ordered:
+                    in_start = shapely.contains(
+                        start_buffer, [stop_points[i] for i in ordered])
+                    in_end = shapely.contains(
+                        end_buffer, [start_points[i] for i in ordered])
+                    filtered = [
+                        (idx, bool(s), bool(e))
+                        for idx, s, e in zip(ordered, in_start, in_end)
+                        if s or e
+                    ]
 
                 best_vote = math.inf
                 best_candidate = None
                 best_slave_idx = None
 
-                for idx in filtered_indices:
+                for idx, stop_in_start, start_in_end in filtered:
                     changed, vote, candidate_stem, _ = calc_connectivity_votes(
                         base_stem,
                         line_start,
@@ -208,6 +228,9 @@ def connect_stems(stems: List[Stem], config) -> List[Stem]:
                         max_tree_height,
                         tolerance_angle,
                         cycle_stems[idx],
+                        base_coords=base_coords,
+                        endpoint_tests=(stop_in_start, start_in_end),
+                        coords_cache=coords_cache,
                     )
                     if changed and vote < best_vote:
                         best_vote = vote
@@ -263,8 +286,20 @@ def calc_connectivity_votes(
         max_distance,
         max_tree_height,
         tolerance_angle,
-        stem: Stem
+        stem: Stem,
+        base_coords=None,
+        endpoint_tests=None,
+        coords_cache=None,
 ) -> (bool, List[float], List[Stem], List[Stem]):
+    """Votes for appending `stem` to `stems0`.
+
+    The optional arguments let connect_stems hand down what it already
+    has: `base_coords` = (stems0 path, line_start, line_stop) as
+    coordinate lists, `endpoint_tests` = (start_buffer contains
+    stem.stop, end_buffer contains stem.start) and `coords_cache`, a
+    per-cycle {id(stem): (stem, coords)} for the candidates. Without
+    them everything is computed here, as before.
+    """
     # Calculate votes for the aggregation of stem parts to stems
     if stem == stems0:
         # if the stems are identical return no change and infinite vote
@@ -280,12 +315,27 @@ def calc_connectivity_votes(
     # candidate pair -- 220k sequence constructions on one dense tile,
     # most of connect_stems' time. Read each path once; the tuples are the
     # same floats, and LineString([tuples]) is the same geometry.
-    sc = list(stem.path.coords)
-    s0c = list(stems0.path.coords)
+    if coords_cache is not None:
+        hit = coords_cache.get(id(stem))
+        if hit is None or hit[0] is not stem:
+            hit = (stem, list(stem.path.coords))
+            coords_cache[id(stem)] = hit
+        sc = hit[1]
+    else:
+        sc = list(stem.path.coords)
+    if base_coords is not None:
+        s0c, line_start_c, line_stop_c = base_coords
+    else:
+        s0c = list(stems0.path.coords)
+        line_start_c = list(line_start.coords)
+        line_stop_c = list(line_stop.coords)
     n_sc = len(sc)
     n_s0c = len(s0c)
-    line_start_c = list(line_start.coords)
-    line_stop_c = list(line_stop.coords)
+    if endpoint_tests is not None:
+        stop_in_start, start_in_end = endpoint_tests
+    else:
+        stop_in_start = start_buffer.contains(stem.stop)
+        start_in_end = end_buffer.contains(stem.start)
 
     if n_sc < 4:
         e_line_start_c = [sc[0], sc[-1]]
@@ -302,7 +352,7 @@ def calc_connectivity_votes(
     ang_el_sp_l_st = abs(ang(e_line_stop_c, line_start_c))
 
     has_length_2 = n_sc == 2
-    if end_buffer.contains(stem.start) and ang_l_sp_el_st < tolerance_angle:
+    if start_in_end and ang_l_sp_el_st < tolerance_angle:
         missing_part_c = [s0c[-2], sc[1]]
         missing_part_ = LineString(missing_part_c)
         dist_f = 1 - (
@@ -352,7 +402,7 @@ def calc_connectivity_votes(
             votes.append(vote)
             slaves.append(slave)
 
-    if start_buffer.contains(stem.stop) and ang_el_sp_l_st < tolerance_angle:
+    if stop_in_start and ang_el_sp_l_st < tolerance_angle:
         missing_part_c = [sc[-2], s0c[1]]
         missing_part_ = LineString(missing_part_c)
         dist_f = 1 - (
