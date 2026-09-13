@@ -266,26 +266,22 @@ class ImageProcessing:
                 plan.tile_inner_px,
                 halo_px,
             )
-            tile_paths = []
-            skipped_tiles = 0
-            for job in jobs:
-                pred_tile, tile_profile = IO.load_raster_window_with_profile(
-                    pred_path or self.stem_path, job.halo_window)
-                pred_arr = pred_tile if hasattr(pred_tile, 'size') else None
-                if (
-                    pred_arr is None
-                    or pred_arr.size == 0
-                    or not (pred_arr >= 1).any()
-                ):
-                    skipped_tiles += 1
-                    continue
-                tile_path = os.path.join(
-                    work_dir, f"{job.tile_id}_roi_stem_map.tif")
-                IO.write_tile_raster(pred_tile, tile_profile, tile_path)
-                tile_paths.append(tile_path)
+            # The split -- read each halo window, skip the empty ones, write
+            # the tile raster the merge later takes its bounds from -- used
+            # to run here, serially, before the pool: 89 s on a full R13
+            # ortho (1512 windows, 796 with foreground), all of it one core
+            # while the other eleven waited. Each worker now does it for
+            # its own tile, with the same functions, so the raster it writes
+            # and then reads back is the one this loop would have written.
+            source_path = pred_path or self.stem_path
+            tile_paths = [
+                os.path.join(work_dir, f"{job.tile_id}_roi_stem_map.tif")
+                for job in jobs
+            ]
+            sources = [(source_path, job.halo_window) for job in jobs]
             print(
-                f"Prepared {len(tile_paths)}/{len(jobs)} vector tiles "
-                f"with foreground | skipped_empty {skipped_tiles}"
+                f"Prepared {len(jobs)} vector tile windows | foreground "
+                f"filtered per tile in the workers"
             )
             if not tile_paths:
                 print("No foreground tiles found for vector stage.")
@@ -298,6 +294,7 @@ class ImageProcessing:
                 self.process_type,
                 work_dir,
                 plan.cpu_workers,
+                sources=sources,
             )
             merged = self.run_merge_phase(plan, work_dir)
             if plan.keep_temp:

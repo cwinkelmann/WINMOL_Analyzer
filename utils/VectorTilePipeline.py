@@ -11,9 +11,11 @@ import numpy as np
 
 from classes.Config import Config
 from utils.IO import (
+    load_raster_window_with_profile,
     load_stem_map,
     write_all_layers_to_gpkg,
     write_stems_to_gpkg,
+    write_tile_raster,
 )
 import utils.Quantification as Quant
 import utils.Skeletonization as Skel
@@ -301,7 +303,27 @@ def process_prediction_tile(
     config,
     process_type: str,
     output_prefix: str,
+    source=None,
 ):
+    if source is not None:
+        # The split, done here instead of serially in the parent: read
+        # this tile's halo window from the stem map, skip it when empty,
+        # and write the tile raster the merge phase takes its bounds
+        # from. Same functions as before, then read back through the
+        # same load_stem_map -- the profile and pixels the pipeline sees
+        # are the ones it always saw.
+        source_path, window = source
+        pred_tile, tile_profile = load_raster_window_with_profile(
+            source_path, window)
+        pred_arr = pred_tile if hasattr(pred_tile, 'size') else None
+        if (
+            pred_arr is None
+            or pred_arr.size == 0
+            or not (pred_arr >= 1).any()
+        ):
+            return None
+        write_tile_raster(pred_tile, tile_profile, pred_tile_path)
+        del pred_tile, pred_arr
     pred, profile = load_stem_map(pred_tile_path)
     pred_arr = np.asarray(pred)
     if pred_arr.size == 0 or not np.any(pred_arr >= 1):
@@ -416,10 +438,18 @@ def _print_vector_summary(
     print(f'Total segments:        {totals["segment_count"]}')
     print(f'Total stems:           {totals["stem_count"]}')
     print(f'Elapsed:               {elapsed:.3f}s')
+    # Every stage, not just two: a full run's log is the only per-stage
+    # profile of the real tile mix there is (per-tile prints are captured
+    # in the workers), and the skeleton stage was the largest for a long
+    # time without appearing here.
+    stages = ', '.join(
+        f'{key[:-2]} {totals[key] / timed_tiles:.3f}s'
+        for key in ('skel_s', 'restore_s', 'build_s', 'connect_s',
+                    'quant_s', 'write_s')
+    )
     print(
         f'Avg timed tile:        {totals["total_s"] / timed_tiles:.3f}s '
-        f'(quant {totals["quant_s"] / timed_tiles:.3f}s, connect '
-        f'{totals["connect_s"] / timed_tiles:.3f}s)',
+        f'({stages})',
     )
 
 
@@ -429,8 +459,21 @@ def process_prediction_tiles(
     process_type: str,
     output_dir: str,
     cpu_workers: int,
+    sources=None,
 ):
+    """Run the vector pipeline over `pred_tile_paths` in a process pool.
+
+    With `sources` -- one (stem_map_path, window) per path -- the tile
+    rasters do not exist yet: each worker reads its window from the stem
+    map and writes the raster itself (see process_prediction_tile).
+    """
     os.makedirs(output_dir, exist_ok=True)
+    if sources is None:
+        sources = [None] * len(pred_tile_paths)
+    if len(sources) != len(pred_tile_paths):
+        raise ValueError(
+            f'sources ({len(sources)}) must align with pred_tile_paths '
+            f'({len(pred_tile_paths)})')
     total_workers = max(
         1,
         int(cpu_workers or getattr(config, 'cpu_workers', 1) or 1),
@@ -448,7 +491,7 @@ def process_prediction_tiles(
     progress_interval_s = float(getattr(config, 'progress_interval_s', 60.0))
 
     tasks = []
-    for pred_tile_path in pred_tile_paths:
+    for pred_tile_path, source in zip(pred_tile_paths, sources):
         name = os.path.splitext(os.path.basename(pred_tile_path))[0]
         name = name.replace('_roi_stem_map', '')
         output_prefix = os.path.join(output_dir, name)
@@ -457,7 +500,8 @@ def process_prediction_tiles(
             cpu_workers=inner_workers,
             vector_tile_workers=1,
         )
-        tasks.append((pred_tile_path, tile_cfg, process_type, output_prefix))
+        tasks.append(
+            (pred_tile_path, tile_cfg, process_type, output_prefix, source))
 
     if not tasks:
         print('Vector tiles 0/0 | no foreground tiles queued', flush=True)
