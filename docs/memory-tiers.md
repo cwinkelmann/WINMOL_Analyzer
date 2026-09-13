@@ -1,65 +1,95 @@
-# Running WINMOL on limited RAM — recommendations by tier
+# Running WINMOL on limited RAM — measured, by tier
 
-The pipeline has two peaks, and they are in **different** phases:
+Everything below is measured (GPU image, RTX 4080 host, 2026-09-13), not
+modelled. Two inputs: a 25-tile crop for the knob sweep, and the full
+19 GB R13 orthomosaic (99,231 prediction tiles, 796 vector tiles) for
+the realistic peak. Every configuration produced bit-identical output.
 
-- **Prediction** holds one CUDA onnxruntime session (~1.1 GB RSS; it also
-  maps ~10 GB of *virtual*, which does not count against RSS but does
-  count against the kernel's overcommit limit — see below) plus a GDAL
-  block cache the entrypoint sizes at 20 % of RAM.
-- **Vectorisation** forks/spawns a pool of tile workers. Since the pool
-  now uses the `spawn` start method (utils/VectorTilePipeline.py), each
-  worker is an independent process: **~0.1 GB fixed** (Python + geo/
-  science imports, measured) plus its per-tile working set. Its memory is
-  *additive*, not shared copy-on-write.
+## What actually costs RAM
 
-Peak RAM is therefore roughly:
+Peak container RSS on the 25-tile crop, single ortho, single GPU:
 
-```
-prediction:  1.1 (session) + GDAL_CACHEMAX + ~0.5 overhead
-vector:      parent + N_workers × (0.1 + per_tile_working_set)
-```
+| vector workers | GDAL cache | batch | peak RSS |
+|---|---|---|---|
+| 1 | 256 MB | 1 | 2.49 GiB |
+| 2 | 256 MB | 1 | 2.49 GiB |
+| 2 | 512 MB | 1 | 2.75 GiB |
+| 4 | 512 MB | 1 | 3.60 GiB |
+| 4 | 2048 MB | 1 | 4.68 GiB |
+| 8 | 2048 MB | 1 | 4.77 GiB |
+| 8 | 2048 MB | 4 | 5.56 GiB |
 
-Two knobs move these, both settable as env vars on `docker run`:
+Read down the table and the levers separate cleanly:
 
-| knob | controls | entrypoint default |
-|---|---|---|
-| `WINMOL_JOBS` | orthomosaics processed in parallel | `RAM // 6`, capped by GPU count |
-| `WINMOL_CONFIG_OVERRIDES_JSON` `max_vector_tile_workers` | vector pool size | auto (RAM- and CPU-bounded) |
-| `GDAL_CACHEMAX` | GDAL block cache, MB | `20 % of RAM ÷ jobs` |
+- **The floor is ~2.5 GiB**: the CUDA session (~1.1 GB RSS), the Python
+  process with its geo/science imports, the writer thread, and one tile
+  in flight. Nothing below this is reachable on the GPU image.
+- **Vector workers are nearly free.** 1→2 workers: +0 MB. 4→8: +90 MB.
+  Each spawned worker is ~100 MB of imports plus a working set that the
+  foreground-bbox crop (utils/Skeletonization.py) keeps small. The
+  execution plan still budgets 1.75 GB per worker
+  (`VECTOR_WORKER_PRIVATE_BYTES`); that figure predates the crop and is
+  now ~20× too pessimistic. It is what throttled the pool to 10 on a
+  46 GB host.
+- **GDAL block cache is the biggest knob**: 512 → 2048 MB cost +1.1 GB.
+- **Batch size costs host RAM too**, not just VRAM: batch 1 → 4 at 8
+  workers cost +0.8 GB. Batch 1 is also the fastest (measured across
+  1/4/8/12/16), so there is no reason to raise it on a small machine.
 
-## The overcommit constraint (why a GPU run can be killed with RAM free)
-
-A CUDA session maps ~10 GB of **virtual** address space that the driver
-never releases for the life of the process. With `vm.overcommit_memory=0`
-(the Linux default) the kernel refuses new allocations once
-`Committed_AS` exceeds `CommitLimit` (≈ RAM×0.5 + swap). Forking the
-vector pool from a CUDA-holding parent multiplied that virtual footprint
-by the worker count and blew the limit **with real RAM still free**. The
-`spawn` fix removes this: spawned workers do not inherit the parent's
-mappings. These recommendations assume the spawn fix is in.
+**Full-scale correction:** the same 8-worker / 2048 MB config peaked at
+**8.36 GiB on the full orthomosaic** vs 4.77 on the crop — larger halo
+tiles, a larger merge, more in flight. Treat full-scale peak as roughly
+**1.75× the crop figure** and size from that.
 
 ## Recommendations (single ortho, single GPU)
 
-Reserve ~2 GB for the OS. Numbers are for the **GPU image**; the CPU image
-drops the ~1.1 GB session but the model then runs in RAM, so treat CPU as
-one tier lower.
+Reserve ~2 GB for the OS. Peaks below are the full-scale estimate
+(crop × 1.75), and the 8 GB row was verified directly: the 2-worker /
+256 MB configuration completed under a hard 4 GB container cap.
 
-| RAM | WINMOL_JOBS | max_vector_tile_workers | GDAL_CACHEMAX | notes |
+| RAM | `max_vector_tile_workers` | `GDAL_CACHEMAX` | batch | est. full-scale peak |
 |---|---|---|---|---|
-| **8 GB** | 1 | 2 | 1024 MB | tight; prefer overviews on the input to cut read amplification |
-| **16 GB** | 1 | 4 | 2048 MB | comfortable for one ortho |
-| **24 GB** | 1 (2 if CPU-bound) | 6 | 3072 MB | headroom for a second job on CPU-heavy vector work |
-| **32 GB** | 2 | 8 | 4096 MB | two orthos in parallel, or one with a wide vector pool |
+| **8 GB** | 2 | 512 MB | 1 | ~4.5 GiB |
+| **16 GB** | 8 | 2048 MB | 1 | ~8.5 GiB |
+| **24 GB** | 8 | 3072 MB | 1 | ~10 GiB — room for `WINMOL_JOBS=2` on multi-file runs |
+| **32 GB** | 12 | 4096 MB | 1 | ~12 GiB — `WINMOL_JOBS=2`, or 3 with a smaller cache |
 
-`WINMOL_JOBS` above 1 only helps with **multiple** input files — a single
-ortho runs one job regardless. On multi-job runs every number in the row
-is *per job*, so the pool total is `JOBS × max_vector_tile_workers`; keep
-that product within `(RAM − 2) ÷ 0.5`.
+Since workers are almost free, on 16 GB and up the pool size should be
+set by **CPU count**, not RAM; the RAM-derived cap in the plan can only
+under-provision it. On 8 GB, the small pool costs about 25% on the vector
+phase (53 s vs 42 s on the crop) — acceptable, and far better than an
+OOM.
+
+`WINMOL_JOBS` above 1 helps only with **multiple** input files (a single
+ortho runs one job regardless); every row is then *per job*.
+
+All three are set as environment variables on `docker run`;
+`max_vector_tile_workers` and the batch go in `WINMOL_CONFIG_OVERRIDES_JSON`.
+
+## Overcommit: measured, not a wall
+
+A CUDA onnxruntime session maps ~10 GB of *virtual* address space that
+the driver keeps for the process lifetime (VmSize 10.3 GB after one
+inference, 9.3 GB after `close()` + `cudaDeviceReset()`). Under the
+Linux default `vm.overcommit_memory=0` this is **not** a limit: every
+configuration above ran at 101–126% of `CommitLimit`, and the full run
+reached 144%, all without incident. The heuristic only refuses single
+allocations that are absurd relative to free memory.
+
+It becomes a hard wall only under `vm.overcommit_memory=2` (strict),
+where `CommitLimit ≈ RAM/2 + swap` and a 10 GB session alone exceeds it
+on a 16 GB host. If a site runs strict overcommit, prediction must run
+in a child process that exits before vectorisation
+(utils/PredictionProcess.py — present, not wired by default).
 
 ## If a run is killed at the vector phase
 
-1. Confirm the spawn fix is present (`grep spawn utils/VectorTilePipeline.py`).
-2. Lower `max_vector_tile_workers` first — it is the additive term.
-3. Then lower `GDAL_CACHEMAX`.
-4. On a ZFS host, `MemAvailable` under-reports by the ARC size (ARC is
-   reclaimable but excluded); a monitor reading it may kill a healthy run.
+1. The tile split before the pool writes one halo tile per grid cell;
+   make sure they are DEFLATE-compressed (utils/IO.write_tile_raster).
+   Uncompressed, a full ortho pushed ~78 GB through the page cache and
+   was killed there, in the loop, before any worker existed.
+2. Lower `GDAL_CACHEMAX` — the largest single lever.
+3. Keep batch at 1.
+4. Only then lower `max_vector_tile_workers`; it recovers almost nothing.
+5. On a ZFS host, `MemAvailable` excludes the ARC (reclaimable but
+   uncounted); a monitor reading it may kill a healthy run.
