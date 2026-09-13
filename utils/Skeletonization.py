@@ -59,16 +59,23 @@ def find_segments(pred, config, profile) -> (List[Part], List[Tuple[int]]):
     px_size = abs(profile['transform'][0])
     min_length = math.floor((config.min_length / 4) / px_size)
     padding = int(config.max_tree_height / px_size) + 1
-    pred = np.pad(
-        pred,
-        ((padding, padding), (padding, padding)),
-        'constant',
-        constant_values=False
-    )
 
+    # Coordinates downstream (restore_geoinformation) are in the frame of
+    # the tile padded by `padding` on every side. That frame used to be
+    # materialised: a 4916 px tile became 7102 px, 50M pixels, and every
+    # stage ran over all of them although well under 1% are live. Now the
+    # frame is only a coordinate offset. The work happens on a crop around
+    # the foreground, and the parts come out in the padded frame -- an
+    # integer shift, hence exact.
     pred = _as_binary_mask(pred)
+    padded_shape = (pred.shape[0] + 2 * padding, pred.shape[1] + 2 * padding)
+    cropped = _crop_for_skeleton(pred, padding)
+    if cropped is None:
+        t.stop()
+        return []
+    crop, offset = cropped
 
-    skel = morphology.skeletonize(pred)
+    skel = _skeletonize_sparse(crop)
 
     t.stop()
     print("#######################################################")
@@ -77,7 +84,7 @@ def find_segments(pred, config, profile) -> (List[Part], List[Tuple[int]]):
     end_nodes, skel = get_nodes(skel)
     segments, skel = find_skeleton_segments(
         skel, end_nodes, math.floor(min_length / 4),
-        padding, config=config
+        padding, config=config, offset=offset, out_shape=padded_shape,
     )
     measuring_point_spacing = math.floor(
         min(config.min_length, config.measuring_point_spacing_m) / px_size)
@@ -108,6 +115,77 @@ def _foreground_bbox(skel: np.ndarray, margin: int = _NODE_MARGIN):
     x0 = max(0, int(xs.min()) - margin)
     x1 = min(skel.shape[1], int(xs.max()) + margin + 1)
     return y0, y1, x0, x1
+
+
+def _crop_for_skeleton(mask: np.ndarray, padding: int,
+                       margin: int = _NODE_MARGIN):
+    """The foreground of `mask` with `margin` zero pixels on every side,
+    and the offset that maps crop coordinates into the frame of the tile
+    padded by `padding` -- or None when there is no foreground.
+
+    Every stage of the skeleton pipeline is local (3x3 neighbourhoods, a
+    2x2 erosion, tracing along skeleton pixels), so nothing further than
+    one pixel from the foreground can influence a result. The margin is
+    kept at the tile edge as well, by padding the crop, so no stage ever
+    sees an array boundary where the padded frame had zeros.
+    """
+    rows = np.flatnonzero(mask.any(axis=1))
+    if rows.size == 0:
+        return None
+    cols = np.flatnonzero(mask.any(axis=0))
+    y0, y1 = int(rows[0]), int(rows[-1]) + 1
+    x0, x1 = int(cols[0]), int(cols[-1]) + 1
+    cy0, cy1 = max(0, y0 - margin), min(mask.shape[0], y1 + margin)
+    cx0, cx1 = max(0, x0 - margin), min(mask.shape[1], x1 + margin)
+    sub = mask[cy0:cy1, cx0:cx1]
+    pad_t, pad_b = margin - (y0 - cy0), margin - (cy1 - y1)
+    pad_l, pad_r = margin - (x0 - cx0), margin - (cx1 - x1)
+    crop = np.pad(sub, ((pad_t, pad_b), (pad_l, pad_r)))
+    offset = (cy0 - pad_t + padding, cx0 - pad_l + padding)
+    return crop, offset
+
+
+_EIGHT_CONNECTED = np.ones((3, 3), dtype=int)
+
+
+def _skeletonize_sparse(mask: np.ndarray) -> np.ndarray:
+    """morphology.skeletonize, applied per connected component.
+
+    Thinning removes a pixel based on its 3x3 neighbourhood only, and two
+    8-connected components share no neighbourhood, so each component
+    thins exactly as it would inside the full image -- in the same raster
+    order, to the same fixed point. Doing it per component bbox turns a
+    pass over the whole (mostly empty) crop into passes over the stems.
+    """
+    mask = np.asarray(mask, dtype=bool)
+    out = np.zeros(mask.shape, dtype=bool)
+    labels, count = scipy.ndimage.label(mask, structure=_EIGHT_CONNECTED)
+    if count == 0:
+        return out
+    for index, region in enumerate(scipy.ndimage.find_objects(labels), 1):
+        component = labels[region] == index
+        thinned = morphology.skeletonize(np.pad(component, 1))[1:-1, 1:-1]
+        out[region] |= thinned
+    return out
+
+
+def _gather_neighbours(skel: np.ndarray):
+    """Row-major coordinates of the skeleton pixels and their eight
+    neighbours, read from a zero-padded copy so every gather is in range.
+
+    Returns (ys, xs, p) with p[k] the neighbour in position k of the
+    clockwise-from-north ordering p2..p9 used by find_skeleton_nodes:
+    N, NE, E, SE, S, SW, W, NW.
+    """
+    padded = np.pad(skel, 1, mode='constant', constant_values=0)
+    ys, xs = np.nonzero(skel)
+    y, x = ys + 1, xs + 1
+    p = (
+        padded[y - 1, x], padded[y - 1, x + 1], padded[y, x + 1],
+        padded[y + 1, x + 1], padded[y + 1, x], padded[y + 1, x - 1],
+        padded[y, x - 1], padded[y - 1, x - 1],
+    )
+    return ys, xs, p
 
 
 def get_nodes(skel: np.ndarray) -> Tuple[List[Tuple[int, int]], Any]:
@@ -149,7 +227,7 @@ def get_nodes(skel: np.ndarray) -> Tuple[List[Tuple[int, int]], Any]:
         skel = remove_branchpoints_from_skel(skel, branch_points)
         end_nodes, branch_points = find_skeleton_nodes(skel)
         bp_count = bp_count + len(branch_points)
-    skel = morphology.skeletonize(skel)
+    skel = _skeletonize_sparse(skel)
     print("Branch points removed: ", bp_count)
     print("Detected end nodes: ", len(end_nodes))
     t.stop()
@@ -160,20 +238,29 @@ def get_nodes(skel: np.ndarray) -> Tuple[List[Tuple[int, int]], Any]:
 
 # Remove "dense" (2x2 or larger) regions in the skeleton.
 def remove_dense_skeleton_nodes(skel: np.ndarray) -> Tuple[ndarray, int]:
-    dense_nodes = morphology.binary_erosion(
-        np.pad(skel, 1),
-        np.ones((2, 2))
-    )[1:-1, 1:-1]
-    labeled_array, num_features = scipy.ndimage.measurements.label(dense_nodes)
-    # `count` is only ever printed, and it was being obtained as
-    # len(center_of_mass(...)) -- which is num_features BY DEFINITION, since
-    # center_of_mass returns one centre per requested label. The centres
-    # themselves were computed and discarded. That call was 84% of this
-    # function (465 ms of 557 ms on a real R13 tile) and it costs that even
-    # when num_features is 0, because it walks the array regardless.
-    count = num_features
+    # This is binary_erosion(np.pad(skel, 1), ones((2, 2)))[1:-1, 1:-1]:
+    # with scipy's origin for an even structure (centre index 1) a pixel
+    # is dense when it and its N, W and NW neighbours are all skeleton.
+    # Evaluated at the skeleton pixels only instead of over the array.
+    sk = np.asarray(skel, dtype=bool)
+    ys, xs = np.nonzero(sk)
+    inner = (ys > 0) & (xs > 0)
+    yi, xi = ys[inner], xs[inner]
+    dense = np.zeros(ys.size, dtype=bool)
+    dense[inner] = sk[yi - 1, xi] & sk[yi, xi - 1] & sk[yi - 1, xi - 1]
+    dy, dx = ys[dense], xs[dense]
 
-    skel[np.where(dense_nodes.__eq__(True))] = False
+    # `count` is only ever printed: the number of 4-connected dense
+    # regions, labelled over their own bounding box rather than the tile.
+    count = 0
+    if dy.size:
+        y0, x0 = int(dy.min()), int(dx.min())
+        local = np.zeros((int(dy.max()) - y0 + 1, int(dx.max()) - x0 + 1),
+                         dtype=bool)
+        local[dy - y0, dx - x0] = True
+        count = int(scipy.ndimage.label(local)[1])
+
+    skel[dy, dx] = False
     return skel, count
 
 
@@ -183,22 +270,12 @@ def find_skeleton_nodes(
 
     print("Find skeletion nodes")
 
-    # Pad the skeleton array (same as in the numpy version)
-    skel = np.pad(skel, 1, mode='constant', constant_values=0)
-
-    # Extract 8-neighbors using slicing"
-    p2 = skel[:-2, 1:-1]
-    p3 = skel[:-2, 2:]
-    p4 = skel[1:-1, 2:]
-    p5 = skel[2:, 2:]
-    p6 = skel[2:, 1:-1]
-    p7 = skel[2:, :-2]
-    p8 = skel[1:-1, :-2]
-    p9 = skel[:-2, :-2]
-    p1 = skel[1:-1, 1:-1]
-
-    # Binary skeleton mask
-    mask = p1 == 1
+    # The transition count A(p1) of Zhang-Suen, evaluated at the skeleton
+    # pixels only. The former version built the eight neighbour planes of
+    # the whole array (ten full passes) to classify well under 1% of it.
+    # Same test, same row-major order as np.argwhere gave.
+    ys, xs, (p2, p3, p4, p5, p6, p7, p8, p9) = _gather_neighbours(
+        np.asarray(skel, dtype=bool))
 
     # A(p1) calculation (transition count)
     transitions = ((p2 == 0) & (p3 == 1)).astype(np.uint8) + \
@@ -211,16 +288,13 @@ def find_skeleton_nodes(
                   ((p9 == 0) & (p2 == 1))
 
     # Endpoint: A(p1) == 1, Branchpoint: A(p1) >= 3
-    endpoint_mask = (transitions == 1) & mask
-    branchpoint_mask = (transitions >= 3) & mask
+    endpoint_sel = transitions == 1
+    branchpoint_sel = transitions >= 3
 
-    # Get coordinates (remove padding offset)
-    endpoints = np.argwhere(endpoint_mask)
-    branchpoints = np.argwhere(branchpoint_mask)
-
-    # Convert to CPU tuples
-    endpoints = [tuple(map(int, p)) for p in endpoints]
-    branchpoints = [tuple(map(int, p)) for p in branchpoints]
+    endpoints = [(int(y), int(x)) for y, x in
+                 zip(ys[endpoint_sel], xs[endpoint_sel])]
+    branchpoints = [(int(y), int(x)) for y, x in
+                    zip(ys[branchpoint_sel], xs[branchpoint_sel])]
 
     return endpoints, branchpoints
 
@@ -229,29 +303,20 @@ def remove_branchpoints_from_skel(skel, branchpoints):
     print("Remove branch points")
     skel_arr = np.asarray(skel, dtype=bool)
     branchpoints_arr = np.asarray(branchpoints)
+    if branchpoints_arr.size == 0:
+        return skel_arr
 
-    mask = np.zeros_like(skel_arr, dtype=bool)
-
+    # Clear the 3x3 block around each branch point directly; building a
+    # full-size mask first was two passes over the array per call.
     for dx in [-1, 0, 1]:
         for dy in [-1, 0, 1]:
             xs = branchpoints_arr[:, 0] + dx
             ys = branchpoints_arr[:, 1] + dy
             xs = np.clip(xs, 0, skel_arr.shape[0] - 1)
             ys = np.clip(ys, 0, skel_arr.shape[1] - 1)
-            mask[xs, ys] = True
+            skel_arr[xs, ys] = False
 
-    skel_arr[mask] = False
     return skel_arr
-
-
-def _neighbor_degree(skel: np.ndarray) -> np.ndarray:
-    p = np.pad(skel.astype(np.uint8), 1, mode='constant', constant_values=0)
-    deg = (
-        p[:-2, :-2] + p[:-2, 1:-1] + p[:-2, 2:] +
-        p[1:-1, :-2] + p[1:-1, 2:] +
-        p[2:, :-2] + p[2:, 1:-1] + p[2:, 2:]
-    )
-    return deg
 
 
 def _edge_key(a: Tuple[int, int], b: Tuple[int, int]):
@@ -342,8 +407,18 @@ def find_skeleton_segments(
         end_nodes: List[Tuple[int]],
         min_length: int,
         padding: int,
-        config=None
+        config=None,
+        offset: Tuple[int, int] = (0, 0),
+        out_shape: Tuple[int, int] = None,
 ) -> (List[Part], np.ndarray):
+    """Trace the skeleton into parts.
+
+    `skel` may be a crop: `offset` is where its origin sits in the output
+    frame, and `out_shape` the size of that frame. The parts come back in
+    the output frame (an integer shift of every path pixel, so exact) and
+    the returned skeleton is the output-frame array with the traced pixels
+    set -- what refine_skeleton_segments slices its sub-windows from.
+    """
     t = Timer()
     t.start()
     print("#######################################################")
@@ -353,14 +428,32 @@ def find_skeleton_segments(
     print("Minimum length in pixel: ", min_length)
 
     skel_bool = np.asarray(skel, dtype=bool)
-    out_skel = np.zeros_like(skel_bool, dtype=bool)
+    oy, ox = int(offset[0]), int(offset[1])
+    h, w = skel_bool.shape
+    out_skel = np.zeros(out_shape or skel_bool.shape, dtype=bool)
+    out_view = out_skel[oy:oy + h, ox:ox + w]     # crop frame, shares memory
     visited_edges = set()
     parts = []
 
-    deg = _neighbor_degree(skel_bool)
-    node_mask = skel_bool & (deg != 2)
-    node_coords = [tuple(map(int, p)) for p in np.argwhere(node_mask)]
+    # Degree != 2 marks a node. Counted at the skeleton pixels only, in
+    # the row-major order np.argwhere over a full mask would have given.
+    ys, xs, planes = _gather_neighbours(skel_bool)
+    deg = np.zeros(ys.size, dtype=np.uint8)
+    for plane in planes:
+        deg += plane
+    is_node = deg != 2
+    node_coords = [(int(y), int(x)) for y, x in
+                   zip(ys[is_node], xs[is_node])]
     node_set = set(node_coords)
+
+    def _keep(path):
+        # Parts live in the output frame; the traced pixels mark the crop.
+        part = _build_part_from_path(
+            [(r + oy, c + ox) for r, c in path], min_length)
+        if part is not None:
+            parts.append(part)
+            for rr, cc in path:
+                out_view[rr, cc] = True
 
     for node in node_coords:
         nbrs = get_neighbors(node[0], node[1], skel_bool)
@@ -368,25 +461,15 @@ def find_skeleton_segments(
             ek = _edge_key(node, nb)
             if ek in visited_edges:
                 continue
-            path = _trace_chain(node, nb, skel_bool, node_set, visited_edges)
-            part = _build_part_from_path(path, min_length)
-            if part is not None:
-                parts.append(part)
-                for rr, cc in part.path:
-                    out_skel[rr, cc] = True
+            _keep(_trace_chain(node, nb, skel_bool, node_set, visited_edges))
 
     # handle loops or isolated remnants without degree!=2 nodes
     remaining = [tuple(map(int, p))
-                 for p in np.argwhere(skel_bool & (~out_skel))]
+                 for p in np.argwhere(skel_bool & (~out_view))]
     for seed in remaining:
-        if out_skel[seed]:
+        if out_view[seed]:
             continue
-        path = _trace_loop(seed, skel_bool, visited_edges)
-        part = _build_part_from_path(path, min_length)
-        if part is not None:
-            parts.append(part)
-            for rr, cc in part.path:
-                out_skel[rr, cc] = True
+        _keep(_trace_loop(seed, skel_bool, visited_edges))
 
     skeleton_parts = set(parts)
     print("Detected skeleton segments: ", len(skeleton_parts))
@@ -484,11 +567,15 @@ def refine_skeleton_segment(part: Part, low_bounds: Tuple[int, int],
         p_last = [parts[0].start, parts[0].stop]
         parts[0].path = []
         parts[0].path.extend([w])
-        temp = np.full(skel.shape, False)
+        # Pixels cleared from `skel` since the last measuring point, so a
+        # split can put them back. This was a full-size boolean mask
+        # reallocated at EVERY step along the path -- the part's whole
+        # bounding window, refilled per pixel walked.
+        cleared = []
         while w != z:
             x, y = w
             skel[(x, y)] = False
-            temp[(x, y)] = True
+            cleared.append((x, y))
             ww = get_neighbors(x, y, skel)
             if ww:
                 w = ww[0]
@@ -501,12 +588,13 @@ def refine_skeleton_segment(part: Part, low_bounds: Tuple[int, int],
                                         low_bounds, up_bounds)
                         parts.append(new_part)
                         parts[0].stop = n
-                        skel[np.where(temp.__eq__(True))] = True
-                        temp = np.full(skel.shape, False)
+                        for px in cleared:
+                            skel[px] = True
+                        cleared = []
                         split_ = split_ + 1
                     else:
                         parts[0].path.extend([w])
-                        temp = np.full(skel.shape, False)
+                        cleared = []
                 else:
                     if math.dist(n, w) > measuring_point_spacing:
                         if n == parts[0].start:
@@ -523,7 +611,7 @@ def refine_skeleton_segment(part: Part, low_bounds: Tuple[int, int],
                                 parts[0].path.extend([w])
                                 p_last = p_recent
                                 n = w
-                                temp = np.full(skel.shape, False)
+                                cleared = []
                         else:
                             if angle > 30:
                                 new_part = Part(n, parts[0].stop,
@@ -531,14 +619,15 @@ def refine_skeleton_segment(part: Part, low_bounds: Tuple[int, int],
                                                 low_bounds, up_bounds)
                                 parts.append(new_part)
                                 parts[0].stop = n
-                                skel[np.where(temp.__eq__(True))] = True
+                                for px in cleared:
+                                    skel[px] = True
                                 z = w
                                 split_ = split_ + 1
                             else:
                                 parts[0].path.extend([w])
                                 p_last = p_recent
                                 n = w
-                                temp = np.full(skel.shape, False)
+                                cleared = []
             else:
                 parts[0].path.extend([(x, y)])
                 parts[0].stop = (x, y)
