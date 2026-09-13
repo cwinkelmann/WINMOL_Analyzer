@@ -26,11 +26,10 @@ Read down the table and the levers separate cleanly:
   in flight. Nothing below this is reachable on the GPU image.
 - **Vector workers are nearly free.** 1→2 workers: +0 MB. 4→8: +90 MB.
   Each spawned worker is ~100 MB of imports plus a working set that the
-  foreground-bbox crop (utils/Skeletonization.py) keeps small. The
-  execution plan still budgets 1.75 GB per worker
-  (`VECTOR_WORKER_PRIVATE_BYTES`); that figure predates the crop and is
-  now ~20× too pessimistic. It is what throttled the pool to 10 on a
-  46 GB host.
+  foreground crop (utils/Skeletonization.py) keeps small. The execution
+  plan budgets 256 MB per worker (`VECTOR_WORKER_PRIVATE_BYTES`, a 10×
+  margin over the measured marginal cost); the previous 1.75 GB figure
+  predated the crop and throttled the pool to 10 on a 46 GB host.
 - **GDAL block cache is the biggest knob**: 512 → 2048 MB cost +1.1 GB.
 - **Batch size costs host RAM too**, not just VRAM: batch 1 → 4 at 8
   workers cost +0.8 GB. Batch 1 is also the fastest (measured across

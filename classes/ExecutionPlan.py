@@ -146,10 +146,21 @@ def _scenario(hardware: Any) -> str:
     return MULTI_GPU
 
 
-#: Private resident bytes one vector tile worker needs. Measured at
-#: ~1.38 GB (Private_Dirty, smaps_rollup, Tegel R13/R12); rounded up for
-#: headroom since peak differs from the sampled instant.
-VECTOR_WORKER_PRIVATE_BYTES = 1.75 * (1024 ** 3)
+#: Private resident bytes one vector tile worker needs.
+#:
+#: Was 1.75 GB, from a ~1.38 GB Private_Dirty measurement on Tegel R13.
+#: That predates the foreground crop in utils.Skeletonization: what made
+#: a worker expensive was running every node-detection pass over the
+#: full max_tree_height-padded tile (7102^2 for a 4916 tile, 50M pixels,
+#: well under 1% live). Re-measured after the crop on a 7-config sweep
+#: (2026-09-13, R13 crop, spawn workers): 1->2 workers +0 MB peak
+#: container RSS, 4->8 workers +90 MB -- about 25 MB marginal per
+#: worker. 256 MB keeps a 10x margin over that.
+#:
+#: The old figure was not idle: it throttled the pool to 10 on a 46 GB
+#: host whose CPU cap allowed 11, and to a handful on small machines,
+#: for RAM the workers no longer used. See docs/memory-tiers.md.
+VECTOR_WORKER_PRIVATE_BYTES = 256 * (1024 ** 2)
 
 #: Sentinel for "this cap does not apply" inside the min() below.
 _UNCONSTRAINED = 1 << 30
