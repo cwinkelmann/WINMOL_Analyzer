@@ -67,3 +67,21 @@ onnxruntime-gpu[cuda,cudnn]>=1.26,<1.27
 # the run logs "RAM=0.0 GB" — a wrong number in the log is a wrong
 # number, and psutil is tiny.
 psutil>=5.9
+
+# OPTIONAL, and OFF unless WINMOL_ONNX_TENSORRT=1 is set.
+#
+# onnxruntime ships the TensorRT provider SHIM regardless, which is why
+# get_available_providers() lists TensorrtExecutionProvider on an image
+# that cannot actually use it -- the session then logs
+# "TryGetProviderInfo_TensorRT ... Failed to load library" and falls back
+# to CUDA. Installing the runtime is what makes the EP real.
+#
+# Measured on an RTX 4080 against the CUDA provider, R13 tiles:
+#   per-tile GPU  10.38 ms -> 5.51 ms   (1.88x)
+#   engine build  ~14 s per input shape, cached by utils.onnx_runtime
+#
+# NOT bit-identical: 3 px of 2,097,152 flipped across the 0.5 threshold
+# (IoU 0.999542), but max|diff| 0.398. Every other optimisation in this
+# lineage is exactly equivalent; this one is a different kernel
+# implementation, so it stays opt-in and the default never selects it.
+tensorrt-cu12>=10,<11

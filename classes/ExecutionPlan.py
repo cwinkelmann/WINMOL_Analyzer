@@ -146,10 +146,21 @@ def _scenario(hardware: Any) -> str:
     return MULTI_GPU
 
 
-#: Private resident bytes one vector tile worker needs. Measured at
-#: ~1.38 GB (Private_Dirty, smaps_rollup, Tegel R13/R12); rounded up for
-#: headroom since peak differs from the sampled instant.
-VECTOR_WORKER_PRIVATE_BYTES = 1.75 * (1024 ** 3)
+#: Private resident bytes one vector tile worker needs.
+#:
+#: Was 1.75 GB, from a ~1.38 GB Private_Dirty measurement on Tegel R13.
+#: That predates the foreground crop in utils.Skeletonization: what made
+#: a worker expensive was running every node-detection pass over the
+#: full max_tree_height-padded tile (7102^2 for a 4916 tile, 50M pixels,
+#: well under 1% live). Re-measured after the crop on a 7-config sweep
+#: (2026-09-13, R13 crop, spawn workers): 1->2 workers +0 MB peak
+#: container RSS, 4->8 workers +90 MB -- about 25 MB marginal per
+#: worker. 256 MB keeps a 10x margin over that.
+#:
+#: The old figure was not idle: it throttled the pool to 10 on a 46 GB
+#: host whose CPU cap allowed 11, and to a handful on small machines,
+#: for RAM the workers no longer used. See docs/memory-tiers.md.
+VECTOR_WORKER_PRIVATE_BYTES = 256 * (1024 ** 2)
 
 #: Sentinel for "this cap does not apply" inside the min() below.
 _UNCONSTRAINED = 1 << 30
@@ -184,15 +195,11 @@ def _vector_available_bytes(hardware: Any) -> float:
 def _vector_memory_cap(config: Any, hardware: Any) -> int:
     """How many vector tile workers free RAM can actually hold.
 
-    Sized on PRIVATE resident memory, not RSS. Measured with
-    smaps_rollup on a live Tegel vector phase, per worker:
-
-        RSS 2734 MB | Shared_Dirty 1257 MB | Private_Dirty 1381 MB
-
-    The Shared_Dirty part is copy-on-write state inherited from the
-    parent at fork; it is shared with the parent and every sibling, so
-    it costs physical RAM ONCE, not once per worker. Sizing off RSS
-    triple-counts it and badly under-provisions the pool.
+    Sized on the MARGINAL cost of one more worker: the pool is spawned,
+    not forked, so nothing is shared with the parent, and what a worker
+    adds to the peak is what it holds itself -- measured at ~25 MB per
+    worker once the skeleton stage stopped scanning the padded tile
+    (VECTOR_WORKER_PRIVATE_BYTES above keeps a 10x margin over that).
     """
     per_worker = float(_cfg(
         config, 'vector_worker_bytes', VECTOR_WORKER_PRIVATE_BYTES,

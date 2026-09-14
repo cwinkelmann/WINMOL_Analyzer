@@ -49,6 +49,35 @@ def _cpu_stream_forces_onnx_cpu(prediction_backend, selected_providers):
     return not any(p in _ACCELERATOR_PROVIDERS for p in selected_providers)
 
 
+def _release_prediction_memory(model=None):
+    """Free what prediction held, before anything forks.
+
+    Ordered cheapest-to-most-invasive so a failure in one step cannot
+    strand the others: drop the session, shrink GDAL's block cache (it is
+    sized for streaming tile reads and is dead weight afterwards), then
+    collect. Never raises -- reclaiming memory must not be able to fail a
+    run that has already produced its raster.
+    """
+    try:
+        if model is not None and hasattr(model, "close"):
+            model.close()
+    except Exception:
+        pass
+    try:
+        from osgeo import gdal
+        # Setting the cache max below its current fill forces GDAL to
+        # drop blocks immediately rather than at the next allocation.
+        gdal.SetCacheMax(0)
+        gdal.SetCacheMax(64 * 1024 * 1024)
+    except Exception:
+        pass
+    try:
+        import gc
+        gc.collect()
+    except Exception:
+        pass
+
+
 class ImageProcessing:
     def __init__(self, model_path, uav_path, stem_path,
                  trees_path, process_type):
@@ -188,6 +217,14 @@ class ImageProcessing:
             model,
             self.config,
         )
+        # Hand the memory back BEFORE the vector phase starts its pool.
+        # After a full-ortho prediction this process holds an onnxruntime
+        # arena, a CUDA context and a GDAL block cache the entrypoint
+        # sized at 20% of the container -- none of it needed again, and
+        # all of it counted against the same container limit as the
+        # eleven workers about to start. (The pool is spawned, so nothing
+        # is inherited; this is about the parent's own footprint.)
+        _release_prediction_memory(model)
         return (None, profile, self.stem_path)
 
     def trees_processing(self, pred, profile):
@@ -205,7 +242,7 @@ class ImageProcessing:
         stems = Quant.quantify_stems(stems, pred, profile, config=self.config)
         return stems
 
-    def run_vector_phase(self, plan, pred_path=None, pred=None, profile=None):
+    def run_vector_phase(self, plan, pred_path=None):
         if self.process_type == 'Stems':
             return None
 
@@ -226,38 +263,46 @@ class ImageProcessing:
                 plan.tile_inner_px,
                 halo_px,
             )
-            tile_paths = []
-            skipped_tiles = 0
-            for job in jobs:
-                pred_tile, tile_profile = IO.load_raster_window_with_profile(
-                    pred_path or self.stem_path, job.halo_window)
-                pred_arr = pred_tile if hasattr(pred_tile, 'size') else None
-                if (
-                    pred_arr is None
-                    or pred_arr.size == 0
-                    or not (pred_arr >= 1).any()
-                ):
-                    skipped_tiles += 1
-                    continue
-                tile_path = os.path.join(
-                    work_dir, f"{job.tile_id}_roi_stem_map.tif")
-                IO.write_tile_raster(pred_tile, tile_profile, tile_path)
-                tile_paths.append(tile_path)
+            # The split -- read each halo window, skip the empty ones, write
+            # the tile raster the merge later takes its bounds from -- used
+            # to run here, serially, before the pool: 89 s on a full R13
+            # ortho (1512 windows, 796 with foreground), all of it one core
+            # while the other eleven waited. Each worker now does it for
+            # its own tile, with the same functions, so the raster it writes
+            # and then reads back is the one this loop would have written.
+            source_path = pred_path or self.stem_path
+            tile_paths = [
+                os.path.join(work_dir, f"{job.tile_id}_roi_stem_map.tif")
+                for job in jobs
+            ]
+            sources = [(source_path, job.halo_window) for job in jobs]
+            # The plugin's progress parser (plugin_utils/run_progress.py)
+            # keys on "Prepared n/m vector tiles" and uses n as the merge
+            # denominator. Before the pool, n can only be the window count;
+            # the line after the pool corrects it to the tiles that
+            # produced output, which is what the merge reads back.
             print(
                 f"Prepared {len(tile_paths)}/{len(jobs)} vector tiles "
-                f"with foreground | skipped_empty {skipped_tiles}"
+                f"(windows; empty ones are skipped by the workers)"
             )
             if not tile_paths:
-                print("No foreground tiles found for vector stage.")
+                print("Empty tile grid; nothing to vectorise.")
                 return None
             from utils.VectorTilePipeline import process_prediction_tiles
 
-            process_prediction_tiles(
+            results = process_prediction_tiles(
                 tile_paths,
                 self.config,
                 self.process_type,
                 work_dir,
                 plan.cpu_workers,
+                sources=sources,
+            )
+            written = sum(
+                1 for r in results if r and r.get('gpkg_path'))
+            print(
+                f"Prepared {written}/{len(jobs)} vector tiles with output "
+                f"for the merge"
             )
             merged = self.run_merge_phase(plan, work_dir)
             if plan.keep_temp:
@@ -288,9 +333,8 @@ class ImageProcessing:
         self.run_prediction_phase(plan)
 
     def run_tree_pipeline(self, plan):
-        pred, profile, pred_path = self.run_prediction_phase(plan)
-        return self.run_vector_phase(
-            plan, pred_path=pred_path, pred=pred, profile=profile)
+        _, _, pred_path = self.run_prediction_phase(plan)
+        return self.run_vector_phase(plan, pred_path=pred_path)
 
     def check_DL_env(self):
         def get_nvidia_driver_version():

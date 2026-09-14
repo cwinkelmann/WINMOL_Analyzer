@@ -11,9 +11,12 @@ import numpy as np
 
 from classes.Config import Config
 from utils.IO import (
+    load_raster_window_with_profile,
     load_stem_map,
+    load_stem_map_profile,
     write_all_layers_to_gpkg,
     write_stems_to_gpkg,
+    write_tile_raster,
 )
 import utils.Quantification as Quant
 import utils.Skeletonization as Skel
@@ -296,15 +299,53 @@ def process_prediction_array_to_gpkg(
     )
 
 
+def _has_foreground(arr) -> bool:
+    """np.any(arr >= 1) without the comparison pass: for bool and
+    unsigned data, `>= 1` is `!= 0`, which any() tests directly."""
+    if arr.dtype == np.bool_ or arr.dtype.kind == 'u':
+        return bool(arr.any())
+    return bool(np.any(arr >= 1))
+
+
 def process_prediction_tile(
     pred_tile_path: str,
     config,
     process_type: str,
     output_prefix: str,
+    source=None,
 ):
-    pred, profile = load_stem_map(pred_tile_path)
+    if source is not None:
+        # The split, done here instead of serially in the parent: read
+        # this tile's halo window from the stem map, skip it when empty,
+        # and write the tile raster the merge phase takes its bounds
+        # from. Same functions as before, then read back through the
+        # same load_stem_map -- the profile and pixels the pipeline sees
+        # are the ones it always saw.
+        source_path, window = source
+        pred_tile, tile_profile = load_raster_window_with_profile(
+            source_path, window)
+        pred_arr = pred_tile if hasattr(pred_tile, 'size') else None
+        if (
+            pred_arr is None
+            or pred_arr.size == 0
+            or not _has_foreground(pred_arr)
+        ):
+            return None
+        write_tile_raster(pred_tile, tile_profile, pred_tile_path)
+        if pred_arr.dtype == np.uint8:
+            # The raster just written IS this array (uint8 in, uint8
+            # out, lossless codec), so reading it back would only be a
+            # second decompression pass; the profile is still taken
+            # from the file, as load_stem_map takes it.
+            pred = pred_arr
+            profile = load_stem_map_profile(pred_tile_path)
+        else:
+            del pred_tile, pred_arr
+            pred, profile = load_stem_map(pred_tile_path)
+    else:
+        pred, profile = load_stem_map(pred_tile_path)
     pred_arr = np.asarray(pred)
-    if pred_arr.size == 0 or not np.any(pred_arr >= 1):
+    if pred_arr.size == 0 or not _has_foreground(pred_arr):
         return None
     tile_label = os.path.splitext(os.path.basename(pred_tile_path))[0]
     try:
@@ -416,10 +457,18 @@ def _print_vector_summary(
     print(f'Total segments:        {totals["segment_count"]}')
     print(f'Total stems:           {totals["stem_count"]}')
     print(f'Elapsed:               {elapsed:.3f}s')
+    # Every stage, not just two: a full run's log is the only per-stage
+    # profile of the real tile mix there is (per-tile prints are captured
+    # in the workers), and the skeleton stage was the largest for a long
+    # time without appearing here.
+    stages = ', '.join(
+        f'{key[:-2]} {totals[key] / timed_tiles:.3f}s'
+        for key in ('skel_s', 'restore_s', 'build_s', 'connect_s',
+                    'quant_s', 'write_s')
+    )
     print(
         f'Avg timed tile:        {totals["total_s"] / timed_tiles:.3f}s '
-        f'(quant {totals["quant_s"] / timed_tiles:.3f}s, connect '
-        f'{totals["connect_s"] / timed_tiles:.3f}s)',
+        f'({stages})',
     )
 
 
@@ -429,8 +478,21 @@ def process_prediction_tiles(
     process_type: str,
     output_dir: str,
     cpu_workers: int,
+    sources=None,
 ):
+    """Run the vector pipeline over `pred_tile_paths` in a process pool.
+
+    With `sources` -- one (stem_map_path, window) per path -- the tile
+    rasters do not exist yet: each worker reads its window from the stem
+    map and writes the raster itself (see process_prediction_tile).
+    """
     os.makedirs(output_dir, exist_ok=True)
+    if sources is None:
+        sources = [None] * len(pred_tile_paths)
+    if len(sources) != len(pred_tile_paths):
+        raise ValueError(
+            f'sources ({len(sources)}) must align with pred_tile_paths '
+            f'({len(pred_tile_paths)})')
     total_workers = max(
         1,
         int(cpu_workers or getattr(config, 'cpu_workers', 1) or 1),
@@ -448,7 +510,7 @@ def process_prediction_tiles(
     progress_interval_s = float(getattr(config, 'progress_interval_s', 60.0))
 
     tasks = []
-    for pred_tile_path in pred_tile_paths:
+    for pred_tile_path, source in zip(pred_tile_paths, sources):
         name = os.path.splitext(os.path.basename(pred_tile_path))[0]
         name = name.replace('_roi_stem_map', '')
         output_prefix = os.path.join(output_dir, name)
@@ -457,7 +519,8 @@ def process_prediction_tiles(
             cpu_workers=inner_workers,
             vector_tile_workers=1,
         )
-        tasks.append((pred_tile_path, tile_cfg, process_type, output_prefix))
+        tasks.append(
+            (pred_tile_path, tile_cfg, process_type, output_prefix, source))
 
     if not tasks:
         print('Vector tiles 0/0 | no foreground tiles queued', flush=True)
@@ -492,7 +555,21 @@ def process_prediction_tiles(
         )
         return results
 
-    with mp.Pool(tile_workers) as pool:
+    # SPAWN, not the platform default (fork on Linux). This pool starts
+    # AFTER prediction, so under fork every worker inherits the parent's
+    # address space copy-on-write -- including the ~9.3 GB of VIRTUAL
+    # memory a CUDA onnxruntime session maps and never returns (measured:
+    # VmSize 10.3 GB after one inference, still 9.3 GB after close() and
+    # cudaDeviceReset(); the driver holds those reservations for the
+    # process lifetime). RSS stays small, but with vm.overcommit_memory=0
+    # the kernel counts committed virtual, so forking N workers pushes
+    # Committed_AS past CommitLimit and the run is killed at the fork --
+    # with plenty of real RAM free. This was invisible until the pipeline
+    # moved to onnxruntime-gpu; the CPU runtime maps almost no virtual.
+    # Spawned workers start clean and inherit none of it. (PredictWorkers
+    # already uses spawn, for the sibling CUDA-in-a-fork hazard.)
+    ctx = mp.get_context('spawn')
+    with ctx.Pool(tile_workers) as pool:
         for idx, result in enumerate(
             pool.imap_unordered(_process_prediction_tile_star, tasks),
             start=1,

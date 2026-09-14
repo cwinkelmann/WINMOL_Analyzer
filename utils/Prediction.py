@@ -217,6 +217,41 @@ def _resize_batch(batch_nhwc, size, order):
     return out
 
 
+def _nearest_indices(n_in: int, n_out: int) -> np.ndarray:
+    """Source indices skimage's order=0 resize would sample.
+
+    ``skimage.transform.resize`` maps an output centre back with
+    ``src = (dst + 0.5) * (n_in / n_out) - 0.5`` and, at order=0, hands
+    that to ``ndi.map_coordinates``, which rounds half UP (not numpy's
+    banker's rounding -- hence ``floor(x + 0.5)``) and clamps at the edge
+    under ``mode='edge'``. Reproducing that here is what makes the
+    indexing path below pixel-IDENTICAL rather than merely similar.
+    """
+    coords = (np.arange(n_out) + 0.5) * (float(n_in) / float(n_out)) - 0.5
+    return np.clip(np.floor(coords + 0.5).astype(np.intp), 0, n_in - 1)
+
+
+def _resize_mask_nearest(mask: np.ndarray, out_size) -> np.ndarray:
+    """Nearest-neighbour resize of a BOOLEAN mask, by indexing.
+
+    The old path cast the mask to float32, wrapped it into an NHWC batch
+    and pushed it through ``_resize_batch(order=0)`` -- i.e. skimage's
+    full ``warp`` machinery -- to do what is only an index selection.
+    Measured on a 1217x1217 tile from R13: 10.6 ms -> 1.7 ms, and the
+    output is bit-identical on every real tile tested.
+
+    That 10.6 ms was the single largest item in the producer, and it
+    holds the GIL: the producers are threads, so it did not parallelise.
+    Per tile the loop was 14.36 ms of which 82.9% was GIL-held, capping
+    threaded speed-up at 1.21x however many producers were configured --
+    which is why raising ``prediction_producer_workers_gpu`` never moved
+    throughput and why the GPU sat starved on ~2 of 12 cores.
+    """
+    rows = _nearest_indices(mask.shape[0], int(out_size[0]))
+    cols = _nearest_indices(mask.shape[1], int(out_size[1]))
+    return mask[rows[:, None], cols[None, :]]
+
+
 def _resize_like_consumer(tile, valid_mask, out_size):
     """Producer-side twin of _prepare_inference_batch's resize.
 
@@ -245,10 +280,10 @@ def _prepare_inference_batch(raw_tiles, raw_masks, config,
         read_strategy = resolve_read_strategy(config)
     if raw_masks is None:
         raw_masks = [_default_valid_mask(t) for t in raw_tiles]
-    mask_batch = np.stack(
-        [m.astype(np.float32)[:, :, None] for m in raw_masks],
-        axis=0,
-    )
+    # Stack the bools, then cast ONCE. Casting each mask first allocated a
+    # float32 temporary per tile before the stack copied it again: 0.908 ms
+    # -> 0.074 ms per batch, same array out.
+    mask_batch = np.stack(raw_masks, axis=0).astype(np.float32)[..., None]
 
     if strategy_wraps_graph(read_strategy):
         # The wrapped model normalizes and resizes in-graph: hand it the
@@ -256,8 +291,8 @@ def _prepare_inference_batch(raw_tiles, raw_masks, config,
         # masks to the model grid, so only stacking remains. EVERY caller
         # -- the consumer loop and the autotune probes alike -- must feed
         # the model this way, or the uint8 graph input rejects the batch.
-        from utils.onnx_preprocess import as_uint8_nhwc
-        return as_uint8_nhwc(raw_tiles), mask_batch
+        from utils.onnx_preprocess import as_uint8_nchw
+        return as_uint8_nchw(raw_tiles), mask_batch
 
     batch = np.stack([_raw_tile_to_batchable(t) for t in raw_tiles], axis=0)
     size = (config.img_height, config.img_width)
@@ -534,12 +569,25 @@ class TileBatchProducer(threading.Thread):
                                        resampling=Resampling.cubic)
                         mask_kw.update(out_shape=(oh, ow),
                                        resampling=Resampling.nearest)
-                    tile = src.read(
-                        indexes, window=window, **read_kw).transpose(1, 2, 0)
+                    # GDAL returns (C, H, W). The graph strategies now take
+                    # NCHW straight through, so the transpose to HWC happens
+                    # only for the strategies that genuinely need it. Keeping
+                    # the native layout is what makes the consumer's stack a
+                    # memcpy instead of a 29x strided gather.
+                    tile = src.read(indexes, window=window, **read_kw)
+                    if not strategy_wraps_graph(strat):
+                        tile = tile.transpose(1, 2, 0)
                     gdal_mask = src.read_masks(
                         1, window=window, **mask_kw) > 0
 
-                    pixel_mask = np.any(tile != 0, axis=2)
+                    # `!= 0` materialises a full HxWx3 bool temporary (4.4 MB
+                    # per tile) that `any` does not need -- it already treats
+                    # non-zero as true. Identical output, 1.77 ms -> 0.68 ms,
+                    # and this runs under the GIL so the saving is real
+                    # parallel capacity, not just CPU time.
+                    # channel axis: 0 while CHW (graph), 2 once HWC
+                    pixel_mask = np.any(
+                        tile, axis=0 if strategy_wraps_graph(strat) else 2)
 
                     # If GDAL mask is effectively all valid, it is not helping.
                     # Fall back to pixel-based validity for
@@ -554,11 +602,8 @@ class TileBatchProducer(threading.Thread):
                         # is only needed at model resolution for the
                         # binarize step, and nearest on one channel is
                         # cheap enough to keep here (and parallel).
-                        mk = valid_mask.astype(np.float32)[:, :, None]
-                        valid_mask = _resize_batch(
-                            mk[None, ...], (int(self.out_size[0]),
-                                            int(self.out_size[1])),
-                            order=0)[0, :, :, 0] > 0.5
+                        valid_mask = _resize_mask_nearest(
+                            valid_mask, self.out_size)
                     elif strat == "native_producer" and self.out_size:
                         # Same skimage resize the consumer would do, but
                         # run HERE so it parallelises across producers
@@ -619,6 +664,104 @@ def _is_oom_error(exc) -> bool:
     msg = str(exc).lower()
     return ('oom' in msg or 'out of memory' in msg
             or 'failed to allocate memory' in msg)
+
+
+class _CoreWriter(threading.Thread):
+    """Crops, binarises and writes finished predictions off the GPU thread.
+
+    The consumer loop used to do this inline, so the GPU idled through it.
+    Measured at b1 on R13: 13.5 ms of wall per tile against `infer` of
+    10.0 ms -- the GPU was busy 74% of the time and the other 26% was this
+    work, with the device parked. Moving it here lets it run DURING the
+    next inference.
+
+    That overlap is real only because onnxruntime releases the GIL inside
+    ``session.run``; NumPy here holds it, so the two interleave rather
+    than contend. If a future runtime stopped releasing it this would
+    degrade to the old serial cost rather than break.
+
+    Ordering does not matter: every core goes to its own
+    ``Window(col_off, row_off, ...)`` and tiles do not overlap in the
+    destination, so out-of-order writes give a bit-identical raster. The
+    queue is bounded so a slow disk applies backpressure instead of
+    growing the backlog without limit.
+
+    ONE writer only -- a rasterio dataset is not safe for concurrent
+    writes, and `dst` is owned exclusively by this thread once started.
+    """
+
+    _SENTINEL = object()
+
+    def __init__(self, dst, layout, config, maxsize=2):
+        super().__init__(daemon=True)
+        self.dst = dst
+        self.layout = layout
+        self.crop = config.overlap_pred // 2
+        self.img_width = config.img_width
+        self.threshold = float(getattr(
+            config, 'stem_binary_threshold', 0.5))
+        self.queue = queue.Queue(maxsize=maxsize)
+        self.write_s = 0.0
+        self.written = 0
+        self.error = None
+
+    def _put(self, payload):
+        """Block for space, but NEVER unconditionally.
+
+        A bare ``queue.put`` deadlocks the entire run the moment the
+        writer dies: the queue is bounded, nothing drains it any more, and
+        the GPU thread waits forever on a consumer that is gone. Polling
+        with a timeout lets us notice the corpse and re-raise its
+        exception instead of hanging. Caught by the regression test, which
+        hung for two minutes before this existed.
+        """
+        while True:
+            if self.error is not None:
+                raise self.error
+            if not self.is_alive():
+                raise RuntimeError(
+                    "prediction writer thread died without reporting an "
+                    "error; the stem map would be incomplete")
+            try:
+                self.queue.put(payload, timeout=0.25)
+                return
+            except queue.Full:
+                continue
+
+    def submit(self, pred, mask_resized, items):
+        self._put((pred, mask_resized, items))
+
+    def close(self):
+        """Drain, stop, and re-raise anything the thread swallowed."""
+        if self.is_alive():
+            try:
+                self._put(self._SENTINEL)
+            except Exception:
+                pass                    # dead already; self.error re-raised
+        self.join()
+        if self.error is not None:
+            raise self.error
+
+    def run(self):
+        try:
+            while True:
+                payload = self.queue.get()
+                if payload is self._SENTINEL:
+                    return
+                pred, mask_resized, items = payload
+                lo, hi = self.crop, self.img_width - self.crop
+                for idx, (job, _, _) in enumerate(items):
+                    pred_core = pred[idx, lo:hi, lo:hi, 0]
+                    mask_core = mask_resized[idx, lo:hi, lo:hi, 0] > 0.5
+                    core = _binarize_prediction_core(
+                        pred_core, mask_core, threshold=self.threshold)
+                    self.write_s += _write_prediction_core(
+                        self.dst, core, job, self.layout)
+                    self.written += 1
+        except BaseException as exc:            # surfaced by close()
+            # Never swallow: a dropped write is a hole in the stem map
+            # with nothing in the log to say so.
+            self.error = exc
 
 
 def _predict_tensor_adaptive(tile_tensor, model, batch_size):
@@ -1147,6 +1290,11 @@ def predict_stream_to_raster(
         producer.start()
 
     with rasterio.open(tmp_path, 'w', **out_profile) as dst:
+        # Owned exclusively by this thread from here on: a rasterio
+        # dataset is not safe for concurrent writes, so exactly one
+        # writer, started inside the `with` and drained before it closes.
+        writer = _CoreWriter(dst, layout, config)
+        writer.start()
         while finished_producers < len(producers) or pending_items:
             while (finished_producers < len(producers)
                    and len(pending_items) < chunk_size
@@ -1208,25 +1356,15 @@ def predict_stream_to_raster(
                 _persist_autotune_batch(autotune_key, autotune_cache_file,
                                         used_batch)
 
-            crop = config.overlap_pred // 2
-            write_batch_s = 0.0
-            for idx, (job, _, _) in enumerate(items):
-                pred_core = pred[idx, crop:(
-                    config.img_width - crop), crop:(
-                        config.img_width - crop), 0]
-                mask_core = mask_resized[idx, crop:(
-                    config.img_width - crop), crop:(
-                        config.img_width - crop), 0] > 0.5
-                pred_core = _binarize_prediction_core(
-                    pred_core,
-                    mask_core,
-                    threshold=float(getattr(
-                        config, 'stem_binary_threshold', 0.5)),
-                )
-                write_batch_s += _write_prediction_core(
-                    dst, pred_core, job, layout)
-                done += 1
-            total_write_s += write_batch_s
+            # Hand the batch to the writer and go straight back to the
+            # GPU. `done` counts SUBMITTED tiles so the ETA still tracks
+            # progress; the writer is bounded to 2 batches, so it can
+            # never fall more than that behind.
+            writer.submit(pred, mask_resized, items)
+            if writer.error is not None:        # fail fast, not at the end
+                raise writer.error
+            done += len(items)
+            total_write_s = writer.write_s
 
             now = time.monotonic()
             if (
@@ -1258,6 +1396,14 @@ def predict_stream_to_raster(
                     flush=True,
                 )
                 last_report = now
+
+        # Drain INSIDE the `with`, while dst is still open: the writer
+        # holds up to two batches, and flushing them into a closed
+        # dataset would lose the last tiles of every run. close() also
+        # re-raises whatever the thread caught, so a failed write ends
+        # the run instead of silently leaving holes in the stem map.
+        writer.close()
+        total_write_s = writer.write_s
 
     for producer in producers:
         producer.join()
