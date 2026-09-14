@@ -125,6 +125,38 @@ def test_find_segments_is_translation_invariant(seed):
     assert sorted(move(p) for p in a) == sorted(b)
 
 
+def test_find_segments_with_padding_below_the_margin():
+    """A small max_tree_height gives a frame padding below the 8 px crop
+    margin; with foreground on the tile edge the crop must still map
+    inside the padded frame (it used to slice out of it)."""
+    profile = {'transform': (0.05, 0, 0, 0, -0.05, 0)}
+
+    class Cfg(_Cfg):
+        max_tree_height = 0.2          # padding = int(0.2 / 0.05) + 1 = 5
+
+    mask = np.zeros((300, 300), dtype=bool)
+    mask[0:3, 0:120] = True            # touches row 0 and column 0
+    mask[297:300, 180:300] = True      # touches the far edges
+    parts = Skel.find_segments(mask, Cfg(), profile)
+    assert len(parts) >= 2
+    for p in parts:
+        assert all(0 <= r < 310 and 0 <= c < 310 for r, c in p.path)
+
+
+def test_dense_occupancy_path_matches_per_component_path(monkeypatch):
+    """Above _DENSE_OCCUPANCY the skeleton is thinned on the dense array;
+    both routes must give the same pixels."""
+    mask = _stem_mask(7, size=200, stems=60)
+    ys, xs = np.nonzero(mask)
+    sparse = Skel._skeletonize_coords(ys, xs, mask.shape)
+    monkeypatch.setattr(Skel, '_DENSE_OCCUPANCY', 0.0)
+    dense = Skel._skeletonize_coords(ys, xs, mask.shape)
+    assert np.array_equal(sparse[0], dense[0])
+    assert np.array_equal(sparse[1], dense[1])
+    assert np.array_equal(sparse[2], dense[2])
+    assert np.array_equal(sparse[0], morphology.skeletonize(mask))
+
+
 def test_find_segments_empty_mask_returns_no_parts():
     profile = {'transform': (0.05, 0, 0, 0, -0.05, 0)}
     assert Skel.find_segments(

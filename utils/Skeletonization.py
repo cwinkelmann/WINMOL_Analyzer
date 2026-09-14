@@ -5,11 +5,10 @@
 
 import math
 import multiprocessing as mp
-from typing import Any, List, Tuple
+from typing import List, Tuple
 
 import numpy as np
-import scipy.ndimage.measurements
-from numpy import ndarray
+import scipy.ndimage
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from skimage import morphology
@@ -21,15 +20,6 @@ from utils.Geometry import ang
 
 # System epsilon
 epsilon = np.finfo(float).eps
-
-
-def _as_binary_mask(pred):
-    arr = np.asarray(pred)
-    if arr.dtype == np.bool_:
-        return arr
-    if arr.dtype == np.uint8 and arr.size and arr.max() <= 1:
-        return arr.astype(bool, copy=False)
-    return arr >= 0.5
 
 
 def _worker_count(config=None):
@@ -78,6 +68,8 @@ def find_segments(pred, config, profile) -> (List[Part], List[Tuple[int]]):
     ys, xs = _foreground_coords(pred)
     if ys.size == 0:
         t.stop()
+        print("#######################################################")
+        print("")
         return []
     (ys, xs), crop_shape, offset = _crop_coords(ys, xs, padding)
 
@@ -105,28 +97,22 @@ def find_segments(pred, config, profile) -> (List[Part], List[Tuple[int]]):
     return segments
 
 
-# get nodes
-#: Rows/cols kept around the foreground bounding box. Every operation in
-#: get_nodes is local -- a 2x2 erosion and 3x3 neighbour counts -- so a
-#: handful of rows is ample; 8 is far more than any of them reach.
+#: Empty rows/cols kept around the foreground in the working crop. Every
+#: operation in the skeleton stage is local -- a 2x2 erosion and 3x3
+#: neighbour tests -- so one pixel would do; 8 is far more than any of
+#: them reach. Never more than the padded frame's own `padding`, which
+#: is what the crop maps back into.
 _NODE_MARGIN = 8
 
-
-def _foreground_bbox(skel: np.ndarray, margin: int = _NODE_MARGIN):
-    """Slices around the live pixels, or None when the skeleton is empty."""
-    ys, xs = np.nonzero(skel)
-    if ys.size == 0:
-        return None
-    y0 = max(0, int(ys.min()) - margin)
-    y1 = min(skel.shape[0], int(ys.max()) + margin + 1)
-    x0 = max(0, int(xs.min()) - margin)
-    x1 = min(skel.shape[1], int(xs.max()) + margin + 1)
-    return y0, y1, x0, x1
+#: Foreground fraction of the crop above which the skeleton is thinned
+#: on the dense array rather than per component from the pixel list
+#: (see _skeletonize_coords). Real stem maps sit well under 1%.
+_DENSE_OCCUPANCY = 0.05
 
 
 def _foreground_coords(pred):
-    """Row-major coordinates of the foreground, read the way
-    _as_binary_mask reads the array (any nonzero value for bool and
+    """Row-major coordinates of the foreground, under the binarisation
+    the pipeline has always used (any nonzero value for bool and
     unsigned data, >= 0.5 otherwise) -- without materialising the mask."""
     arr = np.asarray(pred)
     if arr.dtype == np.bool_ or arr.dtype.kind == 'u':
@@ -145,7 +131,10 @@ def _crop_coords(ys, xs, padding: int, margin: int = _NODE_MARGIN):
     one pixel from the foreground can influence a result; the margin is
     there whether or not the foreground touches the tile edge, so no
     stage ever sees an array boundary where the padded frame had zeros.
+    The margin is capped at `padding` so the crop always lies inside the
+    padded frame (a small max_tree_height gives a padding below 8).
     """
+    margin = min(margin, padding)
     y0 = int(ys.min()) - margin
     x0 = int(xs.min()) - margin
     shape = (int(ys.max()) - y0 + 1 + margin, int(xs.max()) - x0 + 1 + margin)
@@ -158,8 +147,10 @@ def _components(ys, xs, shape):
     S and SE neighbours by binary search in the sorted linear index (the
     other four directions are the same edges seen from the other end),
     and the union is a sparse graph whose connected components are the
-    image's. scipy.ndimage.label gave the same labels by scanning the
-    whole array; this touches only the pixels.
+    image's. scipy.ndimage.label(mask, structure=np.ones((3, 3))) gives
+    the same components by scanning the whole array (its default
+    structure is 4-connected, which thinning equivalence does not
+    allow); this touches only the pixels.
     """
     n = ys.size
     height, width = shape
@@ -200,6 +191,15 @@ def _skeletonize_coords(ys, xs, shape):
     skel = np.zeros(shape, dtype=bool)
     if ys.size == 0:
         return skel, ys, xs
+    if ys.size > _DENSE_OCCUPANCY * shape[0] * shape[1]:
+        # A mostly-foreground crop (a degenerate stem map, or a tile
+        # inside one huge blob): the coordinate graph would cost ~100 B
+        # per pixel against 1 B for the dense array, and the dense pass
+        # is the cheap one here anyway. Same thinning, same pixels.
+        skel[ys, xs] = True
+        skel = morphology.skeletonize(skel)
+        sy, sx = np.nonzero(skel)
+        return skel, sy, sx
     count, labels = _components(ys, xs, shape)
     order = np.argsort(labels, kind='stable')
     splits = np.flatnonzero(np.diff(labels[order])) + 1
@@ -255,39 +255,12 @@ def _gather_neighbours(skel: np.ndarray, ys=None, xs=None):
     return ys, xs, p
 
 
-def get_nodes(skel: np.ndarray) -> Tuple[List[Tuple[int, int]], Any]:
-    """Detect end nodes and split the skeleton, working only where there
-    is skeleton to work on.
-
-    find_segments pads by max_tree_height (1093 px at R13's 2.9 cm), so a
-    4096 tile arrives as 6282x6282 -- 2.35x the pixels -- and typically
-    holds ~5k live pixels in 39M, i.e. 0.01% occupancy. Every stage below
-    is a dense array pass, so all of them paid for the padding and the
-    emptiness. Cropping to the foreground bounding box first measured
-    3.3x here (4158 -> 1253 ms) with the output arrays and end-node sets
-    BIT-IDENTICAL, because every operation involved is local and the
-    margin exceeds their reach.
-    """
-    box = _foreground_bbox(skel)
-    if box is None:
-        return [], skel
-    y0, y1, x0, x1 = box
-    if (y1 - y0, x1 - x0) != skel.shape:
-        sub_nodes, sub_skel = get_nodes(skel[y0:y1, x0:x1].copy())
-        out = np.zeros_like(skel)
-        out[y0:y1, x0:x1] = sub_skel
-        return [(int(a) + y0, int(b) + x0) for (a, b) in sub_nodes], out
-
-    ys, xs = np.nonzero(np.asarray(skel, dtype=bool))
-    end_nodes, skel, _, _ = _get_nodes_coords(skel, ys, xs)
-    return end_nodes, skel
-
-
 def _get_nodes_coords(skel: np.ndarray, ys, xs):
-    """get_nodes on a skeleton whose row-major pixel coordinates are
-    already known. Returns the end nodes, the split skeleton, and its
-    coordinates -- kept in step with every edit, so no stage scans the
-    array: after a pixel removal the list is filtered by a gather."""
+    """Detect end nodes and split the skeleton at dense spots and branch
+    points, given the skeleton's row-major pixel coordinates. Returns
+    the end nodes, the split skeleton, and its coordinates -- kept in
+    step with every edit, so no stage scans the array: after a pixel
+    removal the list is filtered by a gather."""
     t = Timer()
     t.start()
     print("#######################################################")
@@ -316,7 +289,7 @@ def _get_nodes_coords(skel: np.ndarray, ys, xs):
 
 
 # Remove "dense" (2x2 or larger) regions in the skeleton.
-def remove_dense_skeleton_nodes(skel: np.ndarray) -> Tuple[ndarray, int]:
+def remove_dense_skeleton_nodes(skel: np.ndarray) -> Tuple[np.ndarray, int]:
     ys, xs = np.nonzero(np.asarray(skel, dtype=bool))
     skel, count, _, _ = _remove_dense(skel, ys, xs)
     return skel, count
@@ -540,7 +513,9 @@ def find_skeleton_segments(
     node_set = set(node_coords)
 
     def _keep(path):
-        # Parts live in the output frame; the traced pixels mark the crop.
+        # The Part is built from the path shifted into the output frame
+        # (and may come back reversed -- same pixels); the crop-frame
+        # `path` marks out_view, which is the same array as out_skel.
         part = _build_part_from_path(
             [(r + oy, c + ox) for r, c in path], min_length)
         if part is not None:

@@ -217,16 +217,13 @@ class ImageProcessing:
             model,
             self.config,
         )
-        # Hand the memory back BEFORE the vector phase forks its pool.
-        #
-        # multiprocessing.Pool forks, so every page still resident in this
-        # process is inherited copy-on-write by each of N workers. After a
-        # full-ortho prediction this process is holding an onnxruntime
+        # Hand the memory back BEFORE the vector phase starts its pool.
+        # After a full-ortho prediction this process holds an onnxruntime
         # arena, a CUDA context and a GDAL block cache the entrypoint
-        # sized at 20% of the container -- and none of that is needed
-        # again. Measured on R13 (99,231 tiles): the vector phase ALONE
-        # peaks at 4.95 GiB and prediction alone completes, but the two in
-        # sequence were killed at the fork every time.
+        # sized at 20% of the container -- none of it needed again, and
+        # all of it counted against the same container limit as the
+        # eleven workers about to start. (The pool is spawned, so nothing
+        # is inherited; this is about the parent's own footprint.)
         _release_prediction_memory(model)
         return (None, profile, self.stem_path)
 
@@ -245,7 +242,7 @@ class ImageProcessing:
         stems = Quant.quantify_stems(stems, pred, profile, config=self.config)
         return stems
 
-    def run_vector_phase(self, plan, pred_path=None, pred=None, profile=None):
+    def run_vector_phase(self, plan, pred_path=None):
         if self.process_type == 'Stems':
             return None
 
@@ -279,22 +276,33 @@ class ImageProcessing:
                 for job in jobs
             ]
             sources = [(source_path, job.halo_window) for job in jobs]
+            # The plugin's progress parser (plugin_utils/run_progress.py)
+            # keys on "Prepared n/m vector tiles" and uses n as the merge
+            # denominator. Before the pool, n can only be the window count;
+            # the line after the pool corrects it to the tiles that
+            # produced output, which is what the merge reads back.
             print(
-                f"Prepared {len(jobs)} vector tile windows | foreground "
-                f"filtered per tile in the workers"
+                f"Prepared {len(tile_paths)}/{len(jobs)} vector tiles "
+                f"(windows; empty ones are skipped by the workers)"
             )
             if not tile_paths:
-                print("No foreground tiles found for vector stage.")
+                print("Empty tile grid; nothing to vectorise.")
                 return None
             from utils.VectorTilePipeline import process_prediction_tiles
 
-            process_prediction_tiles(
+            results = process_prediction_tiles(
                 tile_paths,
                 self.config,
                 self.process_type,
                 work_dir,
                 plan.cpu_workers,
                 sources=sources,
+            )
+            written = sum(
+                1 for r in results if r and r.get('gpkg_path'))
+            print(
+                f"Prepared {written}/{len(jobs)} vector tiles with output "
+                f"for the merge"
             )
             merged = self.run_merge_phase(plan, work_dir)
             if plan.keep_temp:
@@ -325,9 +333,8 @@ class ImageProcessing:
         self.run_prediction_phase(plan)
 
     def run_tree_pipeline(self, plan):
-        pred, profile, pred_path = self.run_prediction_phase(plan)
-        return self.run_vector_phase(
-            plan, pred_path=pred_path, pred=pred, profile=profile)
+        _, _, pred_path = self.run_prediction_phase(plan)
+        return self.run_vector_phase(plan, pred_path=pred_path)
 
     def check_DL_env(self):
         def get_nvidia_driver_version():

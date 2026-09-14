@@ -195,15 +195,11 @@ def _vector_available_bytes(hardware: Any) -> float:
 def _vector_memory_cap(config: Any, hardware: Any) -> int:
     """How many vector tile workers free RAM can actually hold.
 
-    Sized on PRIVATE resident memory, not RSS. Measured with
-    smaps_rollup on a live Tegel vector phase, per worker:
-
-        RSS 2734 MB | Shared_Dirty 1257 MB | Private_Dirty 1381 MB
-
-    The Shared_Dirty part is copy-on-write state inherited from the
-    parent at fork; it is shared with the parent and every sibling, so
-    it costs physical RAM ONCE, not once per worker. Sizing off RSS
-    triple-counts it and badly under-provisions the pool.
+    Sized on the MARGINAL cost of one more worker: the pool is spawned,
+    not forked, so nothing is shared with the parent, and what a worker
+    adds to the peak is what it holds itself -- measured at ~25 MB per
+    worker once the skeleton stage stopped scanning the padded tile
+    (VECTOR_WORKER_PRIVATE_BYTES above keeps a 10x margin over that).
     """
     per_worker = float(_cfg(
         config, 'vector_worker_bytes', VECTOR_WORKER_PRIVATE_BYTES,

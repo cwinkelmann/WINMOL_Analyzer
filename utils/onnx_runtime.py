@@ -98,8 +98,8 @@ def _preload_tensorrt_libs():
             os.add_dll_directory(d)
         except (AttributeError, OSError):
             pass
-        for pattern in ("nvinfer_*.dll", "nvinfer_plugin_*.dll",
-                        "nvonnxparser_*.dll"):
+        for pattern in ("nvinfer_[0-9]*.dll", "nvinfer_plugin_[0-9]*.dll",
+                        "nvonnxparser_[0-9]*.dll"):
             for dll in sorted(glob.glob(os.path.join(d, pattern))):
                 try:
                     ctypes.WinDLL(dll)
