@@ -354,3 +354,16 @@ def deletion_plan(plugin_dir, configured_exe=None, remove_venv=True,
         return {"kind": "none", "paths": [], "clears_setting": False}
     return {"kind": "managed", "paths": paths,
             "clears_setting": bool(exe and remove_venv)}
+
+
+def repair_variant(installed):
+    """The ``gpu`` flag "Reinstall dependencies" should build with.
+
+    ``True``/``False`` mirror the sentinel, so a repair reinstalls what
+    the user chose. ``None`` means the sentinel could not be read — the
+    caller must ASK rather than assume, because invalidate_marker()
+    deletes it first: an interrupted repair leaves a GPU venv with no
+    marker, and reading that as "cpu" silently downgrades it."""
+    if installed is None:
+        return None
+    return installed == "gpu"

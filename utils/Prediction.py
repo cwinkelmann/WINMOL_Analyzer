@@ -364,7 +364,7 @@ def _free_gpu_memory_gb():
     driver stuck in an uninterruptible ioctl used to hang this call
     forever (rr NVIDIA_SMI_TIMEOUT); on timeout the caller falls back
     to the host-RAM bound."""
-    lines = run_nvidia_smi_query("memory.free", timeout=8.0, nounits=True)
+    lines = run_nvidia_smi_query("memory.free", nounits=True)
     values = []
     for line in lines or []:
         try:

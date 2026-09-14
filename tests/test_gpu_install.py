@@ -3,10 +3,15 @@ verdicts, and the conflict-safe runtime swap. onnxruntime and
 onnxruntime-gpu ship the SAME module; pip never uninstalls the other,
 so the installer must — these tests pin that behavior.
 """
+import ast
 import importlib
 import json
+import subprocess
 import sys
+import threading
 from pathlib import Path
+
+import pytest
 
 REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
@@ -117,6 +122,239 @@ def test_probe_old_driver_is_refused():
     result = _probe(lambda timeout: (None, "NVIDIA T400, 470.10\n"))
     assert result.status == gpu_probe.STATUS_OLD_DRIVER
     assert not result.present
+
+
+# --- start_probe: the same verdict, off the GUI thread -----------------------
+# The dialog calls this at construction so nvidia-smi is already answered
+# by the time the Setup tab or the pre-run modal asks. A slow driver must
+# cost the QGIS GUI thread nothing.
+
+
+def test_start_probe_returns_before_a_slow_nvidia_smi_finishes():
+    started, release = threading.Event(), threading.Event()
+
+    def slow(timeout):
+        started.set()
+        release.wait(5)
+        return None, "NVIDIA GeForce RTX 4080 SUPER, 580.65.06\n"
+
+    handle = gpu_probe.start_probe(system="Linux", machine="x86_64",
+                                   runner=slow)
+    assert started.wait(5), "probe never started"
+    assert not handle.done()          # still running: we did not block
+    release.set()
+    assert handle.result().present
+
+
+def test_start_probe_result_matches_the_synchronous_probe():
+    out = "NVIDIA GeForce RTX 4080 SUPER, 580.65.06\n"
+    runner = lambda timeout: (None, out)          # noqa: E731
+    handle = gpu_probe.start_probe(system="Linux", machine="x86_64",
+                                   runner=runner)
+    assert handle.result() == _probe(runner)
+
+
+def test_start_probe_result_is_bounded_and_reports_a_timeout():
+    handle = gpu_probe.start_probe(system="Linux", machine="x86_64",
+                                   runner=lambda timeout: (
+                                       threading.Event().wait(30), None)[1])
+    result = handle.result(timeout=0.1)
+    assert result.status == gpu_probe.STATUS_TIMEOUT
+    assert not result.present
+
+
+def test_start_probe_result_is_cached_not_re_run():
+    calls = []
+
+    def counting(timeout):
+        calls.append(timeout)
+        return None, "NVIDIA GeForce RTX 4080 SUPER, 580.65.06\n"
+
+    handle = gpu_probe.start_probe(system="Linux", machine="x86_64",
+                                   runner=counting)
+    assert handle.result().present
+    assert handle.result().present
+    assert len(calls) == 1
+
+
+# --- a timed-out probe is UNKNOWN, not "no GPU" (issue #55) -------------------
+
+def test_timeout_is_inconclusive_not_absent():
+    """#55: a 6 s nvidia-smi timed the probe out, present went False,
+    and the setup installed the CPU runtime on a GPU machine."""
+    result = _probe(lambda timeout: (gpu_probe.STATUS_TIMEOUT, ""))
+    assert not result.present
+    assert result.inconclusive
+
+
+def test_a_real_absence_is_conclusive():
+    for status in (gpu_probe.STATUS_NO_DRIVER, gpu_probe.STATUS_NONE):
+        result = _probe(lambda timeout: (status, ""))
+        assert not result.present
+        assert not result.inconclusive
+
+
+def test_unsupported_platform_is_conclusive():
+    result = gpu_probe.probe(system="Darwin", machine="arm64")
+    assert not result.present
+    assert not result.inconclusive
+
+
+def test_create_asks_instead_of_assuming_cpu_when_the_probe_is_unsure():
+    text = (REPO / "winmol_analyzer_dialog.py").read_text()
+    assert "inconclusive" in text
+
+
+# --- Windows: nvidia-smi must not flash a console window ---------------------
+# The probe now runs at QGIS startup, so an unhidden console would pop up
+# on every launch. tasks_threads.py has hidden its child since rr6; this
+# is the same treatment for the one plugin_utils spawn the GUI triggers.
+
+def test_hidden_window_kwargs_are_empty_off_windows():
+    assert gpu_probe.hidden_window_kwargs(system="Linux") == {}
+    assert gpu_probe.hidden_window_kwargs(system="Darwin") == {}
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only API")
+def test_hidden_window_kwargs_hide_the_console_on_windows():
+    kwargs = gpu_probe.hidden_window_kwargs(system="Windows")
+    info = kwargs["startupinfo"]
+    assert info.dwFlags & subprocess.STARTF_USESHOWWINDOW
+    assert info.wShowWindow == subprocess.SW_HIDE
+
+
+def test_nvidia_smi_spawn_forwards_the_hidden_window_kwargs(monkeypatch):
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen.update(kwargs)
+        raise FileNotFoundError("nvidia-smi")
+
+    monkeypatch.setattr(gpu_probe, "hidden_window_kwargs",
+                        lambda system=None: {"startupinfo": "SENTINEL"})
+    monkeypatch.setattr(gpu_probe.subprocess, "run", fake_run)
+    gpu_probe._run_nvidia_smi(1.0)
+    assert seen.get("startupinfo") == "SENTINEL"
+
+
+# --- prefetch: started at plugin load, not dialog construction ----------------
+# Every reader of the verdict is reached from the dialog's __init__ (via
+# populate_model_combo_box -> _model_device), so starting the probe there
+# buys nothing. It has to start when the plugin loads.
+
+def _fresh_prefetch(monkeypatch):
+    monkeypatch.setattr(gpu_probe, "_PREFETCHED", None, raising=False)
+
+
+def test_prefetch_runs_the_probe_once_per_process(monkeypatch):
+    _fresh_prefetch(monkeypatch)
+    calls = []
+
+    def counting(timeout):
+        calls.append(timeout)
+        return None, "NVIDIA GeForce RTX 4080 SUPER, 580.65.06\n"
+
+    first = gpu_probe.prefetch(system="Linux", machine="x86_64",
+                               runner=counting)
+    second = gpu_probe.prefetch(system="Linux", machine="x86_64",
+                                runner=counting)
+    assert first is second
+    assert first.result().present
+    assert len(calls) == 1
+
+
+def test_prefetch_does_not_block_its_caller(monkeypatch):
+    _fresh_prefetch(monkeypatch)
+    started, release = threading.Event(), threading.Event()
+
+    def slow(timeout):
+        started.set()
+        release.wait(5)
+        return None, "NVIDIA GeForce RTX 4080 SUPER, 580.65.06\n"
+
+    handle = gpu_probe.prefetch(system="Linux", machine="x86_64",
+                                runner=slow)
+    assert started.wait(5)
+    assert not handle.done()
+    release.set()
+    assert handle.result().present
+
+
+def _self_calls(path, func_name):
+    """Attribute calls made inside ``func_name`` of ``path``."""
+    tree = ast.parse(Path(path).read_text())
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == func_name)
+    return {ast.unparse(n.func) for n in ast.walk(fn)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+
+
+def test_plugin_initgui_starts_the_probe():
+    """The head start is the whole fix: initGui runs at QGIS startup,
+    the dialog is built when the user clicks, seconds to minutes later."""
+    assert "gpu_probe.prefetch" in _self_calls(
+        REPO / "winmol_analyzer.py", "initGui")
+
+
+def test_dialog_never_calls_the_blocking_probe_directly():
+    text = (REPO / "winmol_analyzer_dialog.py").read_text()
+    assert "gpu_probe.probe(" not in text
+    assert "gpu_probe.prefetch()" in text
+
+
+#: Where production code lives. An explicit list, not a REPO-wide glob:
+#: the glob walked .claude/worktrees (whole extra checkouts) and would
+#: fail the build over vendored code the repo does not own.
+_SOURCE_ROOTS = ("plugin_utils", "utils", "classes", "qgisutil", "standalone")
+
+
+def _production_sources():
+    """Every production ``.py``: the source packages plus top-level
+    modules. Tests and tooling are excluded -- a literal is fine there."""
+    paths = sorted(REPO.glob("*.py"))
+    for root in _SOURCE_ROOTS:
+        paths.extend(sorted((REPO / root).rglob("*.py")))
+    return paths
+
+
+def _smi_timeout_args(path):
+    """``(lineno, unparsed timeout arg)`` for every
+    ``run_nvidia_smi_query`` call in ``path`` that passes one."""
+    tree = ast.parse(Path(path).read_text(encoding="utf-8"))
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else \
+            getattr(func, "id", None)
+        if name != "run_nvidia_smi_query":
+            continue
+        for kw in node.keywords:
+            if kw.arg == "timeout":
+                found.append((node.lineno, ast.unparse(kw.value)))
+    return found
+
+
+def test_no_caller_hard_codes_an_nvidia_smi_timeout():
+    """ONE budget per kind of caller, named in gpu_probe -- never a
+    literal at the call site.
+
+    Stefan's first-run bug WAS this defect: the dialog probed with a
+    hard-coded 2 s while model_registry probed the same card with 20 s,
+    so a driver that answers in 6-8 s made the two disagree -- a CPU
+    environment installed while the run log printed the GPU. The 2 s
+    literal is gone; these are the ones still able to reintroduce it.
+    """
+    offenders = []
+    for path in _production_sources():
+        for lineno, arg in _smi_timeout_args(path):
+            if arg.replace(".", "", 1).isdigit():
+                offenders.append(
+                    f"{path.relative_to(REPO)}:{lineno} timeout={arg}")
+    assert offenders == [], (
+        "hard-coded nvidia-smi timeouts must reference a gpu_probe "
+        "constant:\n  " + "\n  ".join(offenders))
 
 
 # --- variant-aware sentinel --------------------------------------------------

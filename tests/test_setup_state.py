@@ -92,3 +92,24 @@ def test_gpu_failure_ignores_ordinary_errors():
     assert not setup_state.looks_like_gpu_failure(
         "IndexError: list index out of range")
     assert not setup_state.looks_like_gpu_failure("")
+
+
+# --- "Reinstall dependencies": never guess CPU when the marker is gone -------
+# invalidate_marker() DELETES the sentinel as the first step of every
+# repair, so an interrupted repair leaves a GPU venv with no marker. The
+# old `installed_variant(venv) == "gpu"` read that None as False and
+# rebuilt the environment as CPU without asking.
+
+def test_repair_variant_preserves_the_installed_runtime():
+    assert setup_state.repair_variant("gpu") is True
+    assert setup_state.repair_variant("cpu") is False
+
+
+def test_repair_variant_refuses_to_guess_without_a_sentinel():
+    assert setup_state.repair_variant(None) is None
+
+
+def test_repair_env_no_longer_reads_a_missing_sentinel_as_cpu():
+    text = (REPO / "winmol_analyzer_dialog.py").read_text()
+    assert 'installed_variant(venv) == "gpu"' not in text
+    assert "setup_state.repair_variant(" in text
