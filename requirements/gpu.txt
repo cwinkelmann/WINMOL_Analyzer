@@ -62,6 +62,7 @@
 #
 # 'CUDAExecutionProvider' must appear in that list.
 onnxruntime-gpu[cuda,cudnn]>=1.26,<1.27
+nvidia-cudnn-cu12==9.10.2.21
 
 # Without psutil, HardwareInfo._detect_total_ram_gb() returns 0.0 and
 # the run logs "RAM=0.0 GB" — a wrong number in the log is a wrong
