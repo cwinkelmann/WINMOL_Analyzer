@@ -90,6 +90,23 @@ def _preload_tensorrt_libs():
     import glob
     loaded = False
     d = os.path.dirname(tensorrt_libs.__file__)
+    if platform.system() == "Windows":
+        # The wheel ships nvinfer_10.dll & co.; the DLL search path is
+        # PATH plus add_dll_directory(), neither of which knows about
+        # site-packages. Register the directory, then load in link order.
+        try:
+            os.add_dll_directory(d)
+        except (AttributeError, OSError):
+            pass
+        for pattern in ("nvinfer_*.dll", "nvinfer_plugin_*.dll",
+                        "nvonnxparser_*.dll"):
+            for dll in sorted(glob.glob(os.path.join(d, pattern))):
+                try:
+                    ctypes.WinDLL(dll)
+                    loaded = True
+                except OSError:
+                    pass
+        return loaded
     # libnvinfer first: the parsers and plugins link against it.
     for pattern in ("libnvinfer.so*", "libnvinfer_plugin.so*",
                     "libnvonnxparser.so*"):

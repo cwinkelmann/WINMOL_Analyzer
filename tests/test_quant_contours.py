@@ -67,3 +67,20 @@ def test_cropped_contours_equal_gdal_full_tile(seed):
 def test_empty_mask_gives_no_contours():
     arr = np.zeros((40, 40), dtype=np.uint8)
     assert _foreground_contours(arr, arr, Affine.identity()) == []
+
+
+def test_self_check_passes_on_this_gdal_and_fallback_is_equivalent(
+        monkeypatch):
+    """The crop is only taken when the process-level self-check says this
+    GDAL places vertices with the replicated formula; on a build where it
+    does not, GDAL polygonises the whole tile. Both paths must agree."""
+    import utils.Quantification as Q
+    Q._VERTEX_FORMULA_HOLDS = None
+    assert Q._gdal_vertex_formula_holds() is True
+    arr = _tile(4)
+    transform = _transform(4)
+    cropped = _foreground_contours(arr, arr, transform)
+    monkeypatch.setattr(Q, '_VERTEX_FORMULA_HOLDS', False)
+    whole = _foreground_contours(arr, arr, transform)
+    Q._VERTEX_FORMULA_HOLDS = None
+    assert [g.wkb for g in cropped] == [g.wkb for g in whole]

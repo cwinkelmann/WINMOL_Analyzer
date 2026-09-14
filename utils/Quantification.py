@@ -14,7 +14,7 @@ import rasterio.transform
 import scipy.ndimage as ndi
 import shapely
 from shapely import STRtree
-from shapely.geometry import LineString, Point, Polygon
+from shapely.geometry import LineString, Point, Polygon, shape
 
 from classes.Stem import Stem
 from classes.Timer import Timer
@@ -98,6 +98,50 @@ def quantify_stems(stems: List[Stem], pred, profile, config=None):
     return stems__
 
 
+_VERTEX_FORMULA_HOLDS = None
+
+
+def _gdal_vertex_formula_holds() -> bool:
+    """Does this GDAL build place polygon vertices exactly at
+    c + col*a + row*b, f + col*d + row*e, evaluated in that order?
+
+    True for the GDAL in the Docker image and the plugin venv's wheel
+    (checked on 790k vertices), but a build that contracts the multiply-
+    adds into FMAs -- clang on arm64 does so by default -- would round
+    differently in the last bit. Rather than assume, it is measured once
+    per process on a small raster with an awkward affine transform;
+    _foreground_contours only crops when the answer is yes.
+    """
+    global _VERTEX_FORMULA_HOLDS
+    if _VERTEX_FORMULA_HOLDS is not None:
+        return _VERTEX_FORMULA_HOLDS
+    try:
+        rng = np.random.default_rng(20260913)
+        arr = (rng.random((64, 80)) < 0.08).astype(np.uint8)
+        arr[5:12, 7:40] = 1
+        arr[8:10, 20:30] = 0
+        transform = rasterio.transform.Affine(
+            0.0293, 0.0017, 412345.6789, -0.0011, -0.0307, 5876543.21)
+        a, b, c, d, e, f = (transform.a, transform.b, transform.c,
+                            transform.d, transform.e, transform.f)
+        holds = True
+        for geom, value in rasterio.features.shapes(
+                arr, mask=arr, transform=transform):
+            if value != 1:
+                continue
+            inv = ~transform
+            for ring in geom['coordinates']:
+                for x, y in ring:
+                    col, row = (round(v) for v in inv * (x, y))
+                    if x != c + col * a + row * b or \
+                            y != f + col * d + row * e:
+                        holds = False
+        _VERTEX_FORMULA_HOLDS = holds
+    except Exception:
+        _VERTEX_FORMULA_HOLDS = False
+    return _VERTEX_FORMULA_HOLDS
+
+
 def _foreground_contours(pred_bin, mask, transform):
     """The value-1 polygons rasterio.features.shapes(pred_bin, mask=mask,
     transform=transform) would yield, polygonised on the foreground's
@@ -112,6 +156,14 @@ def _foreground_contours(pred_bin, mask, transform):
     from the pixel-frame polygons GDAL returns for an identity transform,
     with the crop origin added back to the integer pixel indices.
     """
+    if not _gdal_vertex_formula_holds():
+        # Unknown GDAL arithmetic: let GDAL place every vertex itself.
+        return [
+            shape(geom)
+            for geom, value in rasterio.features.shapes(
+                pred_bin, mask=mask, transform=transform)
+            if value == 1
+        ]
     ys, xs = np.nonzero(mask)
     if ys.size == 0:
         return []
