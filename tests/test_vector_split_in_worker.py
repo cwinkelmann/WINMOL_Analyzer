@@ -55,8 +55,9 @@ def test_worker_split_writes_only_foreground_tiles(stem_map, tmp_path):
     sources = [(stem_map, j.halo_window) for j in jobs]
     results = VTP.process_prediction_tiles(
         paths, _config(), 'Nodes', work, 1, sources=sources)
-    written = sorted(os.path.basename(p)
-                     for p in glob.glob(os.path.join(work, '*_roi_stem_map.tif')))
+    written = sorted(
+        os.path.basename(p)
+        for p in glob.glob(os.path.join(work, '*_roi_stem_map.tif')))
     # exactly the windows with foreground got a raster
     expected = []
     with rasterio.open(stem_map) as src:

@@ -277,6 +277,36 @@ def connect_stems(stems: List[Stem], config) -> List[Stem]:
     return connected_stems
 
 
+def _vote_coords(stems0, line_start, line_stop, stem, base_coords,
+                 coords_cache):
+    """The coordinate lists calc_connectivity_votes works on.
+
+    Every `.coords` access builds a fresh CoordinateSequence (a shapely
+    call, a has_z check, a get_coordinates copy), and the vote used to
+    read `stem.path.coords` and `stems0.path.coords` about fifteen times
+    per candidate pair -- 220k sequence constructions on one dense tile,
+    most of connect_stems' time. Each path is read once; the tuples are
+    the same floats, and LineString([tuples]) is the same geometry.
+    `base_coords` and `coords_cache` let connect_stems supply what it
+    already has (see calc_connectivity_votes).
+    """
+    if coords_cache is not None:
+        hit = coords_cache.get(id(stem))
+        if hit is None or hit[0] is not stem:
+            hit = (stem, list(stem.path.coords))
+            coords_cache[id(stem)] = hit
+        sc = hit[1]
+    else:
+        sc = list(stem.path.coords)
+    if base_coords is not None:
+        s0c, line_start_c, line_stop_c = base_coords
+    else:
+        s0c = list(stems0.path.coords)
+        line_start_c = list(line_start.coords)
+        line_stop_c = list(line_stop.coords)
+    return sc, s0c, line_start_c, line_stop_c
+
+
 def calc_connectivity_votes(
         stems0: Stem,
         line_start: LineString,
@@ -309,26 +339,8 @@ def calc_connectivity_votes(
     candidates = []
     slaves = []
 
-    # Every `.coords` access builds a fresh CoordinateSequence (a shapely
-    # call, a has_z check, a get_coordinates copy). This function read
-    # `stem.path.coords` and `stems0.path.coords` about fifteen times per
-    # candidate pair -- 220k sequence constructions on one dense tile,
-    # most of connect_stems' time. Read each path once; the tuples are the
-    # same floats, and LineString([tuples]) is the same geometry.
-    if coords_cache is not None:
-        hit = coords_cache.get(id(stem))
-        if hit is None or hit[0] is not stem:
-            hit = (stem, list(stem.path.coords))
-            coords_cache[id(stem)] = hit
-        sc = hit[1]
-    else:
-        sc = list(stem.path.coords)
-    if base_coords is not None:
-        s0c, line_start_c, line_stop_c = base_coords
-    else:
-        s0c = list(stems0.path.coords)
-        line_start_c = list(line_start.coords)
-        line_stop_c = list(line_stop.coords)
+    sc, s0c, line_start_c, line_stop_c = _vote_coords(
+        stems0, line_start, line_stop, stem, base_coords, coords_cache)
     n_sc = len(sc)
     n_s0c = len(s0c)
     if endpoint_tests is not None:

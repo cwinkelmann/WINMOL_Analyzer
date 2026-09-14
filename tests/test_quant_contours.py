@@ -41,10 +41,14 @@ def _tile(seed):
 def _transform(seed):
     rng = np.random.default_rng(1000 + seed)
     a = rng.uniform(0.01, 2.0)
-    b, d = (0.0, 0.0) if seed % 3 else (rng.uniform(-0.1, 0.1),
-                                       rng.uniform(-0.1, 0.1))
-    return Affine(a, b, rng.uniform(-1e7, 1e7), d, -rng.uniform(0.01, 2.0),
-                  rng.uniform(-1e7, 1e7))
+    if seed % 3:
+        b, d = 0.0, 0.0
+    else:
+        b, d = rng.uniform(-0.1, 0.1), rng.uniform(-0.1, 0.1)
+    c = rng.uniform(-1e7, 1e7)
+    e = -rng.uniform(0.01, 2.0)
+    f = rng.uniform(-1e7, 1e7)
+    return Affine(a, b, c, d, e, f)
 
 
 @pytest.mark.parametrize('seed', range(12))
