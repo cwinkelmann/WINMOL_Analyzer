@@ -77,9 +77,10 @@ allocations that are absurd relative to free memory.
 
 It becomes a hard wall only under `vm.overcommit_memory=2` (strict),
 where `CommitLimit ≈ RAM/2 + swap` and a 10 GB session alone exceeds it
-on a 16 GB host. If a site runs strict overcommit, prediction must run
-in a child process that exits before vectorisation
-(utils/PredictionProcess.py — present, not wired by default).
+on a 16 GB host. No site has reported running strict overcommit; if one
+does, the remedy is to run prediction in a child process that exits
+before vectorisation, since only process exit returns the reservation.
+That is not implemented.
 
 ## If a run is killed at the vector phase
 
