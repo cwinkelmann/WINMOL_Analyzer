@@ -206,40 +206,69 @@ def _read_batch_jobs(src, indexes, batch_jobs, out_size=None):
 
 
 def prediction_worker(
-    gpu_id: int,
+    gpu_id,
     model_path: str,
     input_raster: str,
     jobs: List[dict],
     results,
     config_dict: dict,
 ):
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
-    from utils.IO import load_model_from_path
+    """One process per accelerator. gpu_id=None means CPU.
 
-    cfg = _config_from_dict(config_dict)
-    # Wrapped, so the normalize + resize run on THIS worker's GPU instead
-    # of on the CPU inside the timed inference block.
-    model = load_model_from_path(model_path, cfg)
-    out_size = _graph_out_size(cfg)
-    batch_size = max(1, int(getattr(cfg, 'prediction_batch_size', None)
-                            or getattr(cfg, 'prediction_batch_gpu', 4)))
+    Reads are NOT done here any more: a ReaderPool of threads decodes
+    batches ahead of us into a bounded queue, so the GPU never waits on
+    a 27 ms decode. Any failure -- ours or a reader's -- is reported on
+    `results` as {'error': ...}; the coordinator fails the run on it.
+    """
+    if gpu_id is not None:
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+    try:
+        from utils.IO import load_model_from_path
+        from utils.reader_pool import ReaderPool
 
-    with rasterio.open(input_raster) as src:
-        indexes = list(range(1, min(cfg.n_channels, src.count) + 1))
-        for batch_jobs in _group_jobs(jobs, batch_size):
-            raw_tiles, raw_masks, read_stats = \
-                _read_batch_jobs(src, indexes, batch_jobs, out_size)
-            infer0 = time.perf_counter()
-            pred_cores = _predict_batch(raw_tiles, raw_masks, model, cfg)
-            infer_s = time.perf_counter() - infer0
-            for job, pred_core in zip(batch_jobs, pred_cores):
-                results.put({
-                    'row_off': job['dst_row'],
-                    'col_off': job['dst_col'],
-                    'array': pred_core,
-                    'read_s': read_stats['read_s'] / max(len(batch_jobs), 1),
-                    'infer_s': infer_s / max(len(batch_jobs), 1),
-                })
+        cfg = _config_from_dict(config_dict)
+        # Wrapped, so the normalize + resize run on THIS worker's device
+        # instead of on the CPU inside the timed inference block.
+        model = load_model_from_path(model_path, cfg)
+        out_size = _graph_out_size(cfg)
+        batch_size = max(1, int(getattr(cfg, 'prediction_batch_size', None)
+                                or getattr(cfg, 'prediction_batch_gpu', 4)))
+        n_readers = max(1, int(config_dict.get(
+            'prediction_producer_workers', 1) or 1))
+        depth = max(1, int(config_dict.get('producer_queue_batches', 4) or 4))
+
+        with rasterio.open(input_raster) as probe:
+            indexes = list(range(1, min(cfg.n_channels, probe.count) + 1))
+
+        pool = ReaderPool(
+            input_raster, list(_group_jobs(jobs, batch_size)),
+            lambda src, b: _read_batch_jobs(src, indexes, b, out_size),
+            n_readers=n_readers, queue_depth=depth)
+        pool.start()
+        try:
+            while True:
+                item = pool.get()
+                if item is None:
+                    break
+                batch_jobs, raw_tiles, raw_masks, read_stats = item
+                infer0 = time.perf_counter()
+                pred_cores = _predict_batch(raw_tiles, raw_masks, model, cfg)
+                infer_s = time.perf_counter() - infer0
+                n = max(len(batch_jobs), 1)
+                for job, pred_core in zip(batch_jobs, pred_cores):
+                    results.put({
+                        'row_off': job['dst_row'],
+                        'col_off': job['dst_col'],
+                        'array': pred_core,
+                        'read_s': read_stats['read_s'] / n,
+                        'infer_s': infer_s / n,
+                    })
+        finally:
+            pool.close()
+    except BaseException as exc:      # noqa: BLE001 -- report, never vanish
+        results.put({'error': f"{type(exc).__name__}: {exc}",
+                     'gpu_id': gpu_id})
+        return
     results.put({'done': True, 'gpu_id': gpu_id})
 
 

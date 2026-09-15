@@ -196,3 +196,23 @@ def test_real_geotiff_windows_through_own_handles(tmp_path):
     assert len(got) == 16
     for (r, c), t in got.items():
         np.testing.assert_array_equal(t, data[r:r + 16, c:c + 16])
+
+
+def test_prediction_worker_reports_error_instead_of_dying(
+        monkeypatch, tmp_path):
+    """A worker that fails must put {'error': ...}, never vanish: the
+    coordinator's drain loop (Task 3) turns that into a failed run."""
+    from utils import PredictWorkers as PW
+    results = []
+
+    class _Q:
+        def put(self, x):
+            results.append(x)
+    monkeypatch.setattr(PW, "_config_from_dict",
+                        lambda d: (_ for _ in ()).throw(RuntimeError("boom")))
+    PW.prediction_worker(0, "m.onnx", str(tmp_path / "nope.tif"), [], _Q(),
+                         {'prediction_producer_workers': 2,
+                          'producer_queue_batches': 2})
+    assert results and 'error' in results[-1]
+    assert "boom" in results[-1]['error']
+    assert results[-1]['gpu_id'] == 0
