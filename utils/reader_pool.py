@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from typing import Callable, List
 
 import rasterio
@@ -108,7 +109,6 @@ class ReaderPool:
             return item
 
     def close(self) -> None:
-        import time
         self._stop.set()
         deadline = time.time() + 10.0
         while any(t.is_alive() for t in self._threads):
@@ -118,5 +118,3 @@ class ReaderPool:
                 pass
             if time.time() > deadline:
                 break
-        for t in self._threads:
-            t.join(timeout=0)

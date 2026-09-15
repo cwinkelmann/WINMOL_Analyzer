@@ -3,6 +3,7 @@ from __future__ import annotations
 import multiprocessing as mp
 import os
 import queue
+import threading
 import time
 from typing import List, Optional
 
@@ -182,6 +183,33 @@ def _read_batch_jobs(src, indexes, batch_jobs, out_size=None):
     return raw_tiles, raw_masks, stats
 
 
+def _watch_parent(sentinel, exit_fn=lambda: os._exit(1)):
+    """Daemon-thread body: hard-exit this process the moment the parent
+    (the coordinator, or ultimately the CLI process the QGIS plugin
+    started) is gone.
+
+    The plugin cancels a run by terminating the CLI process only
+    (`tasks_threads.py:104-113`). On `main` the single-GPU path ran
+    in-process, so that killed everything. Now the spawned worker(s)
+    survive -- they keep the GPU, and, having inherited fd 1, keep the
+    plugin's log `readline()` (and this repo's harness's
+    `for line in proc.stdout`) from ever seeing EOF, because the pipe's
+    write end is still open in the orphaned worker.
+
+    `sentinel` is `multiprocessing.parent_process().sentinel`: an fd that
+    becomes ready to read the moment the parent process exits. `wait()`
+    blocks until then and returns; nothing here polls.
+    """
+    if sentinel is None:
+        return
+    try:
+        from multiprocessing.connection import wait
+        wait([sentinel])
+    except Exception:
+        return
+    exit_fn()
+
+
 def prediction_worker(
     gpu_id: Optional[int],
     model_path: str,
@@ -197,9 +225,29 @@ def prediction_worker(
     a 27 ms decode. Any failure -- ours or a reader's -- is reported on
     `results` as {'error': ...}; the coordinator fails the run on it.
     """
-    if gpu_id is not None:
-        os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+    # See `_watch_parent`. `parent_process()` is None when this function is
+    # called directly (e.g. from a test), not via `mp.Process` -- that is
+    # not a bug, there is no parent to watch for.
+    parent = mp.parent_process()
+    if parent is not None:
+        threading.Thread(
+            target=_watch_parent, args=(parent.sentinel,),
+            daemon=True).start()
     try:
+        if gpu_id is not None:
+            # Honour a CUDA_VISIBLE_DEVICES the user already set (main's
+            # in-process path did): treat gpu_id as an INDEX into it
+            # rather than overwriting it outright, so a user pinned to
+            # e.g. "1" does not silently get card 0. Unset stays as
+            # before. An out-of-range index fails loudly -- surfaced
+            # below as {'error': ...} -- rather than falling back to an
+            # unintended device.
+            existing = os.environ.get('CUDA_VISIBLE_DEVICES', '')
+            if existing:
+                os.environ['CUDA_VISIBLE_DEVICES'] = \
+                    existing.split(',')[gpu_id]
+            else:
+                os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
         from utils.IO import load_model_from_path
         from utils.reader_pool import ReaderPool
 
@@ -207,6 +255,16 @@ def prediction_worker(
         # Wrapped, so the normalize + resize run on THIS worker's device
         # instead of on the CPU inside the timed inference block.
         model = load_model_from_path(model_path, cfg)
+        # The dispatch used to print this from winmol_run.py; the model now
+        # loads in this child instead, so print it here -- the plugin's
+        # GPU-verdict UX parses this exact line.
+        from utils.onnx_runtime import last_active_report
+        report = last_active_report()
+        if report:
+            print(
+                f"Execution providers (active): "
+                f"{report['active_providers']} "
+                f"(device: {report['accelerator_label']})")
         out_size = _graph_out_size(cfg)
         batch_size = max(1, int(getattr(cfg, 'prediction_batch_size', None)
                                 or getattr(cfg, 'prediction_batch_gpu', 4)))
@@ -217,12 +275,26 @@ def prediction_worker(
         with rasterio.open(input_raster) as probe:
             indexes = list(range(1, min(cfg.n_channels, probe.count) + 1))
 
+        # Group readers at the stream path's chunk size, not at
+        # `batch_size`: autotune samples the FIRST batch handed to it, and
+        # capping that sample at `batch_size` (4 on a single GPU) also caps
+        # the candidates `_prediction_batch_candidates` can sweep
+        # (`c <= len(sample_tiles)`), so a 16-candidate times "correctly"
+        # against a 4-tile sample, reports 4x too fast, wins, and latches
+        # `active_batch` at a value the reader batch then silently caps
+        # forever. CPU (batch 1) never sweeps at all (`len(sample) < 2`).
+        chunk = max(batch_size,
+                    int(getattr(cfg, 'prediction_batch_max_gpu', 12)))
         pool = ReaderPool(
-            input_raster, list(_group_jobs(jobs, batch_size)),
+            input_raster, list(_group_jobs(jobs, chunk)),
             lambda src, b: _read_batch_jobs(src, indexes, b, out_size),
             n_readers=n_readers, queue_depth=depth)
         from utils.Prediction import (_autotune_batch_size,
+                                      _autotune_cache_key,
+                                      _persist_autotune_batch,
                                       _predict_batch_adaptive)
+        autotune_key, autotune_cache_file = _autotune_cache_key(
+            model, cfg, 'Prediction micro-batch')
         active_batch = None
         try:
             pool.start()
@@ -238,19 +310,29 @@ def prediction_worker(
                     active_batch = _autotune_batch_size(
                         raw_tiles, raw_masks, model, cfg, batch_size,
                         label='Prediction micro-batch')
-                # Readers group at the pre-autotune size; re-chunk here so
-                # a reduced micro-batch stays reduced, as the stream loop
-                # did -- _predict_batch_adaptive does not slice its input
-                # on the success path, so handing it the whole (possibly
-                # oversized) reader batch every time would silently re-OOM
-                # and only recover via its own internal recursion.
+                # Readers group at the (now larger) chunk size; re-chunk
+                # here so a reduced micro-batch stays reduced, as the
+                # stream loop did -- _predict_batch_adaptive does not
+                # slice its input on the success path, so handing it the
+                # whole (possibly oversized) reader batch every time would
+                # silently re-OOM and only recover via its own internal
+                # recursion.
                 i = 0
                 while i < len(batch_jobs):
                     sl = slice(i, i + active_batch)
                     infer0 = time.perf_counter()
-                    pred_cores, active_batch = _predict_batch_adaptive(
+                    pred_cores, new_batch = _predict_batch_adaptive(
                         raw_tiles[sl], raw_masks[sl], model, cfg,
                         active_batch)
+                    if new_batch < active_batch:
+                        # Latch the reduction for the REST of the run, and
+                        # persist it -- exactly what the stream path does
+                        # (utils/Prediction.py:1197-1200) -- so the NEXT
+                        # run does not load the stale (too-high) cached
+                        # batch and OOM again before even re-probing.
+                        _persist_autotune_batch(
+                            autotune_key, autotune_cache_file, new_batch)
+                    active_batch = new_batch
                     infer_s = time.perf_counter() - infer0
                     chunk_jobs = batch_jobs[sl]
                     n = max(len(chunk_jobs), 1)
@@ -598,7 +680,13 @@ def run_multi_gpu_prediction(
         try:
             _drain_results(result_q, workers, write_tile, total_tiles,
                            progress_interval_s)
-        except PredictionWorkerFailed:
+        except BaseException:      # noqa: BLE001 -- terminate, never swallow
+            # Not just PredictionWorkerFailed: a write_tile error, a
+            # rasterio error, or a KeyboardInterrupt all used to skip
+            # terminate() here, leaving workers blocked in `results.put`
+            # on a pipe nobody drains -- multiprocessing's atexit join
+            # then waits forever. Every failure must terminate live
+            # workers before propagating.
             for p in workers:
                 if p.is_alive():
                     p.terminate()

@@ -4,6 +4,7 @@ The pool knows nothing about tiles; `read_fn` is injected. These tests use
 a fake read_fn for the protocol (sentinels, errors, liveness) and one real
 tiny GeoTIFF to prove own-handle-per-thread works against rasterio.
 """
+import os
 import sys
 import threading
 import time
@@ -345,3 +346,233 @@ def test_worker_rechunks_to_the_reduced_batch_after_a_backoff(
                           'producer_queue_batches': 2})
     assert all(n <= 2 for n in calls['sizes'][1:]), calls['sizes']
     assert sum(1 for o in out if 'array' in o) == 8
+
+
+def test_watch_parent_exits_when_sentinel_closes():
+    """F1: `_watch_parent` must call `exit_fn` once the sentinel becomes
+    readable (i.e. the parent process is gone) -- not poll, not hang.
+
+    A clean cross-platform test that spawns `prediction_worker` in a real
+    process and kills its parent proved too fiddly (process-group/signal
+    handling differs across CI OSes for a 3-process chain), so per the
+    brief's documented fallback this drives the watchdog directly with a
+    fake sentinel (a pipe) and an injected `exit_fn`.
+    """
+    from utils import PredictWorkers as PW
+    r, w = os.pipe()
+    called = threading.Event()
+
+    def fake_exit():
+        called.set()
+
+    t = threading.Thread(target=PW._watch_parent, args=(r, fake_exit))
+    t.start()
+    assert not called.is_set()
+    os.close(w)  # write end closing makes r readable (EOF) -> wait() returns
+    t.join(timeout=5)
+    assert not t.is_alive()
+    assert called.is_set()
+    os.close(r)
+
+
+def test_watch_parent_is_a_noop_with_no_sentinel():
+    """`multiprocessing.parent_process()` is None when `prediction_worker`
+    is called directly, as every other test in this file does (not
+    spawned) -- `_watch_parent` must not blow up or block in that case."""
+    from utils import PredictWorkers as PW
+    called = []
+    PW._watch_parent(None, exit_fn=lambda: called.append(1))
+    assert called == []
+
+
+def _minimal_worker_run(monkeypatch, tmp_path, gpu_id, config_extra=None):
+    """Shared setup for the F3/F4 tests below: a real tiny GeoTIFF, the
+    worker-test fixture pattern (monkeypatched `_config_from_dict`,
+    `_graph_out_size`, `load_model_from_path`, `_read_batch_jobs`,
+    `_autotune_batch_size`, `_predict_batch_adaptive`), no jobs -- these
+    tests only care what the worker does before it starts reading tiles.
+    """
+    from utils import PredictWorkers as PW
+
+    class _Cfg:
+        n_channels = 1
+        prediction_batch_size = 1
+        img_height = img_width = 8
+
+    monkeypatch.setattr(PW, "_config_from_dict", lambda d: _Cfg())
+    monkeypatch.setattr(PW, "_graph_out_size", lambda cfg: None)
+    monkeypatch.setattr(
+        PW, "_read_batch_jobs",
+        lambda src, idx, b, o: ([], [], {'read_s': 0.0}))
+    monkeypatch.setattr("utils.Prediction._autotune_batch_size",
+                        lambda *a, **k: 1)
+    monkeypatch.setattr("utils.Prediction._predict_batch_adaptive",
+                        lambda *a, **k: ([], 1))
+    import rasterio
+    from rasterio.transform import from_origin
+    path = tmp_path / "p.tif"
+    with rasterio.open(path, 'w', driver='GTiff', width=8, height=8, count=1,
+                       dtype='uint8', transform=from_origin(0, 8, 1, 1),
+                       crs='EPSG:3857') as d:
+        d.write(np.zeros((8, 8), np.uint8), 1)
+
+    class _Q:
+        def put(self, x):
+            pass
+
+    cfg_dict = {'prediction_producer_workers': 1, 'producer_queue_batches': 2}
+    cfg_dict.update(config_extra or {})
+    PW.prediction_worker(gpu_id, "m.onnx", str(path), [], _Q(), cfg_dict)
+
+
+def test_worker_sets_cuda_visible_devices_when_unset(monkeypatch, tmp_path):
+    """F4: env unset -> gpu_id is used verbatim (unchanged behaviour)."""
+    monkeypatch.delenv('CUDA_VISIBLE_DEVICES', raising=False)
+    seen = {}
+
+    def fake_load(p, c):
+        seen['cuda'] = os.environ.get('CUDA_VISIBLE_DEVICES')
+        return object()
+    monkeypatch.setattr("utils.IO.load_model_from_path", fake_load)
+
+    _minimal_worker_run(monkeypatch, tmp_path, gpu_id=0)
+    assert seen['cuda'] == "0"
+
+
+def test_worker_treats_gpu_id_as_index_into_existing_cuda_visible_devices(
+        monkeypatch, tmp_path):
+    """F4: env already set (e.g. by the user) -> gpu_id indexes into it,
+    it must not be overwritten outright. `CUDA_VISIBLE_DEVICES=3,5` with
+    gpu_id=1 must select device "5", not clobber the pin to plain "1"."""
+    monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '3,5')
+    seen = {}
+
+    def fake_load(p, c):
+        seen['cuda'] = os.environ.get('CUDA_VISIBLE_DEVICES')
+        return object()
+    monkeypatch.setattr("utils.IO.load_model_from_path", fake_load)
+
+    _minimal_worker_run(monkeypatch, tmp_path, gpu_id=1)
+    assert seen['cuda'] == "5"
+
+
+def test_worker_autotune_samples_the_reader_chunk_not_batch_size(
+        monkeypatch, tmp_path):
+    """F3: readers must group at `max(batch_size, prediction_batch_max_gpu)`
+    so the autotune sample is not capped at the (small) planner batch --
+    `_prediction_batch_candidates` sweeps only `c <= len(sample_tiles)`, so
+    a 4-tile sample can never even try a 12-candidate no matter what
+    `prediction_batch_max_gpu` says, and the winning candidate's per-tile
+    time is computed by dividing elapsed by the REQUESTED size, so a
+    16-candidate timed on a 4-tile sample reports 4x too fast."""
+    from utils import PredictWorkers as PW
+    calls = {'autotune_sample_len': None}
+
+    class _Cfg:
+        n_channels = 1
+        prediction_batch_size = 4
+        prediction_batch_max_gpu = 12
+        img_height = img_width = 8
+
+    monkeypatch.setattr(PW, "_config_from_dict", lambda d: _Cfg())
+    monkeypatch.setattr(PW, "_graph_out_size", lambda cfg: None)
+    monkeypatch.setattr("utils.IO.load_model_from_path", lambda p, c: object())
+    monkeypatch.setattr(
+        PW, "_read_batch_jobs",
+        lambda src, idx, b, o: (
+            [np.zeros((8, 8, 1), np.uint8)] * len(b),
+            [np.ones((8, 8), bool)] * len(b),
+            {'read_s': 0.0}))
+
+    def fake_autotune(tiles, masks, model, cfg, initial_batch, label=None):
+        if calls['autotune_sample_len'] is None:
+            calls['autotune_sample_len'] = len(tiles)
+        return 4
+
+    def fake_adaptive(tiles, masks, model, cfg, batch_size):
+        return [np.zeros((8, 8), np.uint8) for _ in tiles], batch_size
+
+    monkeypatch.setattr("utils.Prediction._autotune_batch_size",
+                        fake_autotune)
+    monkeypatch.setattr("utils.Prediction._predict_batch_adaptive",
+                        fake_adaptive)
+    import rasterio
+    from rasterio.transform import from_origin
+    path = tmp_path / "p.tif"
+    with rasterio.open(path, 'w', driver='GTiff', width=8, height=8, count=1,
+                       dtype='uint8', transform=from_origin(0, 8, 1, 1),
+                       crs='EPSG:3857') as d:
+        d.write(np.zeros((8, 8), np.uint8), 1)
+    # 16 jobs: at chunk=max(4,12)=12 the FIRST reader batch is a full 12,
+    # which is the sample the autotune sweep actually measures against.
+    jobs = [{'dst_row': 0, 'dst_col': i, 'src_row': 0, 'src_col': 0,
+             'src_width': 8, 'src_height': 8} for i in range(16)]
+    out = []
+
+    class _Q:
+        def put(self, x):
+            out.append(x)
+    PW.prediction_worker(None, "m.onnx", str(path), jobs, _Q(),
+                         {'prediction_producer_workers': 1,
+                          'producer_queue_batches': 2})
+    assert calls['autotune_sample_len'] == 12
+
+
+def test_worker_persists_autotune_batch_after_a_backoff(
+        monkeypatch, tmp_path):
+    """F3: when `_predict_batch_adaptive` returns a SMALLER batch than it
+    was given, the worker must persist that reduction exactly like the
+    stream path does (`utils/Prediction.py:1197-1200`) -- otherwise the
+    NEXT run loads the stale (too-high) cached batch and OOMs again before
+    even re-probing."""
+    from utils import PredictWorkers as PW
+    persisted = []
+
+    class _Cfg:
+        n_channels = 1
+        prediction_batch_size = 4
+        prediction_batch_max_gpu = 12
+        img_height = img_width = 8
+
+    monkeypatch.setattr(PW, "_config_from_dict", lambda d: _Cfg())
+    monkeypatch.setattr(PW, "_graph_out_size", lambda cfg: None)
+    monkeypatch.setattr("utils.IO.load_model_from_path", lambda p, c: object())
+    monkeypatch.setattr(
+        PW, "_read_batch_jobs",
+        lambda src, idx, b, o: (
+            [np.zeros((8, 8, 1), np.uint8)] * len(b),
+            [np.ones((8, 8), bool)] * len(b),
+            {'read_s': 0.0}))
+    monkeypatch.setattr("utils.Prediction._autotune_batch_size",
+                        lambda *a, **k: 4)
+
+    calls = {'n': 0}
+
+    def fake_adaptive(tiles, masks, model, cfg, batch_size):
+        calls['n'] += 1
+        used = 2 if calls['n'] == 1 else batch_size
+        return [np.zeros((8, 8), np.uint8) for _ in tiles], used
+
+    monkeypatch.setattr("utils.Prediction._predict_batch_adaptive",
+                        fake_adaptive)
+    monkeypatch.setattr(
+        "utils.Prediction._persist_autotune_batch",
+        lambda key, cache_file, batch: persisted.append(batch))
+    import rasterio
+    from rasterio.transform import from_origin
+    path = tmp_path / "p.tif"
+    with rasterio.open(path, 'w', driver='GTiff', width=8, height=8, count=1,
+                       dtype='uint8', transform=from_origin(0, 8, 1, 1),
+                       crs='EPSG:3857') as d:
+        d.write(np.zeros((8, 8), np.uint8), 1)
+    jobs = [{'dst_row': 0, 'dst_col': i, 'src_row': 0, 'src_col': 0,
+             'src_width': 8, 'src_height': 8} for i in range(8)]
+    out = []
+
+    class _Q:
+        def put(self, x):
+            out.append(x)
+    PW.prediction_worker(None, "m.onnx", str(path), jobs, _Q(),
+                         {'prediction_producer_workers': 1,
+                          'producer_queue_batches': 2})
+    assert persisted == [2]

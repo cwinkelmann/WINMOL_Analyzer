@@ -11,12 +11,44 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 import numpy as np
+import psutil
 import rasterio
 import geopandas as gpd
+
+
+def _poll_tree_rss(pid, peak, stop_event, interval_s=0.5):
+    """Peak of the SUM of RSS across the process tree, sampled every
+    ``interval_s`` while the child runs.
+
+    `os.wait4`'s `ru_maxrss` is the peak of the LARGEST single process, not
+    the total: on the T14, `main` runs prediction as one process while this
+    branch splits it into a coordinator plus one worker per GPU, so
+    `ru_maxrss` alone can look flat (or even improve) while total memory
+    rose -- exactly the failure mode `rss_ok` exists to catch. `peak[0]` is
+    a single-element list so this thread can write a result the caller
+    reads after joining it.
+    """
+    try:
+        root = psutil.Process(pid)
+    except psutil.Error:
+        return
+    while not stop_event.is_set():
+        try:
+            procs = [root] + root.children(recursive=True)
+            total = sum(p.memory_info().rss for p in procs
+                        if p.is_running())
+        except psutil.Error:
+            # A child can exit between children() and memory_info(); skip
+            # this sample rather than crash the poller.
+            total = 0
+        if total > peak[0]:
+            peak[0] = total
+        stop_event.wait(interval_s)
 
 
 def run(checkout, model, ortho, outdir, cpu):
@@ -34,6 +66,12 @@ def run(checkout, model, ortho, outdir, cpu):
          str(stem), str(outdir / "out"), "Nodes"],
         cwd=checkout, env=env, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, text=True, bufsize=1)
+    tree_peak = [0]      # bytes; written by the poller thread, read after join
+    stop_poll = threading.Event()
+    poller = threading.Thread(
+        target=_poll_tree_rss, args=(proc.pid, tree_peak, stop_poll),
+        daemon=True)
+    poller.start()
     stamped = []                       # (seconds, done_tiles) per progress line
     log = open(outdir / "run.log", "w")
     for line in proc.stdout:
@@ -54,6 +92,8 @@ def run(checkout, model, ortho, outdir, cpu):
     # already reaped by wait4.
     _, status, ru = os.wait4(proc.pid, 0)
     proc.returncode = os.waitstatus_to_exitcode(status)
+    stop_poll.set()
+    poller.join(timeout=2.0)
     wall = time.perf_counter() - t0
     if proc.returncode != 0:
         raise SystemExit(
@@ -61,11 +101,13 @@ def run(checkout, model, ortho, outdir, cpu):
     # Ruling 2: ru_maxrss is KB on Linux, bytes on macOS -- normalise to MB.
     divisor = 1024 * 1024 if sys.platform == "darwin" else 1024
     peak_rss_mb = ru.ru_maxrss / divisor
+    peak_tree_rss_mb = tree_peak[0] / (1024 * 1024)
     # Ruling 4: GPKGs live under <outdir>/out*; compare the LAST (merged)
     # one, but let the caller notice a length mismatch instead of indexing
     # blindly into two lists of different shape.
     gpkgs = sorted(outdir.rglob("*.gpkg"))
     return {"wall_s": wall, "curve": stamped, "peak_rss_mb": peak_rss_mb,
+            "peak_tree_rss_mb": peak_tree_rss_mb,
             "stem": stem, "gpkg": gpkgs}
 
 
@@ -186,7 +228,11 @@ def main():
     ok_r, why_r = same_raster(base["stem"], br["stem"])
     ok_g, why_g = compare_gpkgs(base["gpkg"], br["gpkg"])
     faster = br["wall_s"] <= base["wall_s"]
-    leaner = br["peak_rss_mb"] <= base["peak_rss_mb"]
+    # The gate compares TREE totals, not the single largest process: on the
+    # T14, main is one process while the branch splits coordinator +
+    # worker, so the largest-process number (peak_rss_mb) can pass while
+    # total memory rose. Both are still reported below.
+    leaner = br["peak_tree_rss_mb"] <= base["peak_tree_rss_mb"]
     # #43 gate: the pool must not cliff where main does not.
     base_cliff, br_cliff = cliff_ratio(base["curve"]), cliff_ratio(br["curve"])
     cliff_note = None
@@ -207,6 +253,7 @@ def main():
         "base": {
             "wall_s": base["wall_s"],
             "peak_rss_mb": base["peak_rss_mb"],
+            "peak_tree_rss_mb": base["peak_tree_rss_mb"],
             "first10_tpm": inst_rate(base["curve"], 0, .1),
             "last10_tpm": inst_rate(base["curve"], .9, 1),
             "cliff_ratio": base_cliff,
@@ -214,6 +261,7 @@ def main():
         "branch": {
             "wall_s": br["wall_s"],
             "peak_rss_mb": br["peak_rss_mb"],
+            "peak_tree_rss_mb": br["peak_tree_rss_mb"],
             "first10_tpm": inst_rate(br["curve"], 0, .1),
             "last10_tpm": inst_rate(br["curve"], .9, 1),
             "cliff_ratio": br_cliff,

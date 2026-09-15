@@ -114,12 +114,22 @@ coordinator ─shard─▶ [GPU worker process]
                                 └─▶ predict loop ─▶ result_q ─▶ assembly
 ```
 
-- Queue depth = existing plan field `producer_queue_batches` (4). Readers
-  block on `put`: that is the backpressure.
-- Memory bound per GPU = `producer_queue_batches × prediction_batch × tile
-  bytes`. A native 1217² tile is 4.44 MB RGB uint8 + 1.48 MB mask ≈ 5.9 MB.
-  Carrot: 4 × 12 × 5.9 MB ≈ 284 MB per GPU, ~2.3 GB total. Laptop: 284 MB,
-  less where the plan picks a smaller `prediction_batch`.
+- Queue depth = existing plan field `producer_queue_batches`, which is 8 on
+  both GPU scenarios (`ExecutionPlan.py`), not 4 -- 4 is only the CPU-only
+  floor. Readers block on `put`: that is the backpressure.
+- Memory bound per GPU = `(producer_queue_batches + R + 1) × prediction_batch
+  × tile bytes`, not `producer_queue_batches × prediction_batch × tile
+  bytes`: `producer_queue_batches` counts batches sitting IN the queue, but
+  each of the R readers holds one more decoded batch while blocked in
+  `put()` against a full queue, and one more batch is in flight in the GPU
+  worker being inferred. A native 1217² tile is 4.44 MB RGB uint8 + 1.48 MB
+  mask ≈ 5.9 MB. With F3's reader batch raised to
+  `max(prediction_batch, prediction_batch_max_gpu)` = 12:
+  - Carrot (R=16): (8 + 16 + 1) × 12 × 5.9 MB = 25 × 12 × 5.9 MB ≈ 1.8 GB
+    per worker, ~14.4 GB across 8 workers -- this is what explains the
+    measured +21% RSS.
+  - Laptop / T14 (R=11, 1 GPU): (8 + 11 + 1) × 12 × 5.9 MB = 20 × 12 × 5.9 MB
+    ≈ 1.4 GB.
 - Tile order within a shard is **not preserved** across readers. Assembly is
   keyed by tile coordinates; the plan includes a test that proves it is
   order-independent rather than assuming it.
