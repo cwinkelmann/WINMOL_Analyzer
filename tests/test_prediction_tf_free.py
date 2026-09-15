@@ -204,6 +204,23 @@ def test_prediction_and_predictworkers_import_without_tensorflow():
         sys.modules.pop("utils.Prediction", None)
         sys.modules.pop("utils.PredictWorkers", None)
         sys.modules.update(saved)
+        # The reimport above also rebound `utils.Prediction` /
+        # `utils.PredictWorkers` as ATTRIBUTES on the `utils` package (a
+        # side effect of `import utils.X` loading a submodule fresh).
+        # `sys.modules.update(saved)` restores the sys.modules entries but
+        # not those attributes, so `utils.Prediction` and
+        # `sys.modules['utils.Prediction']` would otherwise silently point
+        # at two different module objects for the rest of the test
+        # session -- e.g. `monkeypatch.setattr("utils.Prediction.foo", ...)`
+        # resolves the dotted path via getattr (picks up the stale
+        # attribute) while an in-function `from utils.Prediction import
+        # foo` resolves via sys.modules (picks up the restored original),
+        # so the patch silently misses.
+        import utils as _utils
+        for name in ("Prediction", "PredictWorkers"):
+            full_name = f"utils.{name}"
+            if full_name in saved:
+                setattr(_utils, name, saved[full_name])
 
 
 # --- Group 5: resample-in-read (TileBatchProducer out_size) ----------------

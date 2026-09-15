@@ -216,3 +216,58 @@ def test_prediction_worker_reports_error_instead_of_dying(
     assert results and 'error' in results[-1]
     assert "boom" in results[-1]['error']
     assert results[-1]['gpu_id'] == 0
+
+
+def test_worker_autotunes_once_then_uses_adaptive_batches(
+        monkeypatch, tmp_path):
+    from utils import PredictWorkers as PW
+    calls = {'autotune': 0, 'adaptive': []}
+
+    class _Cfg:
+        n_channels = 1
+        prediction_batch_size = 4
+        img_height = img_width = 8
+
+    monkeypatch.setattr(PW, "_config_from_dict", lambda d: _Cfg())
+    monkeypatch.setattr(PW, "_graph_out_size", lambda cfg: None)
+    monkeypatch.setattr("utils.IO.load_model_from_path", lambda p, c: object())
+    monkeypatch.setattr(
+        PW, "_read_batch_jobs",
+        lambda src, idx, b, o: (
+            [np.zeros((8, 8, 1), np.uint8)] * len(b),
+            [np.ones((8, 8), bool)] * len(b),
+            {'read_s': 0.0}))
+
+    def fake_autotune(*a, **k):
+        calls['autotune'] += 1
+        return 2
+
+    def fake_adaptive(tiles, masks, model, cfg, batch_size):
+        calls['adaptive'].append(batch_size)
+        return [np.zeros((8, 8), np.uint8) for _ in tiles], batch_size
+
+    monkeypatch.setattr("utils.Prediction._autotune_batch_size",
+                        fake_autotune)
+    monkeypatch.setattr("utils.Prediction._predict_batch_adaptive",
+                        fake_adaptive)
+    import rasterio
+    from rasterio.transform import from_origin
+    path = tmp_path / "p.tif"
+    with rasterio.open(path, 'w', driver='GTiff', width=8, height=8, count=1,
+                       dtype='uint8', transform=from_origin(0, 8, 1, 1),
+                       crs='EPSG:3857') as d:
+        d.write(np.zeros((8, 8), np.uint8), 1)
+    jobs = [{'dst_row': 0, 'dst_col': i, 'src_row': 0, 'src_col': 0,
+             'src_width': 8, 'src_height': 8} for i in range(6)]
+    out = []
+
+    class _Q:
+        def put(self, x):
+            out.append(x)
+    PW.prediction_worker(None, "m.onnx", str(path), jobs, _Q(),
+                         {'prediction_producer_workers': 1,
+                          'producer_queue_batches': 2})
+    assert calls['autotune'] == 1
+    assert calls['adaptive'] and all(b == 2 for b in calls['adaptive'])
+    assert out[-1] == {'done': True, 'gpu_id': None}
+    assert sum(1 for o in out if 'array' in o) == 6

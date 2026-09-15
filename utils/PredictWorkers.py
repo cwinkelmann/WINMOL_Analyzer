@@ -12,7 +12,7 @@ from rasterio.windows import Window
 
 from classes.Config import Config
 from utils import IO
-from utils.Prediction import (_prepare_inference_batch, _resize_batch,
+from utils.Prediction import (_predict_batch_core, _resize_batch,
                               resolve_read_strategy, strategy_wraps_graph)
 
 
@@ -96,30 +96,6 @@ def _format_eta(seconds: float) -> str:
     if h:
         return f"{h:d}h {m:02d}m {s:02d}s"
     return f"{m:02d}m {s:02d}s"
-
-
-def _predict_batch(raw_tiles, raw_masks, model, config):
-    # Follow the session-wide strategy, exactly as the stream loop does.
-    # This used to force "native" because the workers loaded the model
-    # unwrapped, which put the normalize + 1250^2 -> 512^2 resample of
-    # every tile on the CPU: measured on 8xH100 as 1.974 s per tile of
-    # "inference" for a model that runs in 2.97 ms, i.e. 106 tiles/min
-    # against the stream's 8569. The workers now load the wrapped model,
-    # so the resize happens on device and this hands it native uint8.
-    tile_tensor, mask_resized = _prepare_inference_batch(
-        raw_tiles, raw_masks, config)
-    pred = model.predict_on_batch(tile_tensor)
-    crop = config.overlap_pred // 2
-    threshold = float(getattr(config, 'stem_binary_threshold', 0.5))
-    cores = []
-    for idx in range(pred.shape[0]):
-        pred_core = pred[idx, crop:(config.img_width - crop),
-                         crop:(config.img_width - crop), 0]
-        mask_core = mask_resized[idx, crop:(config.img_width - crop),
-                                 crop:(config.img_width - crop), 0] > 0.5
-        cores.append(np.ascontiguousarray(
-            ((pred_core >= threshold) & mask_core).astype(np.uint8)))
-    return cores
 
 
 def _group_jobs(jobs, batch_size):
@@ -245,6 +221,9 @@ def prediction_worker(
             input_raster, list(_group_jobs(jobs, batch_size)),
             lambda src, b: _read_batch_jobs(src, indexes, b, out_size),
             n_readers=n_readers, queue_depth=depth)
+        from utils.Prediction import (_autotune_batch_size,
+                                      _predict_batch_adaptive)
+        active_batch = None
         try:
             pool.start()
             while True:
@@ -252,8 +231,16 @@ def prediction_worker(
                 if item is None:
                     break
                 batch_jobs, raw_tiles, raw_masks, read_stats = item
+                if active_batch is None:
+                    # Once per worker, on real tiles -- the stream path
+                    # did exactly this; without it a 12 GB card OOMs where
+                    # it used to back off.
+                    active_batch = _autotune_batch_size(
+                        raw_tiles, raw_masks, model, cfg, batch_size,
+                        label='Prediction micro-batch')
                 infer0 = time.perf_counter()
-                pred_cores = _predict_batch(raw_tiles, raw_masks, model, cfg)
+                pred_cores, active_batch = _predict_batch_adaptive(
+                    raw_tiles, raw_masks, model, cfg, active_batch)
                 infer_s = time.perf_counter() - infer0
                 n = max(len(batch_jobs), 1)
                 for job, pred_core in zip(batch_jobs, pred_cores):
@@ -315,7 +302,8 @@ def prediction_service_worker(
                 raw_tiles, raw_masks, read_stats = \
                     _read_batch_jobs(src, indexes, batch_jobs, out_size)
                 infer0 = time.perf_counter()
-                pred_cores = _predict_batch(raw_tiles, raw_masks, model, cfg)
+                pred_cores = _predict_batch_core(
+                    raw_tiles, raw_masks, model, cfg)
                 stats['infer_s'] += time.perf_counter() - infer0
                 stats['read_s'] += float(read_stats.get('read_s', 0.0))
                 stats['read_data_s'] \
