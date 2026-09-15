@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import os
+import queue
 import time
 from typing import List, Optional
 
@@ -464,6 +465,69 @@ def predict_jobs_multi_gpu(service, jobs):
     return ordered, stats
 
 
+class PredictionWorkerFailed(RuntimeError):
+    """A prediction worker reported an error or died. The run fails."""
+
+
+def _drain_results(result_q, workers, write_tile, total_tiles,
+                   progress_interval_s, timeout_s=30.0, print_fn=print):
+    """Consume worker results until every worker has said 'done'.
+
+    Assembly is order-independent: each result carries its own output
+    window, and windows are the tiles' non-overlapping cores. That is
+    what lets readers deliver a shard's tiles in any order.
+
+    Failure is loud. An 'error' message, a worker that is dead without
+    'done', or a timeout with nobody left alive all raise; the old loop
+    blocked on result_q.get() forever in each of those cases.
+    """
+    finished = 0
+    done = 0
+    start = time.monotonic()
+    last_report = start
+    total_read_s = total_infer_s = total_write_s = 0.0
+
+    while finished < len(workers):
+        try:
+            result = result_q.get(timeout=timeout_s)
+        except queue.Empty:
+            alive = [w for w in workers if w.is_alive()]
+            if len(alive) + finished < len(workers):
+                raise PredictionWorkerFailed(
+                    f"{len(workers) - len(alive) - finished} prediction "
+                    "worker(s) exited without reporting completion")
+            continue
+        if result.get('error'):
+            raise PredictionWorkerFailed(
+                f"prediction worker (gpu {result.get('gpu_id')}) failed: "
+                f"{result['error']}")
+        if result.get('done'):
+            finished += 1
+            continue
+        total_write_s += write_tile(int(result['row_off']),
+                                    int(result['col_off']), result['array'])
+        total_read_s += float(result.get('read_s', 0.0))
+        total_infer_s += float(result.get('infer_s', 0.0))
+        done += 1
+        now = time.monotonic()
+        if done == 1 or done == total_tiles \
+                or (now - last_report) >= progress_interval_s:
+            elapsed = max(now - start, 1e-9)
+            rate = done / elapsed
+            eta_s = (total_tiles - done) / rate if rate > 0 else float('inf')
+            print_fn(
+                f"Multi-GPU prediction {done}/{total_tiles} | "
+                f"{done / max(total_tiles, 1):.1%} | {rate * 60:.1f} tiles/min"
+                f" | ETA {_format_eta(eta_s)} | avg read "
+                f"{total_read_s / max(done, 1):.3f}s infer "
+                f"{total_infer_s / max(done, 1):.3f}s write "
+                f"{total_write_s / max(done, 1):.3f}s",
+                flush=True)
+            last_report = now
+    return {'read_s': total_read_s, 'infer_s': total_infer_s,
+            'write_s': total_write_s, 'done': done}
+
+
 def run_multi_gpu_prediction(
     model_path: str,
     input_raster: str,
@@ -513,53 +577,26 @@ def run_multi_gpu_prediction(
         workers.append(p)
 
     total_tiles = len(all_jobs)
-    done = 0
-    finished = 0
-    start = time.monotonic()
-    last_report = start
-    total_read_s = 0.0
-    total_infer_s = 0.0
-    total_write_s = 0.0
     progress_interval_s = float(getattr(config, 'progress_interval_s', 20.0))
 
     with rasterio.open(tmp_path, 'w', **out_profile) as dst:
-        while finished < len(workers):
-            result = result_q.get()
-            if result.get('done'):
-                finished += 1
-                continue
-            arr = result['array']
-            row_off = int(result['row_off'])
-            col_off = int(result['col_off'])
+        def write_tile(row_off, col_off, arr):
             write_h = min(arr.shape[0], layout['out_height'] - row_off)
             write_w = min(arr.shape[1], layout['out_width'] - col_off)
             t0 = time.perf_counter()
             dst.write(
-                np.ascontiguousarray(arr[:write_h, :write_w],
-                                     dtype=np.uint8), 1,
-                window=Window(col_off, row_off, write_w, write_h))
-            total_write_s += time.perf_counter() - t0
-            total_read_s += float(result.get('read_s', 0.0))
-            total_infer_s += float(result.get('infer_s', 0.0))
-            done += 1
-            now = time.monotonic()
-            if (
-                done == 1 or done == total_tiles
-                or (now - last_report) >= progress_interval_s
-            ):
-                elapsed = max(now - start, 1e-9)
-                rate = done / elapsed
-                eta_s = \
-                    (total_tiles - done) / rate if rate > 0 else float('inf')
-                print(
-                    f"Multi-GPU prediction {done}/{total_tiles} | "
-                    f"{done / total_tiles:.1%} | {rate * 60:.1f} tiles/min"
-                    f" | ETA {_format_eta(eta_s)} | avg read "
-                    f"{total_read_s / max(done, 1):.3f}s infer "
-                    f"{total_infer_s / max(done, 1):.3f}s write "
-                    f"{total_write_s / max(done, 1):.3f}s",
-                    flush=True, )
-                last_report = now
+                np.ascontiguousarray(arr[:write_h, :write_w], dtype=np.uint8),
+                1, window=Window(col_off, row_off, write_w, write_h))
+            return time.perf_counter() - t0
+
+        try:
+            _drain_results(result_q, workers, write_tile, total_tiles,
+                           progress_interval_s)
+        except PredictionWorkerFailed:
+            for p in workers:
+                if p.is_alive():
+                    p.terminate()
+            raise
 
     for p in workers:
         p.join()
