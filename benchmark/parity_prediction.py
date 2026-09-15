@@ -107,7 +107,11 @@ def same_raster(a, b):
 
 def same_gpkg(a, b):
     import pyogrio
-    for layer in pyogrio.list_layers(a)[:, 0]:
+    la = list(pyogrio.list_layers(a)[:, 0])
+    lb = list(pyogrio.list_layers(b)[:, 0])
+    if la != lb:
+        return False, f"layer sets differ: {la} vs {lb}"
+    for layer in la:
         ga = gpd.read_file(a, layer=layer, engine="pyogrio")
         gb = gpd.read_file(b, layer=layer, engine="pyogrio")
         if len(ga) != len(gb):
@@ -115,7 +119,9 @@ def same_gpkg(a, b):
         if list(ga.geometry.to_wkb()) != list(gb.geometry.to_wkb()):
             return False, f"{layer}: geometry differs"
         cols = [c for c in ga.columns if c != ga.geometry.name]
-        if not ga[cols].equals(gb[cols]):
+        ga_attrs = ga[cols].reset_index(drop=True)
+        gb_attrs = gb[cols].reset_index(drop=True)
+        if not ga_attrs.equals(gb_attrs):
             return False, f"{layer}: attributes differ"
     return True, "identical"
 
