@@ -106,6 +106,17 @@ def same_raster(a, b):
 
 
 def same_gpkg(a, b):
+    """Row-order- and stem_id-independent GPKG comparison.
+
+    ``main`` renumbers stem_id and reorders rows run-to-run (measured
+    2026-09-15: running unmodified main against itself on the same input,
+    with byte-identical rasters, stems/nodes/vectors rows land in
+    different positions and stem_id differs run-to-run; joined on
+    geometry WKB, stem_id is the ONLY differing column in every layer).
+    So this compares each layer keyed on geometry WKB -- not row
+    position -- and ignores stem_id, which is a run-local label, not
+    content.
+    """
     import pyogrio
     la = list(pyogrio.list_layers(a)[:, 0])
     lb = list(pyogrio.list_layers(b)[:, 0])
@@ -116,14 +127,24 @@ def same_gpkg(a, b):
         gb = gpd.read_file(b, layer=layer, engine="pyogrio")
         if len(ga) != len(gb):
             return False, f"{layer}: {len(ga)} vs {len(gb)} rows"
-        if list(ga.geometry.to_wkb()) != list(gb.geometry.to_wkb()):
-            return False, f"{layer}: geometry differs"
-        cols = [c for c in ga.columns if c != ga.geometry.name]
-        ga_attrs = ga[cols].reset_index(drop=True)
-        gb_attrs = gb[cols].reset_index(drop=True)
-        if not ga_attrs.equals(gb_attrs):
-            return False, f"{layer}: attributes differ"
-    return True, "identical"
+        geom_col = ga.geometry.name
+        ga = ga.copy()
+        gb = gb.copy()
+        ga["_wkb"] = ga.geometry.to_wkb()
+        gb["_wkb"] = gb.geometry.to_wkb()
+        if ga["_wkb"].duplicated().sum() or gb["_wkb"].duplicated().sum():
+            return False, f"{layer}: duplicate geometries, cannot key on WKB"
+        cols_a = [c for c in ga.columns if c != geom_col]
+        cols_b = [c for c in gb.columns if c != geom_col]
+        merged = ga[cols_a].merge(gb[cols_b], on="_wkb", suffixes=("_a", "_b"))
+        if len(merged) != len(ga):
+            unmatched = len(ga) - len(merged)
+            return False, f"{layer}: {unmatched} geometries unmatched"
+        compare_cols = [c for c in cols_a if c not in ("_wkb", "stem_id")]
+        for c in compare_cols:
+            if not merged[f"{c}_a"].equals(merged[f"{c}_b"]):
+                return False, f"{layer}: attribute {c} differs"
+    return True, "identical (geometry-keyed, stem_id excluded)"
 
 
 def compare_gpkgs(base_gpkgs, br_gpkgs):
