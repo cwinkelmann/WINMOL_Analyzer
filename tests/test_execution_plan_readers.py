@@ -1,5 +1,7 @@
 """producer_workers is now 'reader threads per prediction worker':
-R = clamp((hw_cpu - 1) // n_gpu, 1, 16); CPU-only is always 1.
+R = clamp((hw_cpu - 1) // n_gpu, 1, 16) for multi-GPU; single-GPU caps
+at 3 instead of 16 (measured on the T14: extra reader threads contend
+with the single consumer for the GIL). CPU-only is always 1.
 
 Not derived from cpu_workers: that is capped at 32 by max_cpu_workers,
 which on an 8-GPU box would give 4 readers per GPU -- ~136 tiles/s
@@ -20,7 +22,8 @@ from classes.ExecutionPlan import (  # noqa: E402
 
 @pytest.mark.parametrize("hw_cpu,n_gpu,cpu_only,expected", [
     (224, 8, False, 16),    # carrot: 223 // 8 = 27 -> cap 16
-    (12, 1, False, 11),     # T14
+    (12, 1, False, 3),      # T14: single-GPU cap, not 11
+    (224, 1, False, 3),     # single-GPU cap dominates even with cores to spare
     (4, 1, False, 3),
     (2, 1, False, 1),       # floor
     (1, 1, False, 1),       # floor, never 0
@@ -40,7 +43,7 @@ def test_env_override_wins(monkeypatch):
 
 def test_env_override_ignored_when_not_an_int(monkeypatch):
     monkeypatch.setenv("WINMOL_PREDICTION_READERS", "lots")
-    assert _reader_threads(12, 1, False) == 11
+    assert _reader_threads(12, 1, False) == 3
 
 
 # --- G2: producer_queue_batches / reader_chunk by scenario -----------------

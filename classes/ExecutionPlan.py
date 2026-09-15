@@ -295,6 +295,11 @@ def _resolve_prediction_mode(config: Any, scen: str) -> str:
 #: one H100 at 4 ms/tile. CPU-only inference is the bottleneck, so extra
 #: readers there only spend RAM.
 READERS_MAX = 16
+#: Single-GPU cap. Measured on the T14 (1x RTX 4080 SUPER, 12 threads):
+#: R=11 (the uncapped formula) -> 1,660-1,980 tiles/min; R=3 -> 2,350;
+#: main (no pool) -> 2,475. Extra reader threads contend with the single
+#: consumer/autotune for the GIL, so R is capped near read/infer ~= 2-3.
+READERS_MAX_SINGLE_GPU = 3
 ENV_READERS = 'WINMOL_PREDICTION_READERS'
 
 
@@ -307,9 +312,10 @@ def _reader_threads(hw_cpu: int, n_gpu: int, cpu_only: bool) -> int:
             pass
     if cpu_only:
         return 1
+    readers_max = READERS_MAX_SINGLE_GPU if n_gpu == 1 else READERS_MAX
     # hw_cpu - 1: the one core the plan already leaves for the OS and the
     # coordinator. No vector-phase reserve: the phases are sequential.
-    return max(1, min(READERS_MAX,
+    return max(1, min(readers_max,
                       (max(1, int(hw_cpu)) - 1) // max(1, int(n_gpu))))
 
 

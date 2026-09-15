@@ -82,6 +82,9 @@ the current inference cost cannot use.
    - throughput **≥** and peak RSS **≤** current `main`, measured on the T14
      (1 GPU) and on a CPU-only run. Faster is allowed; slower or hungrier
      fails.
+   - RSS: the two-process split (coordinator + worker) costs a second
+     interpreter (~2 GB measured on the T14); accepted for this branch;
+     the in-process N=1 worker is filed as follow-up on #60.
 3. Nothing "activates". Small machines get a small reader count from the same
    sizing rule.
 
@@ -154,7 +157,16 @@ R = clamp( floor((hw_cpu − 1) / n_gpu), 1, 16 )
 - Upper bound 16: where thread scaling plateaus and one H100 is saturated.
 - CPU-only: `R = 1`. Inference is the bottleneck there; more readers only
   spend RAM.
-- Carrot: `223 / 8` → 16 (cap). T14: `11 / 1` → 11.
+- Carrot: `223 / 8` → 16 (cap). Single-GPU: capped at `R = 3`, not the
+  formula's uncapped value (`11` on the T14) -- measured on the T14 (1x
+  RTX 4080 SUPER, 12 threads): R=11 gave 1,660-1,980 tiles/min, R=3 gave
+  2,350, and `main` (no pool) gave 2,475. Eleven reader threads contend
+  with the single consumer/autotune for the GIL (their numpy mask prep
+  holds it), which pushed the autotune sweep to batch 1 and slowed
+  inference; R=3 keeps read throughput ahead of a single GPU without that
+  contention. On single-GPU machines the pool is therefore at **parity**
+  with `main`, not faster: their ceiling is the serial prep+infer loop,
+  not the read, so decoupling the read cannot beat it, only match it.
 - `WINMOL_PREDICTION_READERS` overrides, for measurement only.
 
 ## Failure semantics
