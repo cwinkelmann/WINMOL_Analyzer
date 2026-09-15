@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -283,6 +284,29 @@ def _resolve_prediction_mode(config: Any, scen: str) -> str:
     return 'multi_gpu_stream'
 
 
+#: Reader threads per prediction worker. Measured on carrot 2026-09-15:
+#: reader threads scale to ~7.5x at 16 and then plateau, and 16 saturate
+#: one H100 at 4 ms/tile. CPU-only inference is the bottleneck, so extra
+#: readers there only spend RAM.
+READERS_MAX = 16
+ENV_READERS = 'WINMOL_PREDICTION_READERS'
+
+
+def _reader_threads(hw_cpu: int, n_gpu: int, cpu_only: bool) -> int:
+    override = os.environ.get(ENV_READERS, '').strip()
+    if override:
+        try:
+            return max(1, int(override))
+        except ValueError:
+            pass
+    if cpu_only:
+        return 1
+    # hw_cpu - 1: the one core the plan already leaves for the OS and the
+    # coordinator. No vector-phase reserve: the phases are sequential.
+    return max(1, min(READERS_MAX,
+                      (max(1, int(hw_cpu)) - 1) // max(1, int(n_gpu))))
+
+
 def build_execution_plan(
     config: Any,
     hardware: Any,
@@ -331,10 +355,7 @@ def build_execution_plan(
             2,
             int(_cfg(config, 'producer_queue_batches', 4)),
         )
-        producer_workers = max(
-            1,
-            int(_cfg(config, 'prediction_producer_workers_cpu', 1)),
-        )
+        producer_workers = _reader_threads(hw_cpu, 1, True)
         progress_interval_s = float(
             _cfg(config, 'progress_interval_s_cpu', 45.0)
         )
@@ -372,18 +393,7 @@ def build_execution_plan(
         )
         if huge_nodes_job:
             producer_queue_batches = max(producer_queue_batches, 8)
-        requested_producers = int(
-            _cfg(config, 'prediction_producer_workers_gpu', 3)
-        )
-        producer_caps = [(max(1, cpu_workers // 3), 'cpu_workers // 3')]
-        if cpu_workers < 10:
-            producer_caps.append((2, 'cpu_workers < 10'))
-        producer_workers = _apply_caps(
-            'prediction_producer_workers_gpu',
-            requested_producers,
-            producer_caps,
-            capped,
-        )
+        producer_workers = _reader_threads(hw_cpu, 1, False)
         progress_interval_s = float(
             _cfg(config, 'progress_interval_s_gpu', 60.0)
         )
@@ -432,10 +442,7 @@ def build_execution_plan(
             4,
             int(_cfg(config, 'producer_queue_batches', 8)),
         )
-        producer_workers = max(
-            1,
-            int(_cfg(config, 'prediction_producer_workers_multi_gpu', 2)),
-        )
+        producer_workers = _reader_threads(hw_cpu, gpu_workers, False)
         progress_interval_s = float(
             _cfg(config, 'progress_interval_s_multi_gpu', 20.0)
         )
