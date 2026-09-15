@@ -238,19 +238,35 @@ def prediction_worker(
                     active_batch = _autotune_batch_size(
                         raw_tiles, raw_masks, model, cfg, batch_size,
                         label='Prediction micro-batch')
-                infer0 = time.perf_counter()
-                pred_cores, active_batch = _predict_batch_adaptive(
-                    raw_tiles, raw_masks, model, cfg, active_batch)
-                infer_s = time.perf_counter() - infer0
-                n = max(len(batch_jobs), 1)
-                for job, pred_core in zip(batch_jobs, pred_cores):
-                    results.put({
-                        'row_off': job['dst_row'],
-                        'col_off': job['dst_col'],
-                        'array': pred_core,
-                        'read_s': read_stats['read_s'] / n,
-                        'infer_s': infer_s / n,
-                    })
+                # Readers group at the pre-autotune size; re-chunk here so
+                # a reduced micro-batch stays reduced, as the stream loop
+                # did -- _predict_batch_adaptive does not slice its input
+                # on the success path, so handing it the whole (possibly
+                # oversized) reader batch every time would silently re-OOM
+                # and only recover via its own internal recursion.
+                i = 0
+                while i < len(batch_jobs):
+                    sl = slice(i, i + active_batch)
+                    infer0 = time.perf_counter()
+                    pred_cores, active_batch = _predict_batch_adaptive(
+                        raw_tiles[sl], raw_masks[sl], model, cfg,
+                        active_batch)
+                    infer_s = time.perf_counter() - infer0
+                    chunk_jobs = batch_jobs[sl]
+                    n = max(len(chunk_jobs), 1)
+                    for job, pred_core in zip(chunk_jobs, pred_cores):
+                        results.put({
+                            'row_off': job['dst_row'],
+                            'col_off': job['dst_col'],
+                            'array': pred_core,
+                            'read_s': read_stats['read_s']
+                            / max(len(batch_jobs), 1),
+                            'infer_s': infer_s / n,
+                        })
+                    # Advance by what actually came back, not by
+                    # `active_batch`: the returned size may have shrunk
+                    # mid-chunk.
+                    i += len(pred_cores)
         finally:
             pool.close()
     except BaseException as exc:      # noqa: BLE001 -- report, never vanish

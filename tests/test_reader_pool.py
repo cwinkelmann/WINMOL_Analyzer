@@ -271,3 +271,77 @@ def test_worker_autotunes_once_then_uses_adaptive_batches(
     assert calls['adaptive'] and all(b == 2 for b in calls['adaptive'])
     assert out[-1] == {'done': True, 'gpu_id': None}
     assert sum(1 for o in out if 'array' in o) == 6
+
+
+def test_worker_rechunks_to_the_reduced_batch_after_a_backoff(
+        monkeypatch, tmp_path):
+    """The reader groups batches at the pre-autotune size (Step 3's
+    `batch_size`); once autotune or an OOM reduces `active_batch` below
+    that, the worker must re-chunk to the reduced size before calling
+    `_predict_batch_adaptive` again -- passing it the full oversized
+    reader batch every time (as the pre-fix code did) means every later
+    call re-OOMs and only recovers via internal recursion, every batch,
+    for the rest of the run.
+
+    8 jobs / prediction_batch_size=4 groups into TWO FULL reader batches
+    of 4 -- the smallest arrangement where the second reader batch is
+    still oversized relative to a micro-batch already reduced by the
+    first. (6 jobs, as tried first, only yields batches of [4, 2]: the
+    second batch is smaller than the reader's own grouping size, so it
+    is never oversized relative to the reduced micro-batch regardless of
+    whether the worker re-chunks -- the defect needs a second FULL
+    batch to be observable.)
+    """
+    from utils import PredictWorkers as PW
+    calls = {'autotune': 0, 'sizes': []}
+
+    class _Cfg:
+        n_channels = 1
+        prediction_batch_size = 4
+        img_height = img_width = 8
+
+    monkeypatch.setattr(PW, "_config_from_dict", lambda d: _Cfg())
+    monkeypatch.setattr(PW, "_graph_out_size", lambda cfg: None)
+    monkeypatch.setattr("utils.IO.load_model_from_path", lambda p, c: object())
+    monkeypatch.setattr(
+        PW, "_read_batch_jobs",
+        lambda src, idx, b, o: (
+            [np.zeros((8, 8, 1), np.uint8)] * len(b),
+            [np.ones((8, 8), bool)] * len(b),
+            {'read_s': 0.0}))
+
+    def fake_autotune(*a, **k):
+        calls['autotune'] += 1
+        return 4
+
+    def fake_adaptive(tiles, masks, model, cfg, batch_size):
+        calls['sizes'].append(len(tiles))
+        # First call simulates an OOM back-off that halves the
+        # micro-batch; every tile still comes back, exactly like the
+        # real `_predict_batch_adaptive` -- only `used` shrinks.
+        used = batch_size // 2 if len(calls['sizes']) == 1 else batch_size
+        return [np.zeros((8, 8), np.uint8) for _ in tiles], used
+
+    monkeypatch.setattr("utils.Prediction._autotune_batch_size",
+                        fake_autotune)
+    monkeypatch.setattr("utils.Prediction._predict_batch_adaptive",
+                        fake_adaptive)
+    import rasterio
+    from rasterio.transform import from_origin
+    path = tmp_path / "p.tif"
+    with rasterio.open(path, 'w', driver='GTiff', width=8, height=8, count=1,
+                       dtype='uint8', transform=from_origin(0, 8, 1, 1),
+                       crs='EPSG:3857') as d:
+        d.write(np.zeros((8, 8), np.uint8), 1)
+    jobs = [{'dst_row': 0, 'dst_col': i, 'src_row': 0, 'src_col': 0,
+             'src_width': 8, 'src_height': 8} for i in range(8)]
+    out = []
+
+    class _Q:
+        def put(self, x):
+            out.append(x)
+    PW.prediction_worker(None, "m.onnx", str(path), jobs, _Q(),
+                         {'prediction_producer_workers': 1,
+                          'producer_queue_batches': 2})
+    assert all(n <= 2 for n in calls['sizes'][1:]), calls['sizes']
+    assert sum(1 for o in out if 'array' in o) == 8
