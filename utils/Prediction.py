@@ -782,7 +782,12 @@ def _autotune_cache_lookup(
     cached = autotune_cache.load(key, path=cache_file)
     if cached is None:
         return None
-    if initial <= cached <= max_reachable:
+    # The floor here must agree with the selector's: _prediction_batch_
+    # candidates deliberately sweeps from 1, not from `initial`, so a
+    # cached value below `initial` is a legitimate result, not a stale
+    # one. Validating against `initial` instead of 1 rejected exactly
+    # that result and re-swept every single run.
+    if 1 <= cached <= max_reachable:
         print(
             f"{label} autotune: using cached batch {cached} "
             f"(key {key[:8]}, {cache_file})",
@@ -791,7 +796,7 @@ def _autotune_cache_lookup(
         return cached
     print(
         f"{label} autotune: ignoring out-of-range cached batch "
-        f"{cached} (valid {initial}-{max_reachable}); re-tuning.",
+        f"{cached} (valid 1-{max_reachable}); re-tuning.",
         flush=True,
     )
     return None
