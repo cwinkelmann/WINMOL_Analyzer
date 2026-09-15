@@ -307,6 +307,31 @@ def test_out_of_range_cached_batch_is_re_swept_not_clamped(monkeypatch):
     assert result != 50
 
 
+def test_cached_batch_below_initial_is_used_not_rejected(monkeypatch):
+    """G1: the selector sweeps candidates from 1, not from `initial` (see
+    _prediction_batch_candidates), so it can legitimately land on a cached
+    batch below the plan's initial. The validator must agree with that
+    floor of 1 instead of rejecting the cache hit and re-sweeping every
+    run. Regression for the T14: plan initial 4, sweep selects/caches 3,
+    next run rejected 3 as 'out of range' and re-swept forever."""
+    config = _config(prediction_batch_max_gpu=16)
+    model = _fake_model()
+    _plenty_memory(monkeypatch)
+
+    key = autotune_cache.cache_key(model, config, None)
+    autotune_cache.store(key, 3, path=autotune_cache.cache_path())
+
+    monkeypatch.setattr(
+        Pred, "_time_batch_candidate",
+        _must_not_be_called(
+            "a cached batch within [1, max_reachable] must skip the sweep"))
+
+    result = Pred._autotune_batch_size(
+        list(range(16)), list(range(16)), model, config, initial_batch=4)
+
+    assert result == 3
+
+
 def test_autotune_off_env_skips_sweep_and_cache_entirely(monkeypatch):
     monkeypatch.setenv("WINMOL_BATCH_AUTOTUNE", "off")
     config = _config()

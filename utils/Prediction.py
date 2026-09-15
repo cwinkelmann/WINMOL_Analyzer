@@ -925,7 +925,12 @@ def _autotune_cache_lookup(
     cached = autotune_cache.load(key, path=cache_file)
     if cached is None:
         return None
-    if initial <= cached <= max_reachable:
+    # The floor here must agree with the selector's: _prediction_batch_
+    # candidates deliberately sweeps from 1, not from `initial`, so a
+    # cached value below `initial` is a legitimate result, not a stale
+    # one. Validating against `initial` instead of 1 rejected exactly
+    # that result and re-swept every single run.
+    if 1 <= cached <= max_reachable:
         print(
             f"{label} autotune: using cached batch {cached} "
             f"(key {key[:8]}, {cache_file})",
@@ -934,7 +939,7 @@ def _autotune_cache_lookup(
         return cached
     print(
         f"{label} autotune: ignoring out-of-range cached batch "
-        f"{cached} (valid {initial}-{max_reachable}); re-tuning.",
+        f"{cached} (valid 1-{max_reachable}); re-tuning.",
         flush=True,
     )
     return None
@@ -991,7 +996,14 @@ def _autotune_batch_size(
     config,
     initial_batch,
     label='Prediction micro-batch',
+    max_batch=None,
 ):
+    """``max_batch``: an explicit cap on candidates, e.g. the reader's
+    chunk size (utils/PredictWorkers.prediction_worker). ``None`` keeps
+    the previous behaviour -- candidates are already bounded by the
+    sample size below, this just makes the F3 invariant ("never time a
+    candidate larger than the sample") hold even if a caller ever hands
+    in a sample padded past the reader chunk."""
     initial = max(1, int(initial_batch))
 
     # A manual pin beats everything: no probing, no timing, no memory
@@ -1067,9 +1079,12 @@ def _autotune_batch_size(
         )
         return ceiling
 
+    sample_cap = len(sample_tiles)
+    if max_batch is not None:
+        sample_cap = min(sample_cap, max(1, int(max_batch)))
     candidates = [
         c for c in _prediction_batch_candidates(config, initial)
-        if c <= len(sample_tiles) and c <= ceiling
+        if c <= sample_cap and c <= ceiling
     ]
 
     # Tune once, reuse forever (mode 'auto'); mode 'force' skips straight

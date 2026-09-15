@@ -54,7 +54,7 @@ def test_batch_mode_feeds_native_uint8_to_the_wrapped_model():
     # Producer-resized, as the graph contract requires.
     masks = [np.ones((cfg.img_height, cfg.img_width), dtype=bool)]
 
-    PW._predict_batch(tiles, masks, model, cfg)
+    PW._predict_batch_core(tiles, masks, model, cfg)
 
     assert model.seen_dtype == np.uint8, (
         f"batch mode CPU-converted the tile to {model.seen_dtype}")

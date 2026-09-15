@@ -7,6 +7,12 @@ class Config(object):
     tile_overlap_m = 12.0
     prediction_prefetch = 2
     producer_queue_batches = 4
+    # Tiles a reader batch groups per read (utils/PredictWorkers.
+    # prediction_worker); overwritten by classes/ExecutionPlan.py's
+    # `reader_chunk` on every real run (12 multi-GPU, 8 single-GPU, 4
+    # CPU-only). This class default only matters when Config is built
+    # directly, outside a plan (tests, ad hoc scripts).
+    prediction_reader_chunk = 12
     prediction_producer_workers_cpu = 1
     prediction_producer_workers_gpu = 6
     prediction_producer_workers_multi_gpu = 6
