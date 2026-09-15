@@ -19,6 +19,7 @@
 - Queue depth = existing plan field `producer_queue_batches`. Readers block on `put`.
 - A reader or worker that dies must **fail the run**, never stall it. Timeout 30 s. No partial output with a warning.
 - Tests: run with the `WINMOL_Analyzer` conda python from `tests/` cwd; stdout is swallowed, so use `--junitxml` to read results (see memory `winmol-local-test-env`). flake8 must stay clean.
+- **The #43 cliff is a gate.** Readers deal batches round-robin so they work adjacent tiles (tested). `GDAL_CACHEMAX` is never scaled with reader count. Task 7 runs a **full ortho on the T14** and compares the **instantaneous** throughput curve; last-10 %/first-10 % ratio must be ≥ main's × 0.95. A crop cannot detect the cliff (onset ~9,500 tiles).
 - Concise code: no defensive padding, no speculative options, no docs beyond docstrings that state *why*.
 - Deviation from spec, recorded here: the readers-per-worker count is carried in the **existing** plan field `producer_workers` (already wired to `config.prediction_producer_workers`) rather than a new `prediction_readers_per_gpu` field. Same rule, same semantics, one fewer field. After Task 8 that field has exactly one consumer.
 
@@ -185,6 +186,18 @@ def test_silently_dead_reader_is_detected():
         pool.get(timeout=0.2)
 
 
+def test_readers_are_dealt_adjacent_batches_round_robin():
+    """#43 guard: at any moment the readers hold ONE band of consecutive
+    batches, so their overlapping tiles share GDAL blocks. Contiguous
+    chunking (reader k gets batches [k*n/R : (k+1)*n/R]) would put R
+    readers in R distant bands and multiply the block-cache working set."""
+    pool = ReaderPool('x.tif', _batches(12), _ok_read,
+                      n_readers=4, queue_depth=2, open_fn=_fake_open)
+    first_batch_ids = [sl[0][0]['id'] for sl in pool._slices]
+    assert first_batch_ids == [0, 2, 4, 6]        # consecutive batches, not quarters
+    assert [len(sl) for sl in pool._slices] == [3, 3, 3, 3]
+
+
 def test_real_geotiff_windows_through_own_handles(tmp_path):
     import rasterio
     from rasterio.transform import from_origin
@@ -341,7 +354,7 @@ class ReaderPool:
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `/Users/christian/opt/anaconda3/envs/WINMOL_Analyzer/bin/python -m pytest test_reader_pool.py -q --junitxml=/tmp/rp.xml`
-Expected: 6 passed. Then `flake8 utils/reader_pool.py tests/test_reader_pool.py` from repo root: exit 0.
+Expected: 7 passed. Then `flake8 utils/reader_pool.py tests/test_reader_pool.py` from repo root: exit 0.
 
 - [ ] **Step 5: Commit**
 
@@ -465,7 +478,7 @@ def prediction_worker(
 - [ ] **Step 4: Run the tests**
 
 Run: `pytest test_reader_pool.py -q --junitxml=/tmp/rp.xml`
-Expected: 7 passed. Then the full suite: `pytest -q --junitxml=/tmp/all.xml` — expected: previous count + 7, 0 failures.
+Expected: 8 passed. Then the full suite: `pytest -q --junitxml=/tmp/all.xml` — expected: previous count + 8, 0 failures.
 
 - [ ] **Step 5: Commit**
 
@@ -691,7 +704,7 @@ Keep the trailing `for p in workers: p.join()`, `IO.finalize_raster(...)`, `retu
 - [ ] **Step 4: Run the tests**
 
 Run: `pytest test_prediction_drain.py test_reader_pool.py -q --junitxml=/tmp/d.xml`
-Expected: 11 passed. Full suite: 0 failures. flake8 clean.
+Expected: 12 passed. Full suite: 0 failures. flake8 clean.
 
 - [ ] **Step 5: Commit**
 
@@ -914,7 +927,7 @@ Delete `_predict_batch` from `utils/PredictWorkers.py` and remove `_prepare_infe
 
 - [ ] **Step 4: Run the tests**
 
-Run: `pytest test_reader_pool.py -q` → 8 passed. Full suite: 0 failures. flake8 clean.
+Run: `pytest test_reader_pool.py -q` → 9 passed. Full suite: 0 failures. flake8 clean.
 
 - [ ] **Step 5: Commit**
 
@@ -1038,22 +1051,47 @@ def run(checkout, model, ortho, outdir, cpu):
     env = dict(os.environ)
     if cpu:
         env["WINMOL_ONNX_FORCE_CPU"] = "1"
+    # Timestamp every stdout line as it ARRIVES: the progress line carries
+    # only the cumulative average, and the #43 cliff is invisible in a
+    # cumulative average until long after it happened.
     t0 = time.perf_counter()
-    proc = subprocess.run(
+    proc = subprocess.Popen(
         [sys.executable, "-u", "winmol_run.py", model, ortho,
          str(stem), str(outdir / "out"), "Nodes"],
-        cwd=checkout, env=env, capture_output=True, text=True)
+        cwd=checkout, env=env, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, text=True, bufsize=1)
+    stamped = []                       # (seconds, done_tiles) per progress line
+    log = open(outdir / "run.log", "w")
+    for line in proc.stdout:
+        log.write(line)
+        if "tiles/min" in line and ("prediction" in line or "Written tile" in line):
+            done = int(line.split("|")[0].split()[-1].split("/")[0])
+            stamped.append((time.perf_counter() - t0, done))
+    proc.wait(); log.close()
     wall = time.perf_counter() - t0
-    (outdir / "run.log").write_text(proc.stdout + proc.stderr)
     if proc.returncode != 0:
         raise SystemExit(f"{checkout}: exit {proc.returncode}, see {outdir}/run.log")
     rss_kb = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
-    rate = None
-    for line in proc.stdout.splitlines():
-        if "tiles/min" in line and ("prediction" in line or "Written tile" in line):
-            rate = float(line.split("|")[2].split()[0])
-    return {"wall_s": wall, "tiles_per_min": rate, "peak_rss_mb": rss_kb / 1024,
-            "stem": stem, "gpkg": sorted(outdir.glob("out*/**/*.gpkg")) or sorted(outdir.glob("**/*.gpkg"))}
+    return {"wall_s": wall, "curve": stamped, "peak_rss_mb": rss_kb / 1024,
+            "stem": stem, "gpkg": sorted(outdir.glob("**/*.gpkg"))}
+
+
+def inst_rate(curve, lo, hi):
+    """Instantaneous tiles/min over the slice of the run where done is in
+    [lo, hi] of the total -- from successive progress lines, never from the
+    cumulative average."""
+    total = curve[-1][1]
+    pts = [(t, d) for t, d in curve if lo * total <= d <= hi * total]
+    if len(pts) < 2:
+        return float("nan")
+    (t0, d0), (t1, d1) = pts[0], pts[-1]
+    return 60.0 * (d1 - d0) / max(t1 - t0, 1e-9)
+
+
+def cliff_ratio(curve):
+    """last-10% rate / first-10% rate. ~1.0 is flat; the #43 collapse on
+    the T14 measured ~0.3 (2288 -> 677/min on R13)."""
+    return inst_rate(curve, 0.9, 1.0) / inst_rate(curve, 0.0, 0.1)
 
 
 def same_raster(a, b):
@@ -1092,20 +1130,30 @@ def main():
     br = run(a.branch, a.model, a.ortho, out / "branch", a.cpu)
     ok_r, why_r = same_raster(base["stem"], br["stem"])
     ok_g, why_g = (True, "no gpkg") if not base["gpkg"] else same_gpkg(base["gpkg"][-1], br["gpkg"][-1])
-    faster = (br["tiles_per_min"] or 0) >= (base["tiles_per_min"] or 0)
+    faster = br["wall_s"] <= base["wall_s"]
     leaner = br["peak_rss_mb"] <= base["peak_rss_mb"]
-    report = {"raster": why_r, "gpkg": why_g, "base": {k: v for k, v in base.items() if k in ("wall_s", "tiles_per_min", "peak_rss_mb")},
-              "branch": {k: v for k, v in br.items() if k in ("wall_s", "tiles_per_min", "peak_rss_mb")},
-              "throughput_ok": faster, "rss_ok": leaner}
+    # #43 gate: the pool must not cliff where main does not.
+    base_cliff, br_cliff = cliff_ratio(base["curve"]), cliff_ratio(br["curve"])
+    flat = br_cliff >= base_cliff * 0.95
+    report = {"raster": why_r, "gpkg": why_g,
+              "base": {"wall_s": base["wall_s"], "peak_rss_mb": base["peak_rss_mb"],
+                       "first10_tpm": inst_rate(base["curve"], 0, .1),
+                       "last10_tpm": inst_rate(base["curve"], .9, 1), "cliff_ratio": base_cliff},
+              "branch": {"wall_s": br["wall_s"], "peak_rss_mb": br["peak_rss_mb"],
+                         "first10_tpm": inst_rate(br["curve"], 0, .1),
+                         "last10_tpm": inst_rate(br["curve"], .9, 1), "cliff_ratio": br_cliff},
+              "throughput_ok": faster, "rss_ok": leaner, "no_cliff_ok": flat}
     print(json.dumps(report, indent=2))
-    sys.exit(0 if (ok_r and ok_g and faster and leaner) else 1)
+    sys.exit(0 if (ok_r and ok_g and faster and leaner and flat) else 1)
 
 
 if __name__ == "__main__":
     main()
 ```
 
-- [ ] **Step 2: Run it on the T14, GPU and CPU**
+- [ ] **Step 2: Run it on the T14, GPU and CPU — on a FULL ortho**
+
+The #43 cliff has a position (~9,500 tiles on R13). A crop passes this gate while hiding the collapse. Use Tegel R12 (75,072 tiles) or R13 from `/data/mnt/storage` on the T14, on its ZFS storage, not tmpfs. Expect ~20–60 min per arm on the GPU.
 
 ```bash
 # on the T14 (ssh christian@192.168.188.166), two checkouts side by side
@@ -1117,7 +1165,7 @@ python /tmp/wm-branch/benchmark/parity_prediction.py --base /tmp/wm-main --branc
   --model <same> --ortho <same> --out /tmp/parity-cpu --cpu
 ```
 
-Expected: both exit 0, `"raster": "0 differing px"`, `"gpkg": "identical"`, `throughput_ok: true`, `rss_ok: true`. Paste both JSON reports into the PR. **If either exits 1, stop: Task 8 does not run, and the difference is the next bug to fix.**
+Expected: both exit 0, `"raster": "0 differing px"`, `"gpkg": "identical"`, `throughput_ok`, `rss_ok` and `no_cliff_ok` all true. Paste both JSON reports into the PR. **If either exits 1, stop: Task 8 does not run.** If `no_cliff_ok` is the failure, the fix is a RAM term in `_reader_threads` — bound R by `GDAL_CACHEMAX / per-reader working set` — measured, not guessed; re-run this step after it.
 
 - [ ] **Step 3: Run it on carrot, R13**
 

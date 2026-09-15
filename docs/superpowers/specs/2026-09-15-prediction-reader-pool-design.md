@@ -179,6 +179,35 @@ Integration (T14 and carrot, recorded in the PR as numbers, not assertions):
 - carrot R13 throughput, expected to move from ~13.7k toward the GPU ceiling
   (~120k tiles/min at 4 ms, minus the vector phase's share of the cores).
 
+## The #43 cliff and the GDAL block cache
+
+`docs/resampling-and-clogging.md` records why prediction throughput used to
+collapse near tile ~9,500 on R13: GDAL keeps one **global** block cache
+(default 5 % of RAM) shared by every open handle; once the working set
+exceeds it, reads stop being cache-served and the producers fall behind for
+good. `GDAL_CACHEMAX ↑` only delays it. The `overview` strategy avoids it but
+changes pixels, so the default `graph` strategy — native boundless reads —
+still carries the cliff on RAM-constrained machines. Carrot's flat 27 ms
+across all 99,231 tiles is 2 TB of RAM hiding it, not evidence against it.
+
+The pool inherits the default strategy, so it inherits the cliff. Three
+rules follow:
+
+1. **Readers work adjacent tiles.** Batches are dealt round-robin
+   (`batches[i::R]`), so at any moment the R readers hold one band of
+   consecutive tiles whose overlaps share edge blocks. Contiguous chunking
+   would put R readers into R distant bands and multiply the working set by
+   R. This is a tested invariant, not a preference.
+2. **`GDAL_CACHEMAX` is not scaled with R.** Raising it raises RSS against
+   the (ii) gate and competes with the ZFS ARC on the T14.
+3. **The gate runs a full ortho on the T14 and compares the instantaneous
+   rate curve**, as `docs/img/throughput.png` does — never a crop, never
+   the cumulative average the log prints. Criterion: the branch's rate over
+   the last 10 % of tiles, divided by its rate over the first 10 %, must be
+   ≥ the same ratio on `main` × 0.95. If the pool cliffs where `main` does
+   not, the run fails and the sizing rule gains a RAM term (readers bounded
+   by block-cache share) before anything else proceeds.
+
 ## Out of scope
 
 Cross-GPU balancing; `shared_memory`; changing the sharding; the vector
