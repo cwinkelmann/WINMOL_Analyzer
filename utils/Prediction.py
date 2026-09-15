@@ -853,7 +853,14 @@ def _autotune_batch_size(
     config,
     initial_batch,
     label='Prediction micro-batch',
+    max_batch=None,
 ):
+    """``max_batch``: an explicit cap on candidates, e.g. the reader's
+    chunk size (utils/PredictWorkers.prediction_worker). ``None`` keeps
+    the previous behaviour -- candidates are already bounded by the
+    sample size below, this just makes the F3 invariant ("never time a
+    candidate larger than the sample") hold even if a caller ever hands
+    in a sample padded past the reader chunk."""
     initial = max(1, int(initial_batch))
 
     # A manual pin beats everything: no probing, no timing, no memory
@@ -929,9 +936,12 @@ def _autotune_batch_size(
         )
         return ceiling
 
+    sample_cap = len(sample_tiles)
+    if max_batch is not None:
+        sample_cap = min(sample_cap, max(1, int(max_batch)))
     candidates = [
         c for c in _prediction_batch_candidates(config, initial)
-        if c <= len(sample_tiles) and c <= ceiling
+        if c <= sample_cap and c <= ceiling
     ]
 
     # Tune once, reuse forever (mode 'auto'); mode 'force' skips straight

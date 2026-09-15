@@ -146,6 +146,7 @@ class ImageProcessing:
         self.config.prediction_batch_size = plan.prediction_batch_size
         self.config.producer_queue_batches = plan.producer_queue_batches
         self.config.prediction_producer_workers = plan.producer_workers
+        self.config.prediction_reader_chunk = plan.reader_chunk
         self.config.progress_interval_s = plan.progress_interval_s
 
     def run_prediction_phase(self, plan):

@@ -484,7 +484,8 @@ def test_worker_autotune_samples_the_reader_chunk_not_batch_size(
             [np.ones((8, 8), bool)] * len(b),
             {'read_s': 0.0}))
 
-    def fake_autotune(tiles, masks, model, cfg, initial_batch, label=None):
+    def fake_autotune(tiles, masks, model, cfg, initial_batch, label=None,
+                      max_batch=None):
         if calls['autotune_sample_len'] is None:
             calls['autotune_sample_len'] = len(tiles)
         return 4
@@ -503,6 +504,9 @@ def test_worker_autotune_samples_the_reader_chunk_not_batch_size(
                        dtype='uint8', transform=from_origin(0, 8, 1, 1),
                        crs='EPSG:3857') as d:
         d.write(np.zeros((8, 8), np.uint8), 1)
+    # No prediction_reader_chunk on _Cfg here: falls back to the same
+    # default (12) prediction_batch_max_gpu used to provide, so this stays
+    # a regression guard for the multi-GPU-equivalent (unchanged) case.
     # 16 jobs: at chunk=max(4,12)=12 the FIRST reader batch is a full 12,
     # which is the sample the autotune sweep actually measures against.
     jobs = [{'dst_row': 0, 'dst_col': i, 'src_row': 0, 'src_col': 0,
@@ -516,6 +520,71 @@ def test_worker_autotune_samples_the_reader_chunk_not_batch_size(
                          {'prediction_producer_workers': 1,
                           'producer_queue_batches': 2})
     assert calls['autotune_sample_len'] == 12
+
+
+def test_worker_reader_chunk_caps_autotune_sample_and_max_candidate(
+        monkeypatch, tmp_path):
+    """G2: the reader chunk is now plan-derived (`prediction_reader_chunk`),
+    not the hardcoded `prediction_batch_max_gpu` -- on a single-GPU
+    machine the plan sets it to 8. The autotune sample the worker hands
+    over must shrink to match, and the worker must also pass
+    `max_batch=chunk` into the sweep, so a stale/large
+    `prediction_batch_max_gpu` in config cannot let a candidate past the
+    reader chunk back in by the side door."""
+    from utils import PredictWorkers as PW
+    calls = {'autotune_sample_len': None, 'max_batch': 'unset'}
+
+    class _Cfg:
+        n_channels = 1
+        prediction_batch_size = 4
+        prediction_batch_max_gpu = 12
+        prediction_reader_chunk = 8
+        img_height = img_width = 8
+
+    monkeypatch.setattr(PW, "_config_from_dict", lambda d: _Cfg())
+    monkeypatch.setattr(PW, "_graph_out_size", lambda cfg: None)
+    monkeypatch.setattr("utils.IO.load_model_from_path", lambda p, c: object())
+    monkeypatch.setattr(
+        PW, "_read_batch_jobs",
+        lambda src, idx, b, o: (
+            [np.zeros((8, 8, 1), np.uint8)] * len(b),
+            [np.ones((8, 8), bool)] * len(b),
+            {'read_s': 0.0}))
+
+    def fake_autotune(tiles, masks, model, cfg, initial_batch, label=None,
+                      max_batch=None):
+        if calls['autotune_sample_len'] is None:
+            calls['autotune_sample_len'] = len(tiles)
+            calls['max_batch'] = max_batch
+        return 4
+
+    def fake_adaptive(tiles, masks, model, cfg, batch_size):
+        return [np.zeros((8, 8), np.uint8) for _ in tiles], batch_size
+
+    monkeypatch.setattr("utils.Prediction._autotune_batch_size",
+                        fake_autotune)
+    monkeypatch.setattr("utils.Prediction._predict_batch_adaptive",
+                        fake_adaptive)
+    import rasterio
+    from rasterio.transform import from_origin
+    path = tmp_path / "p.tif"
+    with rasterio.open(path, 'w', driver='GTiff', width=8, height=8, count=1,
+                       dtype='uint8', transform=from_origin(0, 8, 1, 1),
+                       crs='EPSG:3857') as d:
+        d.write(np.zeros((8, 8), np.uint8), 1)
+    # 16 jobs: at chunk=max(4,8)=8 the FIRST reader batch is a full 8.
+    jobs = [{'dst_row': 0, 'dst_col': i, 'src_row': 0, 'src_col': 0,
+             'src_width': 8, 'src_height': 8} for i in range(16)]
+    out = []
+
+    class _Q:
+        def put(self, x):
+            out.append(x)
+    PW.prediction_worker(None, "m.onnx", str(path), jobs, _Q(),
+                         {'prediction_producer_workers': 1,
+                          'producer_queue_batches': 2})
+    assert calls['autotune_sample_len'] == 8
+    assert calls['max_batch'] == 8
 
 
 def test_worker_persists_autotune_batch_after_a_backoff(

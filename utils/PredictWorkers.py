@@ -275,16 +275,19 @@ def prediction_worker(
         with rasterio.open(input_raster) as probe:
             indexes = list(range(1, min(cfg.n_channels, probe.count) + 1))
 
-        # Group readers at the stream path's chunk size, not at
-        # `batch_size`: autotune samples the FIRST batch handed to it, and
-        # capping that sample at `batch_size` (4 on a single GPU) also caps
-        # the candidates `_prediction_batch_candidates` can sweep
+        # Group readers at the plan's reader chunk, not at `batch_size`:
+        # autotune samples the FIRST batch handed to it, and capping that
+        # sample at `batch_size` (4 on a single GPU) also caps the
+        # candidates `_prediction_batch_candidates` can sweep
         # (`c <= len(sample_tiles)`), so a 16-candidate times "correctly"
         # against a 4-tile sample, reports 4x too fast, wins, and latches
         # `active_batch` at a value the reader batch then silently caps
         # forever. CPU (batch 1) never sweeps at all (`len(sample) < 2`).
+        # The chunk itself is plan-derived (ExecutionPlan.reader_chunk):
+        # 12 on multi-GPU, but smaller on a single-worker machine, where a
+        # deep chunk only spends RAM the pool no longer needs it to.
         chunk = max(batch_size,
-                    int(getattr(cfg, 'prediction_batch_max_gpu', 12)))
+                    int(getattr(cfg, 'prediction_reader_chunk', 12)))
         pool = ReaderPool(
             input_raster, list(_group_jobs(jobs, chunk)),
             lambda src, b: _read_batch_jobs(src, indexes, b, out_size),
@@ -309,7 +312,7 @@ def prediction_worker(
                     # it used to back off.
                     active_batch = _autotune_batch_size(
                         raw_tiles, raw_masks, model, cfg, batch_size,
-                        label='Prediction micro-batch')
+                        label='Prediction micro-batch', max_batch=chunk)
                 # Readers group at the (now larger) chunk size; re-chunk
                 # here so a reduced micro-batch stays reduced, as the
                 # stream loop did -- _predict_batch_adaptive does not

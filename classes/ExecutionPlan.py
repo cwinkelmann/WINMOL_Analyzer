@@ -64,6 +64,12 @@ class ExecutionPlan:
     vector_tile_workers: int
     vector_inner_workers: int
     keep_temp: bool
+    #: Tiles a reader batch groups per read, and the sample size handed to
+    #: the first autotune probe (utils/PredictWorkers.prediction_worker).
+    #: Multi-GPU keeps 12; single-GPU/CPU-only machines have one worker,
+    #: so a smaller chunk bounds its in-flight memory without touching
+    #: the read-ahead depth logic.
+    reader_chunk: int
     #: Human-readable notes for every knob the planner reduced below what
     #: the config asked for. Empty when nothing was overridden.
     capped: list = field(default_factory=list)
@@ -355,6 +361,12 @@ def build_execution_plan(
             2,
             int(_cfg(config, 'producer_queue_batches', 4)),
         )
+        # One worker, no pooling across accelerators: deep queues only
+        # spend RAM here, the reader pool already decouples the read from
+        # inference. Cap at depth 4 regardless of what the formula above
+        # produced.
+        producer_queue_batches = max(2, min(4, producer_queue_batches))
+        reader_chunk = 4
         producer_workers = _reader_threads(hw_cpu, 1, True)
         progress_interval_s = float(
             _cfg(config, 'progress_interval_s_cpu', 45.0)
@@ -393,6 +405,12 @@ def build_execution_plan(
         )
         if huge_nodes_job:
             producer_queue_batches = max(producer_queue_batches, 8)
+        # One worker on a small machine: the pool already decouples the
+        # read, deep queues only spend RAM. Cap at depth 4, not 8 -- this
+        # overrides the huge_nodes_job bump above on purpose, the memory
+        # gate applies regardless of job size on single-GPU boxes.
+        producer_queue_batches = max(2, min(4, producer_queue_batches))
+        reader_chunk = 8
         producer_workers = _reader_threads(hw_cpu, 1, False)
         progress_interval_s = float(
             _cfg(config, 'progress_interval_s_gpu', 60.0)
@@ -442,6 +460,7 @@ def build_execution_plan(
             4,
             int(_cfg(config, 'producer_queue_batches', 8)),
         )
+        reader_chunk = 12
         producer_workers = _reader_threads(hw_cpu, gpu_workers, False)
         progress_interval_s = float(
             _cfg(config, 'progress_interval_s_multi_gpu', 20.0)
@@ -478,5 +497,6 @@ def build_execution_plan(
         vector_tile_workers=vector_tile_workers,
         vector_inner_workers=vector_inner_workers,
         keep_temp=keep_temp,
+        reader_chunk=reader_chunk,
         capped=capped,
     )
