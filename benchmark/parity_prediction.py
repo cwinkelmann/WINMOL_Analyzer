@@ -38,6 +38,7 @@ def run(checkout, model, ortho, outdir, cpu):
     log = open(outdir / "run.log", "w")
     for line in proc.stdout:
         log.write(line)
+        log.flush()   # else run.log stays empty for minutes on a real run
         is_progress = "prediction" in line or "Written tile" in line
         if "tiles/min" in line and is_progress:
             try:
@@ -77,7 +78,17 @@ def inst_rate(curve, lo, hi):
     total = curve[-1][1]
     pts = [(t, d) for t, d in curve if lo * total <= d <= hi * total]
     if len(pts) < 2:
-        return float("nan")
+        # A fast arm can cross the whole slice within one progress
+        # interval (carrot: <10% of R13 in under one 20s tick) -- fall
+        # back to the two lines nearest this edge instead of NaN-ing out.
+        if len(curve) < 2:
+            return float("nan")
+        if lo == 0:
+            pts = curve[:2]
+        elif hi == 1:
+            pts = curve[-2:]
+        else:
+            return float("nan")
     (t0, d0), (t1, d1) = pts[0], pts[-1]
     return 60.0 * (d1 - d0) / max(t1 - t0, 1e-9)
 
@@ -105,17 +116,29 @@ def same_raster(a, b):
         return diff == 0, f"{diff} differing px"
 
 
+def _row_multiset(gdf, geom_col, cols):
+    """Sorted list of (wkb_bytes, *str(attr)) tuples, one per row.
+
+    astype(str) per column makes NaN and mixed dtypes compare
+    deterministically; sorting makes the comparison row-order-independent
+    while still catching a changed or missing duplicate (unlike a
+    unique-WKB-keyed merge, which real R13 output violates)."""
+    columns = [list(gdf[geom_col].to_wkb())]
+    columns += [gdf[c].astype(str).tolist() for c in cols]
+    return sorted(zip(*columns))
+
+
 def same_gpkg(a, b):
-    """Row-order- and stem_id-independent GPKG comparison.
+    """Multiset comparison of (geometry, attributes except stem_id).
 
     ``main`` renumbers stem_id and reorders rows run-to-run (measured
     2026-09-15: running unmodified main against itself on the same input,
     with byte-identical rasters, stems/nodes/vectors rows land in
-    different positions and stem_id differs run-to-run; joined on
-    geometry WKB, stem_id is the ONLY differing column in every layer).
-    So this compares each layer keyed on geometry WKB -- not row
-    position -- and ignores stem_id, which is a run-local label, not
-    content.
+    different positions and stem_id differs run-to-run). Real R13 output
+    also has duplicate geometries (stems 1, nodes 122, vectors 59), which
+    breaks a unique-WKB merge key. So each layer is compared as a sorted
+    multiset of (geometry_wkb, *attributes-except-stem_id) tuples --
+    order-independent, duplicate-safe, and stem_id-independent.
     """
     import pyogrio
     la = list(pyogrio.list_layers(a)[:, 0])
@@ -128,22 +151,11 @@ def same_gpkg(a, b):
         if len(ga) != len(gb):
             return False, f"{layer}: {len(ga)} vs {len(gb)} rows"
         geom_col = ga.geometry.name
-        ga = ga.copy()
-        gb = gb.copy()
-        ga["_wkb"] = ga.geometry.to_wkb()
-        gb["_wkb"] = gb.geometry.to_wkb()
-        if ga["_wkb"].duplicated().sum() or gb["_wkb"].duplicated().sum():
-            return False, f"{layer}: duplicate geometries, cannot key on WKB"
-        cols_a = [c for c in ga.columns if c != geom_col]
-        cols_b = [c for c in gb.columns if c != geom_col]
-        merged = ga[cols_a].merge(gb[cols_b], on="_wkb", suffixes=("_a", "_b"))
-        if len(merged) != len(ga):
-            unmatched = len(ga) - len(merged)
-            return False, f"{layer}: {unmatched} geometries unmatched"
-        compare_cols = [c for c in cols_a if c not in ("_wkb", "stem_id")]
-        for c in compare_cols:
-            if not merged[f"{c}_a"].equals(merged[f"{c}_b"]):
-                return False, f"{layer}: attribute {c} differs"
+        cols = [c for c in ga.columns if c not in (geom_col, "stem_id")]
+        rows_a = _row_multiset(ga, geom_col, cols)
+        rows_b = _row_multiset(gb, geom_col, cols)
+        if rows_a != rows_b:
+            return False, f"{layer}: rows differ as a multiset"
     return True, "identical (geometry-keyed, stem_id excluded)"
 
 
