@@ -541,7 +541,8 @@ def run_multi_gpu_prediction(
     config,
 ):
     if not gpu_ids:
-        raise ValueError('multi_gpu_prediction requires at least one GPU id')
+        raise ValueError('run_multi_gpu_prediction requires at least one '
+                         'accelerator id; use [None] for CPU')
 
     ctx = mp.get_context('spawn')
     result_q = ctx.Queue(maxsize=max(8, len(gpu_ids) * 8))
@@ -568,6 +569,7 @@ def run_multi_gpu_prediction(
         else None,
         dtype='uint8',
     )
+    os.makedirs(os.path.dirname(output_raster) or '.', exist_ok=True)
     tmp_path = IO.atomic_tmp_path(output_raster)
 
     cfg_dict = dict(getattr(config, 'to_dict', lambda: {})())

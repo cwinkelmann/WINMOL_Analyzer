@@ -149,21 +149,7 @@ class ImageProcessing:
         self.config.progress_interval_s = plan.progress_interval_s
 
     def run_prediction_phase(self, plan):
-        if plan.prediction_mode == 'multi_gpu_stream' and plan.gpu_workers > 1:
-            from utils.PredictWorkers import run_multi_gpu_prediction
-
-            print("\nPerforming multi-GPU streamed prediction...")
-            profile = run_multi_gpu_prediction(
-                self.model_path,
-                self.uav_path,
-                self.stem_path,
-                tile_jobs=None,
-                gpu_ids=list(range(plan.gpu_workers)),
-                config=self.config,
-            )
-            return (None, profile, self.stem_path)
-
-        from utils import Prediction as Pred
+        from utils.PredictWorkers import run_multi_gpu_prediction
 
         if plan.prediction_mode == 'cpu_stream':
             from utils.onnx_runtime import selected_providers
@@ -171,22 +157,21 @@ class ImageProcessing:
                     getattr(self.config, 'prediction_backend', 'auto'),
                     selected_providers()):
                 os.environ["WINMOL_ONNX_FORCE_CPU"] = "1"
+            gpu_ids = [None]
+        else:
+            gpu_ids = list(range(max(1, plan.gpu_workers)))
 
+        # The plugin's progress parser keys on this line; keep it.
         print("\nLoading Model...")
-        model = IO.load_model_from_path(self.model_path, self.config)
-        from utils.onnx_runtime import last_active_report
-        report = last_active_report()
-        if report:
-            print(
-                f"Execution providers (active): "
-                f"{report['active_providers']} "
-                f"(device: {report['accelerator_label']})")
-        print("\nPerforming Prediction with Resampling in stream mode...")
-        profile = Pred.predict_stream_to_raster(
+        print(f"\nPerforming prediction: {len(gpu_ids)} worker(s), "
+              f"{plan.producer_workers} reader thread(s) each...")
+        profile = run_multi_gpu_prediction(
+            self.model_path,
             self.uav_path,
             self.stem_path,
-            model,
-            self.config,
+            tile_jobs=None,
+            gpu_ids=gpu_ids,
+            config=self.config,
         )
         return (None, profile, self.stem_path)
 
