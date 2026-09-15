@@ -169,3 +169,6 @@ cython_debug/
 # venv created by plugin
 winmol_venv
 venv
+
+# SDD scratch (ledger, briefs, review packages) -- never committed
+.superpowers/
