@@ -136,6 +136,29 @@ def test_readers_are_dealt_adjacent_batches_round_robin():
     assert [len(sl) for sl in pool._slices] == [3, 3, 3, 3]
 
 
+def test_close_unblocks_readers_parked_in_queue():
+    """close() must unblock readers parked in put() on a full queue.
+    A slow read_fn with depth=1 means readers block after first batch.
+    Consumer takes one item then close()s. This must return in <1s and
+    leave no threads alive."""
+    calls = []
+
+    def slow_read(src, batch_jobs):
+        calls.append(1)
+        time.sleep(0.1)  # Slow enough readers block on put()
+        return _ok_read(src, batch_jobs)
+
+    pool = ReaderPool('x.tif', _batches(20), slow_read,
+                      n_readers=3, queue_depth=1, open_fn=_fake_open)
+    pool.start()
+    pool.get(timeout=5)  # Take first batch, leave readers blocked
+    start = time.time()
+    pool.close()
+    elapsed = time.time() - start
+    assert elapsed < 1.0, f"close() took {elapsed}s, should be <1s"
+    assert not any(t.is_alive() for t in pool._threads)
+
+
 def test_real_geotiff_windows_through_own_handles(tmp_path):
     import rasterio
     from rasterio.transform import from_origin

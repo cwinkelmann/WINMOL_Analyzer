@@ -55,6 +55,7 @@ class ReaderPool:
         self._q: "queue.Queue" = queue.Queue(maxsize=max(1, int(queue_depth)))
         self._threads: List[threading.Thread] = []
         self._finished = 0
+        self._stop = threading.Event()
 
     def start(self) -> None:
         for idx, my_batches in enumerate(self._slices):
@@ -71,6 +72,8 @@ class ReaderPool:
         try:
             with self._open_fn(self._path) as src:
                 for batch_jobs in my_batches:
+                    if self._stop.is_set():
+                        return
                     tiles, masks, stats = self._read_fn(src, batch_jobs)
                     self._q.put((batch_jobs, tiles, masks, stats))
         except BaseException as exc:  # noqa: BLE001 -- must reach consumer
@@ -105,5 +108,15 @@ class ReaderPool:
             return item
 
     def close(self) -> None:
+        import time
+        self._stop.set()
+        deadline = time.time() + 10.0
+        while any(t.is_alive() for t in self._threads):
+            try:
+                self._q.get(timeout=0.1)
+            except queue.Empty:
+                pass
+            if time.time() > deadline:
+                break
         for t in self._threads:
-            t.join(timeout=5.0)
+            t.join(timeout=0)
