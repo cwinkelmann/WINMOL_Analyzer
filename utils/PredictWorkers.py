@@ -3,7 +3,7 @@ from __future__ import annotations
 import multiprocessing as mp
 import os
 import time
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import rasterio
@@ -206,7 +206,7 @@ def _read_batch_jobs(src, indexes, batch_jobs, out_size=None):
 
 
 def prediction_worker(
-    gpu_id,
+    gpu_id: Optional[int],
     model_path: str,
     input_raster: str,
     jobs: List[dict],
@@ -244,8 +244,8 @@ def prediction_worker(
             input_raster, list(_group_jobs(jobs, batch_size)),
             lambda src, b: _read_batch_jobs(src, indexes, b, out_size),
             n_readers=n_readers, queue_depth=depth)
-        pool.start()
         try:
+            pool.start()
             while True:
                 item = pool.get()
                 if item is None:
