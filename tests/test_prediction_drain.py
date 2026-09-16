@@ -168,3 +168,41 @@ def test_any_exception_terminates_workers_not_just_worker_failed(
 
     assert len(processes) == 2
     assert all(p.terminate_called for p in processes)
+
+
+def test_duplicate_gpu_ids_spawn_two_workers_with_disjoint_shards(
+        monkeypatch, tmp_path):
+    """gpu_ids=[0, 0] must start TWO workers on device 0, each with a
+    non-overlapping half of the jobs -- the shard split keys on list
+    position, not on the id value."""
+    import rasterio
+    from rasterio.transform import from_origin
+
+    from classes.Config import Config
+
+    path = tmp_path / "in.tif"
+    with rasterio.open(
+            path, 'w', driver='GTiff', width=8, height=8, count=3,
+            dtype='uint8', transform=from_origin(0, 8, 1, 1),
+            crs='EPSG:3857') as d:
+        for band in (1, 2, 3):
+            d.write(np.zeros((8, 8), np.uint8), band)
+
+    jobs = [{'idx': i} for i in range(20)]
+
+    processes = []
+    monkeypatch.setattr(
+        PW.mp, "get_context", lambda name: _FakeCtx(processes))
+    monkeypatch.setattr(
+        PW, "_drain_results",
+        lambda *a, **k: {'read_s': 0.0, 'infer_s': 0.0, 'write_s': 0.0,
+                         'done': 0})
+
+    PW.run_multi_gpu_prediction(
+        "m.onnx", str(path), str(tmp_path / "out.tif"),
+        tile_jobs=jobs, gpu_ids=[0, 0], config=Config())
+
+    assert [p.args[0] for p in processes] == [0, 0]
+    shards = [p.args[3] for p in processes]
+    assert len(shards[0]) + len(shards[1]) == len(jobs)
+    assert not (set(map(id, shards[0])) & set(map(id, shards[1])))

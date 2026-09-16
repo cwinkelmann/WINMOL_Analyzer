@@ -142,6 +142,7 @@ class ImageProcessing:
         print(f"  tile_overlap_m   = {plan.tile_overlap_m}")
         print(f"  halo_px          = {plan.halo_px}")
         print(f"  gpu_workers      = {plan.gpu_workers}")
+        print(f"  workers_per_gpu  = {plan.workers_per_gpu}")
         print(f"  cpu_workers      = {plan.cpu_workers}")
         print(f"  vector_tile_workers = {plan.vector_tile_workers}")
         print(f"  vector_inner_workers = {plan.vector_inner_workers}")
@@ -176,6 +177,7 @@ class ImageProcessing:
         self.config.producer_queue_batches = plan.producer_queue_batches
         self.config.prediction_producer_workers = plan.producer_workers
         self.config.prediction_reader_chunk = plan.reader_chunk
+        self.config.prediction_workers_per_gpu = plan.workers_per_gpu
         self.config.progress_interval_s = plan.progress_interval_s
 
     def run_prediction_phase(self, plan):
@@ -189,7 +191,9 @@ class ImageProcessing:
                 os.environ["WINMOL_ONNX_FORCE_CPU"] = "1"
             gpu_ids = [None]
         else:
-            gpu_ids = list(range(max(1, plan.gpu_workers)))
+            per_gpu = max(1, int(getattr(plan, 'workers_per_gpu', 1) or 1))
+            gpu_ids = [g for g in range(max(1, plan.gpu_workers))
+                       for _ in range(per_gpu)]
 
         # The plugin's progress parser keys on this line; keep it.
         print("\nLoading Model...")
