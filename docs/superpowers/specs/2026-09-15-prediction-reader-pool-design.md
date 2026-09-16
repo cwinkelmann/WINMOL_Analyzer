@@ -235,3 +235,57 @@ rules follow:
 Cross-GPU balancing; `shared_memory`; changing the sharding; the vector
 phase's own under-provisioning (`vector_tile_workers = 16` on 224 cores —
 real, separate issue); reader processes (documented fallback only).
+
+## Amendment 2026-09-16 — two workers per GPU on single-GPU machines
+
+Measured on the T14 (RTX 4080 SUPER, PCIe 3.0 ×4), native 1217² tiles,
+in-graph resize, compute only (input already on device):
+
+| batch | 1 | 2 | 4 | 8 | 16 |
+|---|---|---|---|---|---|
+| ms/tile | **7.90** | 8.34 | 9.11 | 9.38 | 9.42 |
+
+The card is at 99 % utilisation with a **single** tile: a 512² UNet's top
+stage saturates all SMs, so batching has nothing to fill, and per-tile
+cost rises because one tile's top-stage activation (33.5 MB fp16) fits the
+64 MB L2 while batch ≥ 2 spills to GDDR6X. Batch 1 is the right batch on
+this class of card (autotune's choice of 1 was correct, not GIL noise).
+
+One worker delivers 12.7 ms/tile in production (#58, 4,700/min) against a
+7.9 ms floor: the ~5 ms of upload, crop, binarise and result pickling run
+on the worker's one thread under one GIL while the GPU idles. Reader
+threads cannot hide that (probes: pool R=3/6/8 all ≤ #58 alone). A second
+**process** on the same card can — its CPU work overlaps the first's
+kernels, and the driver time-slices the contexts:
+
+| K procs × batch | 1×1 | **2×1** | 3×1 | 4×1 | 2×2 |
+|---|---|---|---|---|---|
+| tiles/min, full `_predict_batch_core` | 5,731 | **6,756** | 6,723 | 6,743 | 6,243 |
+
+Two workers reach the floor (8.9 ms/tile aggregate); a third adds nothing.
+
+**Decision.** New plan field `workers_per_gpu`. `run_prediction_phase`
+expands `gpu_ids` to `[g for g in range(gpu_workers) for _ in
+range(workers_per_gpu)]` — `[0, 0]` on a single-GPU box — and the existing
+coordinator shards the jobs across both workers unchanged; each worker
+keeps its own reader pool. Sizing:
+
+- `SINGLE_GPU`: `workers_per_gpu = 2` when `gpu_memory_gb ≥ 8`, else 1
+  (two CUDA contexts + arenas at batch ≤ 4 measured ≤ 3.4 GB each).
+  `reader_chunk = 4` and the planner batch is capped at 2 on this path:
+  autotune sweeps 1..4 per worker, both workers share one cache key
+  (atomic last-writer-wins; identical hardware, so identical answer).
+- `MULTI_GPU`: 1 (unchanged). Carrot's H100 workers are also consumer-bound
+  (9.3 ms/tile against a ~4 ms floor), so 2 is likely a win there too, but
+  it is **not** switched on until measured; `WINMOL_WORKERS_PER_GPU`
+  overrides for that measurement.
+- `CPU_ONLY`: 1.
+- `_reader_threads` divides `hw_cpu − 1` by the **total** worker count
+  (`gpu_workers × workers_per_gpu`); the per-worker single-GPU cap of 3
+  stays (each worker now needs ~56 tiles/s; 3 readers at 24 ms give 125).
+- RSS: a second interpreter + CUDA context ≈ +1.5–2 GB on the T14. The
+  (ii) exception for the coordinator/worker split is extended to it.
+
+Gate: T14 R13 probe, pinned nothing, ≥ 9 windows: `main` 2,512 → #58
+4,700 → target **≥ 5,800 tiles/min** with the same bit-identical output as
+Task 7 proved (the shard boundary moves; assembly is order-independent).
