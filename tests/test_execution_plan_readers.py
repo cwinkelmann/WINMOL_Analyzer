@@ -17,7 +17,7 @@ if str(REPO) not in sys.path:
 
 from classes.Config import Config  # noqa: E402
 from classes.ExecutionPlan import (  # noqa: E402
-    _reader_threads, build_execution_plan)
+    _reader_threads, _workers_per_gpu, build_execution_plan)
 
 
 @pytest.mark.parametrize("hw_cpu,n_gpu,cpu_only,expected", [
@@ -90,7 +90,10 @@ def test_multi_gpu_keeps_deep_queue_and_full_chunk():
 
 
 def test_single_gpu_caps_queue_depth_and_reader_chunk():
-    plan = _plan(12, 1, [16.0], producer_queue_batches=8)
+    # 6.0 GB keeps workers_per_gpu at 1 (below the 8.0 GB threshold in
+    # _workers_per_gpu) so this isolates the queue/chunk cap from the
+    # two-worker behaviour, which gets its own tests below.
+    plan = _plan(12, 1, [6.0], producer_queue_batches=8)
     assert plan.producer_queue_batches == 4
     assert plan.reader_chunk == 8
 
@@ -99,3 +102,51 @@ def test_cpu_only_caps_queue_depth_and_reader_chunk():
     plan = _plan(12, 0, producer_queue_batches=8)
     assert plan.producer_queue_batches <= 4
     assert plan.reader_chunk == 4
+
+
+# --- G3: workers_per_gpu -----------------------------------------------
+
+@pytest.mark.parametrize("scen,gpu_mem_gb,expected", [
+    ('gpu', 16.0, 2),        # T14: 4080 SUPER
+    ('gpu', 8.0, 2),         # threshold inclusive
+    ('gpu', 6.0, 1),         # too little VRAM for two contexts
+    ('multi_gpu_dgx', 80.0, 1),  # carrot: unchanged until measured
+    ('cpu_only', 0.0, 1),
+])
+def test_workers_per_gpu_rule(scen, gpu_mem_gb, expected):
+    assert _workers_per_gpu(scen, gpu_mem_gb) == expected
+
+
+def test_workers_per_gpu_env_override_wins(monkeypatch):
+    monkeypatch.setenv('WINMOL_WORKERS_PER_GPU', '3')
+    assert _workers_per_gpu('gpu', 16.0) == 3
+    assert _workers_per_gpu('multi_gpu_dgx', 80.0) == 3
+    monkeypatch.setenv('WINMOL_WORKERS_PER_GPU', 'two')
+    assert _workers_per_gpu('gpu', 16.0) == 2      # ignored, rule applies
+
+
+def test_single_gpu_two_workers_shrink_chunk_batch_and_readers():
+    plan = _plan(12, 1, [16.0])
+    assert plan.workers_per_gpu == 2
+    assert plan.reader_chunk == 4
+    assert plan.prediction_batch_size <= 2
+    # 11 cores / 2 workers = 5 -> per-worker cap 3
+    assert plan.producer_workers == 3
+
+
+def test_single_gpu_small_card_keeps_one_worker():
+    plan = _plan(12, 1, [6.0])
+    assert plan.workers_per_gpu == 1
+    assert plan.reader_chunk == 8
+
+
+def test_single_gpu_few_cores_split_readers_across_workers():
+    # 5 cores: (5-1)//2 = 2 readers per worker, not 3
+    plan = _plan(5, 1, [16.0])
+    assert plan.workers_per_gpu == 2
+    assert plan.producer_workers == 2
+
+
+def test_multi_gpu_and_cpu_only_keep_one_worker_per_device():
+    assert _plan(32, 8, [80.0]).workers_per_gpu == 1
+    assert _plan(12, 0).workers_per_gpu == 1

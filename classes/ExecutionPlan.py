@@ -70,6 +70,13 @@ class ExecutionPlan:
     #: so a smaller chunk bounds its in-flight memory without touching
     #: the read-ahead depth logic.
     reader_chunk: int
+    #: Prediction worker processes per GPU. 2 on single-GPU machines with
+    #: enough VRAM: one worker's CPU-side work (upload, crop, binarise,
+    #: result pickling) leaves the card idle ~40% of the time under one
+    #: GIL; a second process overlaps it. Measured T14 (4080 SUPER):
+    #: 1 proc 5,731 -> 2 procs 6,756 tiles/min, 3+ add nothing. See the
+    #: spec amendment of 2026-09-16.
+    workers_per_gpu: int = 1
     #: Human-readable notes for every knob the planner reduced below what
     #: the config asked for. Empty when nothing was overridden.
     capped: list = field(default_factory=list)
@@ -309,6 +316,27 @@ READERS_MAX = 16
 READERS_MAX_SINGLE_GPU = 3
 ENV_READERS = 'WINMOL_PREDICTION_READERS'
 
+ENV_WORKERS_PER_GPU = 'WINMOL_WORKERS_PER_GPU'
+#: Two CUDA contexts + onnxruntime arenas at batch <= 4 measured <= 3.4 GB
+#: each on the T14; below this VRAM a second worker risks the OOM back-off
+#: fighting itself.
+WORKERS_PER_GPU_MIN_VRAM_GB = 8.0
+
+
+def _workers_per_gpu(scen: str, gpu_mem_gb: float) -> int:
+    override = os.environ.get(ENV_WORKERS_PER_GPU, '').strip()
+    if override:
+        try:
+            return max(1, int(override))
+        except ValueError:
+            pass
+    if scen == SINGLE_GPU and gpu_mem_gb >= WORKERS_PER_GPU_MIN_VRAM_GB:
+        return 2
+    # Multi-GPU is left at 1 until measured on carrot (its H100 workers
+    # are consumer-bound too, but the reader/RSS budget differs); the env
+    # override exists for that measurement.
+    return 1
+
 
 def _reader_threads(hw_cpu: int, n_gpu: int, cpu_only: bool) -> int:
     override = os.environ.get(ENV_READERS, '').strip()
@@ -380,6 +408,7 @@ def build_execution_plan(
         # produced.
         producer_queue_batches = max(2, min(4, producer_queue_batches))
         reader_chunk = 4
+        workers_per_gpu = 1
         producer_workers = _reader_threads(hw_cpu, 1, True)
         progress_interval_s = float(
             _cfg(config, 'progress_interval_s_cpu', 45.0)
@@ -423,8 +452,20 @@ def build_execution_plan(
         # overrides the huge_nodes_job bump above on purpose, the memory
         # gate applies regardless of job size on single-GPU boxes.
         producer_queue_batches = max(2, min(4, producer_queue_batches))
-        reader_chunk = 8
-        producer_workers = _reader_threads(hw_cpu, 1, False)
+        workers_per_gpu = _workers_per_gpu(scen, gpu_mem_gb)
+        if workers_per_gpu > 1:
+            # Two workers share the card: batch 1-2 is fastest there (see
+            # spec amendment), so cap the batch and the autotune sample.
+            prediction_batch_size = min(prediction_batch_size, 2)
+            reader_chunk = 4
+        else:
+            reader_chunk = 8
+        producer_workers = _reader_threads(
+            hw_cpu, gpu_workers * workers_per_gpu, False)
+        # Both workers still share one GPU: reader threads contend for the
+        # same card/GIL regardless of how many worker processes read for
+        # it, so the single-GPU ceiling applies per worker too.
+        producer_workers = min(producer_workers, READERS_MAX_SINGLE_GPU)
         progress_interval_s = float(
             _cfg(config, 'progress_interval_s_gpu', 60.0)
         )
@@ -474,7 +515,9 @@ def build_execution_plan(
             int(_cfg(config, 'producer_queue_batches', 8)),
         )
         reader_chunk = 12
-        producer_workers = _reader_threads(hw_cpu, gpu_workers, False)
+        workers_per_gpu = _workers_per_gpu(scen, gpu_mem_gb)
+        producer_workers = _reader_threads(
+            hw_cpu, gpu_workers * workers_per_gpu, False)
         progress_interval_s = float(
             _cfg(config, 'progress_interval_s_multi_gpu', 20.0)
         )
@@ -511,5 +554,6 @@ def build_execution_plan(
         vector_inner_workers=vector_inner_workers,
         keep_temp=keep_temp,
         reader_chunk=reader_chunk,
+        workers_per_gpu=workers_per_gpu,
         capped=capped,
     )
