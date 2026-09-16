@@ -285,6 +285,8 @@ keeps its own reader pool. Sizing:
   stays (each worker now needs ~56 tiles/s; 3 readers at 24 ms give 125).
 - RSS: a second interpreter + CUDA context ≈ +1.5–2 GB on the T14. The
   (ii) exception for the coordinator/worker split is extended to it.
+- `winmol_batch.py` pins its children to `WINMOL_WORKERS_PER_GPU=1` unless
+  set: the batch runner already parallelises per card.
 
 Gate: T14 R13 probe, pinned nothing, ≥ 9 windows: `main` 2,512 → #58
 4,700 → target **≥ 5,800 tiles/min** with the same bit-identical output as

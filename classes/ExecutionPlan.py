@@ -338,7 +338,18 @@ def _workers_per_gpu(scen: str, gpu_mem_gb: float) -> int:
     return 1
 
 
-def _reader_threads(hw_cpu: int, n_gpu: int, cpu_only: bool) -> int:
+def _reader_threads(hw_cpu: int, n_gpu: int, cpu_only: bool,
+                    single_gpu: bool = False) -> int:
+    """Reader threads per prediction worker.
+
+    ``single_gpu=True`` marks that every worker being divided across
+    (``n_gpu``) still shares ONE physical card -- e.g. two
+    ``workers_per_gpu`` processes on a single-GPU box pass
+    ``n_gpu=2`` here to split cores, but the READERS_MAX_SINGLE_GPU
+    ceiling still applies per worker, since both contend for the same
+    card/GIL. The env override always wins first, unclamped, so
+    ``WINMOL_PREDICTION_READERS`` can probe past that ceiling.
+    """
     override = os.environ.get(ENV_READERS, '').strip()
     if override:
         try:
@@ -347,7 +358,9 @@ def _reader_threads(hw_cpu: int, n_gpu: int, cpu_only: bool) -> int:
             pass
     if cpu_only:
         return 1
-    readers_max = READERS_MAX_SINGLE_GPU if n_gpu == 1 else READERS_MAX
+    readers_max = (
+        READERS_MAX_SINGLE_GPU if (single_gpu or n_gpu == 1) else READERS_MAX
+    )
     # hw_cpu - 1: the one core the plan already leaves for the OS and the
     # coordinator. No vector-phase reserve: the phases are sequential.
     return max(1, min(readers_max,
@@ -456,16 +469,23 @@ def build_execution_plan(
         if workers_per_gpu > 1:
             # Two workers share the card: batch 1-2 is fastest there (see
             # spec amendment), so cap the batch and the autotune sample.
+            if prediction_batch_size > 2:
+                capped.append(
+                    "prediction_batch_size "
+                    f"{prediction_batch_size} -> 2 (two workers per GPU: "
+                    "batch 1-2 is fastest on a shared card)"
+                )
             prediction_batch_size = min(prediction_batch_size, 2)
             reader_chunk = 4
         else:
             reader_chunk = 8
-        producer_workers = _reader_threads(
-            hw_cpu, gpu_workers * workers_per_gpu, False)
         # Both workers still share one GPU: reader threads contend for the
         # same card/GIL regardless of how many worker processes read for
-        # it, so the single-GPU ceiling applies per worker too.
-        producer_workers = min(producer_workers, READERS_MAX_SINGLE_GPU)
+        # it, so the single-GPU ceiling applies per worker too (honoured
+        # inside _reader_threads via single_gpu=True, ahead of the env
+        # override check).
+        producer_workers = _reader_threads(
+            hw_cpu, gpu_workers * workers_per_gpu, False, single_gpu=True)
         progress_interval_s = float(
             _cfg(config, 'progress_interval_s_gpu', 60.0)
         )

@@ -121,6 +121,10 @@ def run_winmol(input_image: str, model_path: str, output_folder: str,
         # the well-tested path -- instead of every concurrent job trying to
         # spread itself across all of them and contending.
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        # The batch runner already supplies process-level parallelism per
+        # card (one --jobs child per GPU); a user who wants the plan's own
+        # two-workers-per-card rule too sets WINMOL_WORKERS_PER_GPU=2.
+        env.setdefault("WINMOL_WORKERS_PER_GPU", "1")
     if cpu_budget is not None:
         # Each child plans against the FULL machine; with N jobs the
         # CPU-bound vector phases would oversubscribe the cores N-fold.

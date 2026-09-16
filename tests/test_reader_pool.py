@@ -442,10 +442,11 @@ def test_worker_sets_cuda_visible_devices_when_unset(monkeypatch, tmp_path):
 def test_two_workers_with_the_same_gpu_id_both_pin_device_zero(
         monkeypatch, tmp_path):
     """F4 + workers_per_gpu: gpu_ids=[0, 0] means two `prediction_worker`
-    calls both with gpu_id=0 -- each independently pins
-    CUDA_VISIBLE_DEVICES to "0"; the second call is unaffected by
-    whatever the first left in the environment."""
-    monkeypatch.delenv('CUDA_VISIBLE_DEVICES', raising=False)
+    calls both with gpu_id=0. Each call starts from a clean environment
+    (CUDA_VISIBLE_DEVICES unset before every call, not just once) and
+    independently pins it to "0" -- this is what a real second worker
+    process sees, since each is a fresh interpreter, not a leftover env
+    from a prior call in the same process."""
     seen = []
 
     def fake_load(p, c):
@@ -454,6 +455,7 @@ def test_two_workers_with_the_same_gpu_id_both_pin_device_zero(
     monkeypatch.setattr("utils.IO.load_model_from_path", fake_load)
 
     for _ in range(2):
+        monkeypatch.delenv('CUDA_VISIBLE_DEVICES', raising=False)
         _minimal_worker_run(monkeypatch, tmp_path, gpu_id=0)
     assert seen == ['0', '0']
 

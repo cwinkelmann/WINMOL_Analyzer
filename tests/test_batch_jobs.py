@@ -122,6 +122,39 @@ def test_cpu_budget_lands_in_child_overrides(monkeypatch):
     assert overrides == {"max_cpu_workers": 6}
 
 
+# --- I2: winmol_batch pins its own children to one prediction worker per
+# GPU by default -- the batch runner already parallelises per card via
+# --jobs, so the plan's two-workers-per-gpu rule would stack a second
+# layer of parallelism on top of it unless told not to.
+
+def test_child_env_defaults_workers_per_gpu_to_one(monkeypatch):
+    captured = {}
+
+    def _fake_subprocess_run(command, check, env):
+        captured["env"] = env
+
+    monkeypatch.setattr(winmol_batch.subprocess, "run", _fake_subprocess_run)
+    monkeypatch.delenv("WINMOL_WORKERS_PER_GPU", raising=False)
+
+    winmol_batch.run_winmol("/in/a.tif", "/m.onnx", "/tmp/out", gpu_id=0)
+
+    assert captured["env"]["WINMOL_WORKERS_PER_GPU"] == "1"
+
+
+def test_child_env_preserves_a_user_set_workers_per_gpu(monkeypatch):
+    captured = {}
+
+    def _fake_subprocess_run(command, check, env):
+        captured["env"] = env
+
+    monkeypatch.setattr(winmol_batch.subprocess, "run", _fake_subprocess_run)
+    monkeypatch.setenv("WINMOL_WORKERS_PER_GPU", "2")
+
+    winmol_batch.run_winmol("/in/a.tif", "/m.onnx", "/tmp/out", gpu_id=0)
+
+    assert captured["env"]["WINMOL_WORKERS_PER_GPU"] == "2"
+
+
 def test_cpu_budget_does_not_override_an_explicit_user_cap():
     merged = winmol_batch._with_cpu_budget('{"max_cpu_workers": 2}', 8)
     assert json.loads(merged) == {"max_cpu_workers": 2}

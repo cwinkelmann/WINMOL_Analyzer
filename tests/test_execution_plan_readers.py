@@ -20,19 +20,25 @@ from classes.ExecutionPlan import (  # noqa: E402
     _reader_threads, _workers_per_gpu, build_execution_plan)
 
 
-@pytest.mark.parametrize("hw_cpu,n_gpu,cpu_only,expected", [
-    (224, 8, False, 16),    # carrot: 223 // 8 = 27 -> cap 16
-    (12, 1, False, 3),      # T14: single-GPU cap, not 11
-    (224, 1, False, 3),     # single-GPU cap dominates even with cores to spare
-    (4, 1, False, 3),
-    (2, 1, False, 1),       # floor
-    (1, 1, False, 1),       # floor, never 0
-    (64, 2, False, 16),     # 63 // 2 = 31 -> cap
-    (224, 8, True, 1),      # CPU-only ignores cores
-    (12, 1, True, 1),
+@pytest.mark.parametrize("hw_cpu,n_gpu,cpu_only,single_gpu,expected", [
+    (224, 8, False, False, 16),    # carrot: 223 // 8 = 27 -> cap 16
+    (12, 1, False, False, 3),      # T14: single-GPU cap, not 11
+    (224, 1, False, False, 3),     # single-GPU cap dominates, cores to spare
+    (4, 1, False, False, 3),
+    (2, 1, False, False, 1),       # floor
+    (1, 1, False, False, 1),       # floor, never 0
+    (64, 2, False, False, 16),     # 63 // 2 = 31 -> cap
+    (224, 8, True, False, 1),      # CPU-only ignores cores
+    (12, 1, True, False, 1),
+    # single_gpu=True: two workers_per_gpu processes split n_gpu=2 for
+    # core division, but still share one physical card, so the
+    # single-GPU ceiling (3) applies per worker, not the multi-GPU one.
+    (12, 2, False, True, 3),
+    (5, 2, False, True, 2),
 ])
-def test_reader_threads_rule(hw_cpu, n_gpu, cpu_only, expected):
-    assert _reader_threads(hw_cpu, n_gpu, cpu_only) == expected
+def test_reader_threads_rule(hw_cpu, n_gpu, cpu_only, single_gpu, expected):
+    assert _reader_threads(hw_cpu, n_gpu, cpu_only,
+                           single_gpu=single_gpu) == expected
 
 
 def test_env_override_wins(monkeypatch):
@@ -150,3 +156,29 @@ def test_single_gpu_few_cores_split_readers_across_workers():
 def test_multi_gpu_and_cpu_only_keep_one_worker_per_device():
     assert _plan(32, 8, [80.0]).workers_per_gpu == 1
     assert _plan(12, 0).workers_per_gpu == 1
+
+
+# --- I1: WINMOL_PREDICTION_READERS must not be clamped away on a
+# two-worker single-GPU plan (base 075d43e honoured it as 6; a post-hoc
+# min(producer_workers, READERS_MAX_SINGLE_GPU) silently re-clamped it) --
+
+def test_reader_env_override_wins_on_single_gpu_regardless_of_workers(
+        monkeypatch):
+    monkeypatch.setenv('WINMOL_PREDICTION_READERS', '6')
+    assert _plan(12, 1, [16.0]).producer_workers == 6   # two workers/gpu
+    assert _plan(12, 1, [6.0]).producer_workers == 6    # one worker/gpu
+
+
+# --- I3: prediction_batch_size must record a `capped` note when the
+# two-workers-per-gpu rule actually lowers it -----------------------------
+
+def test_two_workers_batch_cap_is_recorded():
+    plan = _plan(12, 1, [16.0], prediction_batch_gpu=4)
+    assert plan.prediction_batch_size == 2
+    assert any('prediction_batch_size' in note for note in plan.capped)
+
+
+def test_two_workers_batch_cap_not_recorded_when_already_at_or_below_two():
+    plan = _plan(12, 1, [16.0], prediction_batch_gpu=1)
+    assert plan.prediction_batch_size == 1
+    assert not any('prediction_batch_size' in note for note in plan.capped)
