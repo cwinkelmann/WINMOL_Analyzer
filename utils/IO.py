@@ -439,6 +439,9 @@ def stems_to_gdf(stems, profile):
             "l_json": _jsonify_list(getattr(s, "segment_length_list", [])),
             "v_json": _jsonify_list(getattr(s, "segment_volume_list", [])),
         })
+        # Stems from manual centre lines keep the ID they were drawn with.
+        if hasattr(s, "source_id"):
+            rows[-1]["source_id"] = str(s.source_id)
 
     return gpd.GeoDataFrame(rows, geometry=geoms, crs=crs)
 
