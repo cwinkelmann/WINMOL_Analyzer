@@ -110,6 +110,21 @@ python -u winmol_run.py <model.onnx> <input.tif> <stem_map.tif> <out_prefix> Nod
 `Stems` writes only the binary stem-map raster; `Trees` / `Nodes` also
 vectorise into a GeoPackage.
 
+### Manual labels instead of a prediction
+
+```bash
+# the full vectoriser on a hand-made mask
+python winmol_from_labels.py --mask stems.gpkg --out plot/trees
+
+# diameters, lengths and volumes along hand-drawn centre lines
+python winmol_from_labels.py --mask stems.gpkg --lines lines.gpkg --out plot/trees
+```
+
+The mask is a GeoTIFF or polygons. Use `--reference <stem_map.tif>` to rasterise polygons on the
+grid of the stem map you compare against. Both routes write the usual GeoPackage layers and
+`<out>_summary.json` with plot totals. A node where a line leaves the mask gets diameter 0, and
+`nodes_zero_diameter` counts them.
+
 ### A folder of orthomosaics
 
 ```bash
