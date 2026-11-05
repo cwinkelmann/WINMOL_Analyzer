@@ -12,8 +12,8 @@ import numpy as np
 import rasterio
 import rasterio.features
 from rasterio.transform import from_origin
-from shapely.geometry import LineString, Point
-from shapely.ops import linemerge, unary_union
+from shapely.geometry import LineString, MultiLineString, Point
+from shapely.ops import linemerge
 
 from classes.Stem import Stem
 from utils import IO
@@ -108,12 +108,20 @@ def _source_id(value, row):
 
 
 def _line_parts(geoms):
-    """Connected pieces of one stem's lines, with touching lines joined end to end."""
-    joined = unary_union(geoms)
-    merged = linemerge(joined) if hasattr(joined, "geoms") else joined
+    """One stem's lines as drawn, joined only where two of them share an endpoint.
+
+    Lines that cross or fork stay whole. Noding them first would cut them at every crossing and
+    add short parts that were never drawn.
+    """
+    drawn = []
+    for geom in geoms:
+        pieces = geom.geoms if hasattr(geom, "geoms") else [geom]
+        drawn += [p for p in pieces if p.geom_type == "LineString" and p.length > 0]
+    if not drawn:
+        return []
+    merged = linemerge(MultiLineString(drawn))
     parts = merged.geoms if hasattr(merged, "geoms") else [merged]
-    return sorted((p for p in parts if p.geom_type == "LineString" and p.length > 0),
-                  key=lambda p: tuple(p.coords[0]))
+    return sorted(parts, key=lambda p: tuple(p.coords[0]))
 
 
 def stems_from_lines(lines, id_field, spacing, aoi=None):

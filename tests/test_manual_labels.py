@@ -6,7 +6,7 @@ import geopandas as gpd
 import numpy as np
 import pytest
 import rasterio
-from shapely.geometry import LineString, box
+from shapely.geometry import LineString, MultiPolygon, box
 
 import winmol_from_labels as cli
 from classes.Config import Config
@@ -62,6 +62,34 @@ def test_separated_lines_with_one_id_stay_parts_of_one_stem():
     stems = ML.stems_from_lines(lines, "ID", 0.5)
     assert [s.source_id for s in stems] == ["7", "7"]
     assert [s.part for s in stems] == [0, 1]
+
+
+def test_crossing_lines_with_one_id_are_not_cut():
+    lines = gpd.GeoDataFrame({"ID": [7, 7]}, geometry=[
+        LineString([(0, 0), (10, 0)]), LineString([(5, -5), (5, 5)])], crs=CRS)
+    stems = ML.stems_from_lines(lines, "ID", 0.5)
+    assert sorted(round(s.path.length, 6) for s in stems) == [10.0, 10.0]
+
+
+def test_a_branch_touching_mid_line_does_not_cut_the_stem():
+    lines = gpd.GeoDataFrame({"ID": [7, 7]}, geometry=[
+        LineString([(0, 0), (10, 0)]), LineString([(5, 0), (5, 3)])], crs=CRS)
+    stems = ML.stems_from_lines(lines, "ID", 0.5)
+    assert sorted(round(s.path.length, 6) for s in stems) == [3.0, 10.0]
+
+
+def test_three_lines_meeting_at_an_endpoint_stay_separate():
+    lines = gpd.GeoDataFrame({"ID": [7, 7, 7]}, geometry=[
+        LineString([(0, 0), (5, 0)]), LineString([(5, 0), (10, 0)]), LineString([(5, 0), (5, 3)])],
+        crs=CRS)
+    assert len(ML.stems_from_lines(lines, "ID", 0.5)) == 3
+
+
+def test_a_line_clipped_into_two_pieces_stays_two_parts():
+    lines = gpd.GeoDataFrame({"ID": [7]}, geometry=[LineString([(0, 0), (10, 0)])], crs=CRS)
+    aoi = MultiPolygon([box(0, -1, 3, 1), box(6, -1, 10, 1)])
+    stems = ML.stems_from_lines(lines, "ID", 0.5, aoi=aoi)
+    assert sorted(round(s.path.length, 6) for s in stems) == [3.0, 4.0]
 
 
 def test_null_ids_are_never_merged():
