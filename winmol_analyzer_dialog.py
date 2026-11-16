@@ -922,6 +922,13 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         # size the batch and let the one-time autotune refine it.
         self.batchsize_spinBox.setValue(
             int(getattr(self.config, "prediction_batch_override", 0) or 0))
+        # Seed the vectorisation boxes from any WINMOL_CONFIG_OVERRIDES_JSON
+        # set in the shell, so the dialog shows what the run will use;
+        # editing a box afterwards overrides it per run.
+        for key, value in config_overrides.numeric_overrides(
+                os.environ.get(config_overrides.ENV_VAR),
+                config_overrides.VECTOR_KEYS).items():
+            setattr(self.config, key, value)
         self.minlength_doubleSpinBox.setValue(self.config.min_length)
         self.maxdistance_doubleSpinBox.setValue(self.config.max_distance)
         self.tolerance_doubleSpinBox.setValue(self.config.tolerance_angle)
@@ -935,23 +942,31 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         self.config.tolerance_angle = self.tolerance_doubleSpinBox.value()
         self.config.max_tree_height = self.maxtree_doubleSpinBox.value()
 
-    def _batch_override_env(self):
-        """Child environment pinning the prediction batch size, or ``{}``.
+    def _config_overrides_env(self):
+        """Child environment carrying the dialog's config values.
 
-        0 is "Auto" and injects nothing. Read here, on the GUI thread and
-        before the worker starts — no widget is ever touched from the
-        worker. Any WINMOL_CONFIG_OVERRIDES_JSON the user set themselves
-        is merged, not replaced.
+        The vectorisation spin boxes and the batch size are read here, on
+        the GUI thread and before the worker starts — no widget is ever
+        touched from the worker. The run command is positional arguments
+        only, so this env var is how the boxes reach the child at all.
+        Any WINMOL_CONFIG_OVERRIDES_JSON the user set themselves is
+        merged, not replaced; its other keys survive.
         """
+        values = {
+            "min_length": self.minlength_doubleSpinBox.value(),
+            "max_distance": self.maxdistance_doubleSpinBox.value(),
+            "tolerance_angle": self.tolerance_doubleSpinBox.value(),
+            "max_tree_height": self.maxtree_doubleSpinBox.value(),
+        }
         try:
-            value = int(self.batchsize_spinBox.value())
+            batch = int(self.batchsize_spinBox.value())
         except Exception:
-            return {}
-        env = config_overrides.batch_override_env(
-            value, os.environ.get(config_overrides.ENV_VAR))
-        if env:
+            batch = 0
+        env = config_overrides.gui_override_env(
+            values, batch, os.environ.get(config_overrides.ENV_VAR))
+        if batch >= 1:
             self.update_output_log(
-                f"Prediction batch size pinned to {value} tiles "
+                f"Prediction batch size pinned to {batch} tiles "
                 "(batch-size autotune skipped)."
             )
         return env
@@ -2086,7 +2101,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             # The run command is five positional arguments; the
             # environment is the only other channel that carries a config
             # value to the child.
-            env_extra.update(self._batch_override_env())
+            env_extra.update(self._config_overrides_env())
             if self._force_cpu:
                 # Issue #24: the user chose CPU after a GPU/cuDNN device
                 # failure. Pin the CPU provider for the child so the model

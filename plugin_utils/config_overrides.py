@@ -53,16 +53,50 @@ def set_default(existing, key, value) -> str:
     return json.dumps(overrides)
 
 
-def batch_override_env(batch, existing=None):
-    """``{ENV_VAR: ...}`` pinning the prediction batch size, or ``{}``.
+#: Config keys behind the dialog's vectorisation spin boxes.
+VECTOR_KEYS = (
+    "min_length",
+    "max_distance",
+    "tolerance_angle",
+    "max_tree_height",
+)
 
-    ``batch`` of 0/None means "Auto": nothing is injected and any value
-    the user set themselves is left exactly as it was.
+
+def gui_override_env(values, batch=None, existing=None):
+    """``{ENV_VAR: ...}`` carrying the dialog's config values, or ``{}``.
+
+    ``values`` go in as given — what the dialog shows is what the child
+    runs with. ``batch`` of 0/None means "Auto": no batch key is
+    injected. Keys the user set themselves in ``existing`` survive
+    unless the dialog sets them too.
+    """
+    updates = dict(values or {})
+    try:
+        if int(batch) >= 1:
+            updates["prediction_batch_override"] = int(batch)
+    except (TypeError, ValueError):
+        pass
+    if not updates:
+        return {}
+    return {ENV_VAR: merge(updates, existing)}
+
+
+def numeric_overrides(existing, keys):
+    """The numeric values among ``keys`` in an existing env JSON.
+
+    Tolerant on purpose: it seeds the dialog's spin boxes at startup,
+    so shell input must never raise. Booleans are excluded (JSON true
+    is not a spacing or an angle).
     """
     try:
-        value = int(batch)
+        parsed = json.loads(existing or "")
     except (TypeError, ValueError):
         return {}
-    if value < 1:
+    if not isinstance(parsed, dict):
         return {}
-    return {ENV_VAR: merge({"prediction_batch_override": value}, existing)}
+    return {
+        key: parsed[key]
+        for key in keys
+        if isinstance(parsed.get(key), (int, float))
+        and not isinstance(parsed.get(key), bool)
+    }
