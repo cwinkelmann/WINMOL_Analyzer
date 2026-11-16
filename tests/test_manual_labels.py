@@ -5,6 +5,7 @@ import math
 
 import geopandas as gpd
 import numpy as np
+import pandas as pd
 import pytest
 import rasterio
 from shapely.geometry import LineString, MultiPolygon, box
@@ -119,6 +120,17 @@ def test_a_line_clipped_into_two_pieces_stays_two_parts():
 def test_null_ids_are_never_merged():
     lines = gpd.GeoDataFrame(
         {"ID": [None, None]},
+        geometry=[LineString([(0, 0), (5, 0)]), LineString([(5, 0), (10, 0)])],
+        crs=CRS,
+    )
+    stems = ML.stems_from_lines(lines, "ID", 0.5)
+    assert len({s.source_id for s in stems}) == 2
+
+
+def test_pandas_na_ids_are_never_merged():
+    # Nullable dtypes read back pd.NA, which is neither None nor NaN.
+    lines = gpd.GeoDataFrame(
+        {"ID": pd.array([pd.NA, pd.NA], dtype="Int64")},
         geometry=[LineString([(0, 0), (5, 0)]), LineString([(5, 0), (10, 0)])],
         crs=CRS,
     )

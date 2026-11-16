@@ -12,12 +12,11 @@ if os.environ.get("PYTHONHASHSEED") != "0":
     os.environ["PYTHONHASHSEED"] = "0"
     os.execv(sys.executable, [sys.executable, "-u"] + sys.argv)
 
-import json
 import shutil
 import subprocess
 import tempfile
 
-from classes.Config import Config
+from classes.Config import Config, apply_env_config_overrides
 from classes.ExecutionPlan import build_execution_plan
 from classes.HardwareInfo import HardwareInfo
 from classes.Timer import Timer
@@ -62,30 +61,7 @@ class ImageProcessing:
         self.apply_env_config_overrides()
 
     def apply_env_config_overrides(self):
-        raw = os.environ.get("WINMOL_CONFIG_OVERRIDES_JSON", "").strip()
-        if not raw:
-            return
-
-        try:
-            overrides = json.loads(raw)
-        except Exception as exc:
-            print(f"Invalid WINMOL_CONFIG_OVERRIDES_JSON: {exc}")
-            sys.exit(2)
-
-        if not isinstance(overrides, dict):
-            print(
-                "Invalid WINMOL_CONFIG_OVERRIDES_JSON: "
-                "top-level JSON must be an object."
-            )
-            sys.exit(2)
-
-        print("Applying config overrides from WINMOL_CONFIG_OVERRIDES_JSON:")
-        for key, value in overrides.items():
-            if not hasattr(self.config, key):
-                print(f"  [skip] unknown config key: {key}")
-                continue
-            setattr(self.config, key, value)
-            print(f"  {key:30} {value}")
+        apply_env_config_overrides(self.config)
 
     def detect_hardware(self):
         hardware = HardwareInfo.detect()

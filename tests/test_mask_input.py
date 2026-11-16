@@ -4,6 +4,8 @@ predicting one from an orthophoto."""
 
 import json
 import os
+import subprocess
+import sys
 
 import geopandas as gpd
 import numpy as np
@@ -54,6 +56,26 @@ def test_geographic_polygons_without_reference_are_refused(tmp_path):
         ML.load_mask(str(path), pixel_size=0.03)
 
 
+def test_raster_mask_with_reference_is_refused(tmp_path):
+    # A raster mask keeps its own grid; accepting --reference and then
+    # ignoring it would yield metrics on a grid the user did not ask for.
+    path = tmp_path / "mask.tif"
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        width=20,
+        height=20,
+        count=1,
+        dtype="uint8",
+        crs=CRS,
+        transform=from_origin(X0, Y0, 0.05, 0.05),
+    ) as dst:
+        dst.write(np.ones((1, 20, 20), np.uint8))
+    with pytest.raises(ValueError, match="reference"):
+        ML.load_mask(str(path), reference=str(tmp_path / "ref.tif"))
+
+
 def test_geographic_polygons_on_a_projected_reference_are_reprojected(tmp_path):
     poly = gpd.GeoDataFrame(
         geometry=[box(X0, Y0, X0 + 2, Y0 + 1)], crs=CRS
@@ -76,6 +98,47 @@ def test_geographic_polygons_on_a_projected_reference_are_reprojected(tmp_path):
     mask, grid = ML.load_mask(str(path), reference=str(ref), pixel_size=0.02)
     assert str(grid["crs"]) == CRS
     assert mask.sum() * 0.02**2 == pytest.approx(2.0, rel=0.05)
+
+
+# --- winmol_from_labels CLI ------------------------------------------------
+
+
+def test_importing_the_cli_does_not_reexec_the_process():
+    # The PYTHONHASHSEED pin must only re-exec when run as a script; on
+    # import it would restart the importing process (e.g. pytest).
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONHASHSEED"}
+    out = subprocess.run(
+        [sys.executable, "-c", "import winmol_from_labels; print('ok')"],
+        cwd=os.path.dirname(os.path.abspath(cli.__file__)),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert out.stdout.strip() == "ok"
+
+
+def test_lines_route_applies_env_config_overrides(tmp_path, monkeypatch):
+    mask, lines = write_scene(tmp_path)
+    monkeypatch.setenv(
+        "WINMOL_CONFIG_OVERRIDES_JSON", '{"measuring_point_spacing_m": 5.0}'
+    )
+    cli.main(
+        ["--mask", mask, "--lines", lines, "--out", str(tmp_path / "o" / "m")]
+    )
+    nodes = gpd.read_file(
+        tmp_path / "o" / "m.gpkg", layer="nodes", engine="pyogrio"
+    )
+    assert len(nodes) == 5  # 20 m line at 5 m spacing, both ends kept
+
+
+def test_dotted_output_prefix_is_kept(tmp_path):
+    mask, lines = write_scene(tmp_path)
+    cli.main(
+        ["--mask", mask, "--lines", lines, "--out", str(tmp_path / "plot.v2")]
+    )
+    assert (tmp_path / "plot.v2.gpkg").exists()
+    assert (tmp_path / "plot.v2_summary.json").exists()
 
 
 # --- mask-only route (no centre lines) -------------------------------------
@@ -116,6 +179,27 @@ def test_batch_mask_mode_matches_winmol_from_labels(tmp_path):
         tmp_path / "ref" / "mask.gpkg"
     )
     assert (tmp_path / "out" / "mask_summary.json").exists()
+
+
+def test_batch_forwards_pixel_size(tmp_path):
+    mask, lines = write_scene(tmp_path)
+    code = winmol_batch.main(
+        [
+            "--mask",
+            mask,
+            "--lines",
+            lines,
+            "--pixel-size",
+            "0.05",
+            "--output",
+            str(tmp_path / "out"),
+        ]
+    )
+    assert code == 0
+    summary = json.loads(
+        (tmp_path / "out" / "mask_summary.json").read_text()
+    )
+    assert summary["pixel_size_m"] == pytest.approx(0.05)
 
 
 def test_batch_refuses_model_and_mask_together(tmp_path, capsys):

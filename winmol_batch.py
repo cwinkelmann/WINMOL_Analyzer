@@ -237,13 +237,14 @@ def run_from_mask(args) -> int:
     command = [sys.executable, "-u", script, "--mask", args.mask, "--out", out]
     for flag, value in (
         ("--mask-layer", args.mask_layer),
+        ("--pixel-size", args.pixel_size),
         ("--lines", args.lines),
         ("--lines-layer", args.lines_layer),
         ("--reference", args.reference),
         ("--aoi", args.aoi),
     ):
         if value:
-            command += [flag, value]
+            command += [flag, str(value)]
     if args.lines:
         command += ["--id-field", args.id_field]
     env = dict(os.environ)
@@ -349,6 +350,12 @@ def main(argv: List[str]) -> int:
     )
     mask.add_argument(
         "--mask-layer", help="layer of a multi-layer polygon file"
+    )
+    mask.add_argument(
+        "--pixel-size",
+        type=float,
+        help="metres per pixel when rasterising a polygon mask "
+        "(default: the Analyzer's stem-map scale)",
     )
     mask.add_argument(
         "--lines",

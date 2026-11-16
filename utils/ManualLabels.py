@@ -11,6 +11,7 @@ import json
 
 import geopandas as gpd
 import numpy as np
+import pandas as pd
 import rasterio
 import rasterio.features
 from rasterio.transform import from_origin
@@ -117,6 +118,12 @@ def load_mask(path, layer=None, reference=None, pixel_size=None, crs=None):
     """(mask, grid) from a raster, or from polygons rasterised onto the
     given grid."""
     if path.lower().endswith(RASTER_SUFFIXES):
+        if reference:
+            raise ValueError(
+                f"{path}: --reference only applies to a polygon mask; a "
+                "raster mask keeps its own grid, so resample it onto the "
+                "reference grid first if they must match"
+            )
         with rasterio.open(path) as src:
             mask = (src.read(1) > 0).astype(np.uint8)
             return mask, _require_projected(
@@ -146,7 +153,7 @@ def resample_line(line, spacing):
 
 
 def _source_id(value, row):
-    if value is None or (isinstance(value, float) and np.isnan(value)):
+    if pd.isna(value):  # None, NaN, or a nullable dtype's pd.NA
         # an unlabelled line is its own stem, never merged with others
         return f"null-{row}"
     if isinstance(value, float) and value.is_integer():

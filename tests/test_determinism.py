@@ -20,7 +20,7 @@ def test_guard_precedes_project_imports():
     first_project_import = min(
         idx for idx in (
             source.index("from classes"),
-            source.index("import json"),
+            source.index("import shutil"),
         ) if idx != -1
     )
     assert guard_idx < first_project_import, (

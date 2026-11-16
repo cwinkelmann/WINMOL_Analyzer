@@ -1,3 +1,8 @@
+import json
+import os
+import sys
+
+
 class Config(object):
     # execution / backend selection
     prediction_backend = "auto"          # auto | cpu | single_gpu | multi_gpu
@@ -166,3 +171,32 @@ class Config(object):
         for key, val in self.to_dict().items():
             print(f"{key:30} {val}")
         print("\n")
+
+
+def apply_env_config_overrides(config):
+    """Apply $WINMOL_CONFIG_OVERRIDES_JSON, the plugin's channel for
+    per-run config, to `config`; exits on malformed JSON."""
+    raw = os.environ.get("WINMOL_CONFIG_OVERRIDES_JSON", "").strip()
+    if not raw:
+        return
+
+    try:
+        overrides = json.loads(raw)
+    except Exception as exc:
+        print(f"Invalid WINMOL_CONFIG_OVERRIDES_JSON: {exc}")
+        sys.exit(2)
+
+    if not isinstance(overrides, dict):
+        print(
+            "Invalid WINMOL_CONFIG_OVERRIDES_JSON: "
+            "top-level JSON must be an object."
+        )
+        sys.exit(2)
+
+    print("Applying config overrides from WINMOL_CONFIG_OVERRIDES_JSON:")
+    for key, value in overrides.items():
+        if not hasattr(config, key):
+            print(f"  [skip] unknown config key: {key}")
+            continue
+        setattr(config, key, value)
+        print(f"  {key:30} {value}")

@@ -28,14 +28,18 @@ import sys
 
 # Same pin as winmol_run.py, which the mask-only route imports: stem
 # connection depends on set order, so an unpinned run would not be
-# reproducible.
-if os.environ.get("PYTHONHASHSEED") != "0":
+# reproducible. Script runs only — on import the execv would restart
+# the importing process (importers set the env themselves).
+if __name__ == "__main__" and os.environ.get("PYTHONHASHSEED") != "0":
     os.environ["PYTHONHASHSEED"] = "0"
     os.execv(sys.executable, [sys.executable, "-u"] + sys.argv)
 
 from shapely.ops import unary_union  # noqa: E402
 
-from classes.Config import Config  # noqa: E402
+from classes.Config import (  # noqa: E402
+    Config,
+    apply_env_config_overrides,
+)
 from utils import ManualLabels as ML  # noqa: E402
 
 
@@ -105,6 +109,7 @@ def main(argv=None):
             "--aoi only applies with --lines; clip the mask before passing it"
         )
     config = Config()
+    apply_env_config_overrides(config)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     pixel_size = args.pixel_size or config.tile_size / config.img_width
     mask, grid = ML.load_mask(
