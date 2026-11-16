@@ -2,6 +2,7 @@
 (hand-drawn or predicted) from the batch CLI and the plugin, instead of
 predicting one from an orthophoto."""
 
+import json
 import os
 
 import geopandas as gpd
@@ -75,6 +76,21 @@ def test_geographic_polygons_on_a_projected_reference_are_reprojected(tmp_path):
     mask, grid = ML.load_mask(str(path), reference=str(ref), pixel_size=0.02)
     assert str(grid["crs"]) == CRS
     assert mask.sum() * 0.02**2 == pytest.approx(2.0, rel=0.05)
+
+
+# --- mask-only route (no centre lines) -------------------------------------
+
+
+def test_mask_only_mode_writes_all_layers_and_a_summary(tmp_path):
+    mask, _ = write_scene(tmp_path)
+    cli.main(["--mask", mask, "--out", str(tmp_path / "out" / "m")])
+    summary = json.loads((tmp_path / "out" / "m_summary.json").read_text())
+    assert summary["mode"] == "mask_only"
+    assert summary["stems"] >= 1
+    nodes = gpd.read_file(
+        tmp_path / "out" / "m.gpkg", layer="nodes", engine="pyogrio"
+    )
+    assert len(nodes) > 0
 
 
 # --- batch CLI -------------------------------------------------------------

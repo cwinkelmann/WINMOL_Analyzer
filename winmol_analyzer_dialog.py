@@ -2039,7 +2039,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         if problem:
             QtWidgets.QMessageBox.warning(self, "WINMOL Analyzer", problem)
             return
-        if self.env.get("status") != "ready" and self.python_exe is None:
+        if self.env.get("status") == "error" or self.python_exe is None:
             self.update_output_log(self.env.get("message") or "WINMOL environment is not available.")
             self._go_to_setup()
             return
