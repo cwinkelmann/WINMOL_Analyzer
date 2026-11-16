@@ -102,10 +102,14 @@ def write_mask(mask, grid, path):
 
 
 def _require_projected(grid, path):
-    # Lengths, diameters and volumes are measured in grid units; in degrees they would be silently wrong.
+    # Lengths, diameters and volumes are measured in grid units; in
+    # degrees they would be silently wrong.
     if grid["crs"] is None or not grid["crs"].is_projected:
-        raise ValueError(f"{path}: the mask grid must be in a projected CRS (metres), got {grid['crs']}; "
-                         "reproject it, or pass a projected --reference raster")
+        raise ValueError(
+            f"{path}: the mask grid must be in a projected CRS (metres), "
+            f"got {grid['crs']}; reproject it, or pass a projected "
+            "--reference raster"
+        )
     return grid
 
 

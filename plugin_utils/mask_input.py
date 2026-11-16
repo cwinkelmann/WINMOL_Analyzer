@@ -1,16 +1,21 @@
-"""Plugin side of the mask input: build and check the ``winmol_from_labels.py`` call.
+"""Plugin side of the mask input: build and check the
+``winmol_from_labels.py`` call.
 
-With "Existing stem mask" chosen, the dialog skips prediction and runs the downstream stages (vectorising, or
-measuring along given centre lines) on a stem mask the user already has: drawn by hand, or predicted by any model.
-Qt-free for unit testing; the dialog only collects the paths and starts the command.
+With "Existing stem mask" chosen, the dialog skips prediction and runs the
+downstream stages (vectorising, or measuring along given centre lines) on a
+stem mask the user already has: drawn by hand, or predicted by any model.
+Qt-free for unit testing; the dialog only collects the paths and starts the
+command.
 """
+
 import os
 
 FROM_LABELS = "winmol_from_labels.py"
 
 
 def split_layer_source(source):
-    """(path, layer name or None) from a QGIS layer source such as ``/d/a.gpkg|layername=stems``."""
+    """(path, layer name or None) from a QGIS layer source such as
+    ``/d/a.gpkg|layername=stems``."""
     path, _, rest = source.partition("|")
     layer = None
     for part in rest.split("|") if rest else []:
@@ -20,10 +25,27 @@ def split_layer_source(source):
     return path, layer
 
 
-def mask_command(python_exe, plugin_dir, mask, out_prefix, mask_layer=None, lines=None, lines_layer=None,
-                 id_field="ID"):
-    """The child command; ``out_prefix`` gets ``.gpkg`` (stems, vectors, nodes) and ``_summary.json``."""
-    cmd = [python_exe, "-u", os.path.join(plugin_dir, FROM_LABELS), "--mask", mask, "--out", out_prefix]
+def mask_command(
+    python_exe,
+    plugin_dir,
+    mask,
+    out_prefix,
+    mask_layer=None,
+    lines=None,
+    lines_layer=None,
+    id_field="ID",
+):
+    """The child command; ``out_prefix`` gets ``.gpkg`` (stems, vectors,
+    nodes) and ``_summary.json``."""
+    cmd = [
+        python_exe,
+        "-u",
+        os.path.join(plugin_dir, FROM_LABELS),
+        "--mask",
+        mask,
+        "--out",
+        out_prefix,
+    ]
     if mask_layer:
         cmd += ["--mask-layer", mask_layer]
     if lines:

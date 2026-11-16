@@ -4,9 +4,11 @@
 - Reads available models from config.json (repo root).
 - Runs winmol_run.py for all *.tif / *.tiff in the input folder.
 - Optionally merges tiled outputs with utils.IO.merge_and_filter_tiled_results.
-- With --mask instead of a model: skips prediction and runs the downstream stages on an existing stem mask
-  (hand-drawn or predicted; raster or polygons), optionally measuring along given centre lines (--lines).
-  This is winmol_from_labels.py; the output is <output>/<mask name>.gpkg and <mask name>_summary.json.
+- With --mask instead of a model: skips prediction and runs the downstream
+  stages on an existing stem mask (hand-drawn or predicted; raster or
+  polygons), optionally measuring along given centre lines (--lines).
+  This is winmol_from_labels.py; the output is <output>/<mask name>.gpkg
+  and <mask name>_summary.json.
 """
 
 import argparse
@@ -223,14 +225,23 @@ def process_orthos(orthos, model_path, output_folder, jobs=1,
 
 
 def run_from_mask(args) -> int:
-    """Downstream stages on an existing stem mask, in a child like run_winmol (same PYTHONHASHSEED pin)."""
+    """Downstream stages on an existing stem mask, in a child like
+    run_winmol (same PYTHONHASHSEED pin)."""
     os.makedirs(args.output, exist_ok=True)
-    out = os.path.join(args.output, os.path.splitext(os.path.basename(args.mask))[0])
-    command = [sys.executable, "-u", os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                                   "winmol_from_labels.py"), "--mask", args.mask, "--out", out]
-    for flag, value in (("--mask-layer", args.mask_layer), ("--lines", args.lines),
-                        ("--lines-layer", args.lines_layer), ("--reference", args.reference),
-                        ("--aoi", args.aoi)):
+    out = os.path.join(
+        args.output, os.path.splitext(os.path.basename(args.mask))[0]
+    )
+    script = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "winmol_from_labels.py"
+    )
+    command = [sys.executable, "-u", script, "--mask", args.mask, "--out", out]
+    for flag, value in (
+        ("--mask-layer", args.mask_layer),
+        ("--lines", args.lines),
+        ("--lines-layer", args.lines_layer),
+        ("--reference", args.reference),
+        ("--aoi", args.aoi),
+    ):
         if value:
             command += [flag, value]
     if args.lines:
@@ -328,14 +339,34 @@ def main(argv: List[str]) -> int:
     )
 
     mask = parser.add_argument_group(
-        "start from an existing stem mask (instead of a model and orthomosaics)")
-    mask.add_argument("--mask", help="stem mask: GeoTIFF (>0 = stem) or polygon file; skips prediction")
-    mask.add_argument("--mask-layer", help="layer of a multi-layer polygon file")
-    mask.add_argument("--lines", help="centre lines to measure along; without them the vectoriser finds the lines")
+        "start from an existing stem mask "
+        "(instead of a model and orthomosaics)"
+    )
+    mask.add_argument(
+        "--mask",
+        help="stem mask: GeoTIFF (>0 = stem) or polygon file; "
+        "skips prediction",
+    )
+    mask.add_argument(
+        "--mask-layer", help="layer of a multi-layer polygon file"
+    )
+    mask.add_argument(
+        "--lines",
+        help="centre lines to measure along; without them the vectoriser "
+        "finds the lines",
+    )
     mask.add_argument("--lines-layer", help="layer of the centre-line file")
-    mask.add_argument("--id-field", default="ID", help="stem ID field of the lines (default: ID)")
-    mask.add_argument("--reference", help="raster whose grid polygons are rasterised on")
-    mask.add_argument("--aoi", help="clip the centre lines to this polygon (with --lines)")
+    mask.add_argument(
+        "--id-field",
+        default="ID",
+        help="stem ID field of the lines (default: ID)",
+    )
+    mask.add_argument(
+        "--reference", help="raster whose grid polygons are rasterised on"
+    )
+    mask.add_argument(
+        "--aoi", help="clip the centre lines to this polygon (with --lines)"
+    )
 
     args = parser.parse_args(argv)
 
@@ -344,7 +375,10 @@ def main(argv: List[str]) -> int:
         return 0
 
     if args.lines and not args.mask:
-        parser.error("--lines needs --mask (centre lines are measured on a given stem mask)")
+        parser.error(
+            "--lines needs --mask "
+            "(centre lines are measured on a given stem mask)"
+        )
     if args.mask and args.model:
         parser.error("give either a model or --mask, not both")
     if not args.model and not args.mask:
