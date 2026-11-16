@@ -40,6 +40,10 @@ REQUIRED = [
     "WINMOL_Analyzer/plugin_utils/model_status.py",
     "WINMOL_Analyzer/plugin_utils/output_selection.py",
     "WINMOL_Analyzer/plugin_utils/config_overrides.py",
+    # the "Existing stem mask" input runs these in the child
+    "WINMOL_Analyzer/plugin_utils/mask_input.py",
+    "WINMOL_Analyzer/winmol_from_labels.py",
+    "WINMOL_Analyzer/utils/ManualLabels.py",
     # rc11-parity modules
     "WINMOL_Analyzer/plugin_utils/py311.py",
     "WINMOL_Analyzer/plugin_utils/autotune_cache.py",

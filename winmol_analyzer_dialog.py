@@ -54,6 +54,7 @@ from .plugin_utils import (
 )
 from .plugin_utils.model_registry import load_registry
 from .plugin_utils.output_selection import gpkg_layers_for, process_type_for
+from .plugin_utils import mask_input
 from .plugin_utils.run_progress import RunProgress
 from .tasks_threads import (
     EnvRemoveWorker,
@@ -1083,6 +1084,122 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
                 pass
         except Exception as exc:                       # pragma: no cover - GUI
             print("WINMOL: could not add layer selector:", exc)
+        self._add_mask_input_controls()
+
+    def _add_mask_input_controls(self):
+        """Input choice: predict from an orthophoto with a model (default), or
+        start from an existing stem mask (hand-drawn or from another model),
+        optionally with centre lines to measure along. The mask route runs
+        winmol_from_labels.py (plugin_utils.mask_input)."""
+        self.mask_mode_radio = None
+        try:
+            from qgis.gui import QgsMapLayerComboBox
+            from qgis.core import QgsMapLayerProxyModel
+            box = QtWidgets.QGroupBox("Input", self)
+            lay = QtWidgets.QGridLayout(box)
+            self.ortho_mode_radio = QtWidgets.QRadioButton("Orthophoto + model", box)
+            self.mask_mode_radio = QtWidgets.QRadioButton("Existing stem mask", box)
+            self.ortho_mode_radio.setChecked(True)
+            self.mask_mode_radio.setToolTip(
+                "Skip prediction: vectorise and measure a stem mask you already "
+                "have (raster > 0 = stem, or stem polygons), e.g. drawn by hand.")
+            lay.addWidget(self.ortho_mode_radio, 0, 0)
+            lay.addWidget(self.mask_mode_radio, 0, 1, 1, 2)
+
+            self.mask_layer_combo = QgsMapLayerComboBox(box)
+            self.mask_layer_combo.setFilters(
+                QgsMapLayerProxyModel.RasterLayer | QgsMapLayerProxyModel.PolygonLayer)
+            self.mask_layer_combo.setAllowEmptyLayer(True)
+            self.mask_lineEdit = QtWidgets.QLineEdit(box)
+            self.mask_lineEdit.setPlaceholderText("or a GeoTIFF / polygon file")
+            mask_button = QtWidgets.QToolButton(box)
+            mask_button.setText("...")
+            mask_button.clicked.connect(self._file_dialog_mask)
+            lay.addWidget(QtWidgets.QLabel("Stem mask:", box), 1, 0)
+            lay.addWidget(self.mask_layer_combo, 1, 1, 1, 2)
+            lay.addWidget(self.mask_lineEdit, 2, 1)
+            lay.addWidget(mask_button, 2, 2)
+
+            self.lines_layer_combo = QgsMapLayerComboBox(box)
+            self.lines_layer_combo.setFilters(QgsMapLayerProxyModel.LineLayer)
+            self.lines_layer_combo.setAllowEmptyLayer(True)
+            self.lines_layer_combo.setToolTip(
+                "Optional. With centre lines, diameters, lengths and volumes are "
+                "measured along them; without, the vectoriser finds the lines.")
+            self.lines_id_lineEdit = QtWidgets.QLineEdit("ID", box)
+            self.lines_id_lineEdit.setToolTip("Stem ID field of the centre lines")
+            lay.addWidget(QtWidgets.QLabel("Centre lines:", box), 3, 0)
+            lay.addWidget(self.lines_layer_combo, 3, 1)
+            lay.addWidget(self.lines_id_lineEdit, 3, 2)
+            for combo in (self.mask_layer_combo, self.lines_layer_combo):
+                try:
+                    combo.setLayer(None)
+                except Exception:
+                    pass
+            self._mask_widgets = [self.mask_layer_combo, self.mask_lineEdit, mask_button,
+                                  self.lines_layer_combo, self.lines_id_lineEdit]
+
+            grid = getattr(self, "gridLayout", None)
+            if grid is not None and hasattr(grid, "addWidget"):
+                grid.addWidget(box, 4, 0, 1, 3)
+            elif getattr(self, "verticalLayout_4", None) is not None:
+                self.verticalLayout_4.insertWidget(2, box)
+            self.mask_mode_radio.toggled.connect(self._on_input_mode_changed)
+            self.mask_layer_combo.layerChanged.connect(lambda *_: self._update_run_gate())
+            self.mask_lineEdit.textChanged.connect(lambda *_: self._update_run_gate())
+            self._on_input_mode_changed()
+        except Exception as exc:                       # pragma: no cover - GUI
+            self.mask_mode_radio = None
+            print("WINMOL: could not add mask input controls:", exc)
+
+    def _mask_mode(self):
+        radio = getattr(self, "mask_mode_radio", None)
+        return bool(radio is not None and radio.isChecked())
+
+    def _on_input_mode_changed(self, *_):
+        """Mask mode: the mask widgets on, the orthophoto and model ones off."""
+        on = self._mask_mode()
+        for w in getattr(self, "_mask_widgets", []):
+            w.setEnabled(on)
+        names = ("uav_lineEdit", "uav_toolButton", "uav_layer_combo", "model_comboBox",
+                 "model_lineEdit", "model_toolButton", "variant_comboBox")
+        if on:
+            # Remember each widget's own state (the Custom-model path field is
+            # disabled unless Custom is chosen) and restore exactly that.
+            self._ortho_widget_state = {}
+            for name in names:
+                w = getattr(self, name, None)
+                if w is not None:
+                    self._ortho_widget_state[name] = w.isEnabled()
+                    w.setEnabled(False)
+        else:
+            for name, was in getattr(self, "_ortho_widget_state", {}).items():
+                w = getattr(self, name, None)
+                if w is not None:
+                    w.setEnabled(was)
+            self._ortho_widget_state = {}
+        try:
+            self._update_run_gate()
+        except Exception:                              # pragma: no cover - GUI
+            pass
+
+    def _file_dialog_mask(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select stem mask", "", "Stem mask (*.tif *.tiff *.gpkg *.shp *.geojson)")
+        if path:
+            self.mask_lineEdit.setText(path)
+            try:
+                self.mask_layer_combo.setLayer(None)
+            except Exception:                          # pragma: no cover - GUI
+                pass
+
+    def _layer_or_file(self, combo, line_edit=None):
+        """(path, layer name) of the chosen QGIS layer, else of the typed file."""
+        layer = combo.currentLayer() if combo is not None else None
+        if layer is not None and layer.isValid():
+            return mask_input.split_layer_source(layer.source())
+        text = line_edit.text().strip() if line_edit is not None else ""
+        return (text, None) if text else ("", None)
 
     def _on_uav_layer_changed(self, layer):
         """A raster layer was chosen: use its source as the input path."""
@@ -1549,6 +1666,10 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
                 "starting a run.")
             return
 
+        if self._mask_mode():
+            self._run_mask_process()
+            return
+
         # set chosen parameters
         self.set_selected_model()
 
@@ -1896,7 +2017,6 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             return
         path_dirname = os.path.dirname(__file__)
         script_path = os.path.join(path_dirname, "winmol_run.py")
-        self._run_tail = []
 
         command = [
             python_exe,
@@ -1908,7 +2028,48 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self.trees_path,
             self.process_type,
         ]
+        self._launch(command, self.process_type)
 
+    def _run_mask_process(self):
+        """The "Existing stem mask" route: no model, no prediction."""
+        mask, mask_layer = self._layer_or_file(
+            getattr(self, "mask_layer_combo", None), getattr(self, "mask_lineEdit", None))
+        lines, lines_layer = self._layer_or_file(getattr(self, "lines_layer_combo", None))
+        problem = mask_input.validate_mask_input(mask, lines or None)
+        if problem:
+            QtWidgets.QMessageBox.warning(self, "WINMOL Analyzer", problem)
+            return
+        if self.env.get("status") != "ready" and self.python_exe is None:
+            self.update_output_log(self.env.get("message") or "WINMOL environment is not available.")
+            self._go_to_setup()
+            return
+        stem_field = self.output_lineEdit_stem.text().strip()
+        self._last_output_is_temp = not bool(stem_field)
+        base = (self._stem_base_from_stem_map(self._normalize_stem_map_output(stem_field))
+                if stem_field else os.path.join(self._winmol_tmp_dir(), Path(mask).stem))
+        out_prefix = f"{base}_from_mask"
+        self.stem_path = ""                 # nothing predicted: no stem map to load
+        self.trees_path = f"{out_prefix}.gpkg"
+        self._last_outputs = [self.trees_path]
+        self._go_to_log()
+        self.output_log.clear()
+        self.update_output_log(f"Stem mask: {mask}" + (f" (layer {mask_layer})" if mask_layer else ""))
+        if lines:
+            self.update_output_log(f"Centre lines: {lines}" + (f" (layer {lines_layer})" if lines_layer else ""))
+        command = mask_input.mask_command(
+            self.python_exe, os.path.dirname(__file__), mask, out_prefix, mask_layer=mask_layer,
+            lines=lines or None, lines_layer=lines_layer,
+            id_field=self.lines_id_lineEdit.text().strip() or "ID")
+        self._launch(command, "Nodes")
+
+    def _launch(self, command, progress_type):
+        """Start the child command on a worker thread (the one place that
+        does, for both the prediction and the mask route)."""
+        if self._run_active:
+            self.update_output_log(
+                "A run is already active — skipping.")
+            return
+        self._run_tail = []
         self.update_output_log("Starting the process...")
 
         # Run this part for responsive GUI
@@ -1938,7 +2099,7 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
             self.thread.started.connect(self.worker.run_process)
             # The progress bar is driven by the pipeline's own printed
             # counters, parsed per line in _on_worker_line.
-            self._run_progress = RunProgress(self.process_type)
+            self._run_progress = RunProgress(progress_type)
             self.worker.update_signal.connect(self._on_worker_line)
             # layers load ONLY on success; failures surface in the log
             # and a dialog instead of loading empty/absent layers.
@@ -2398,6 +2559,13 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         info = self._env_info()
         if info.status == "error" and info.python is None:
             return info.message or setup_state.TXT_ENV_ERROR
+        if self._mask_mode():
+            try:
+                mask, _ = self._layer_or_file(self.mask_layer_combo, self.mask_lineEdit)
+            except Exception:                      # pragma: no cover - GUI
+                mask = "?"
+            return None if mask else ("Select a stem mask first — a loaded "
+                                      "raster or polygon layer, or a file.")
         try:
             has_input = bool(self.uav_lineEdit.text().strip())
         except Exception:                          # pragma: no cover - GUI
@@ -3399,17 +3567,21 @@ class WINMOLAnalyzerDialog(QtWidgets.QDialog, FORM_CLASS):
         products are selected).
         """
         print("Loading output layers into QGIS session...")
-        self.load_raster(self.stem_path)
+        if self.stem_path:                  # the mask route predicts no stem map
+            self.load_raster(self.stem_path)
         gpkg = self._resolve_output_gpkg(self.trees_path)
 
         if not gpkg:
             print("No output GeoPackage found; skipping vector layer loading.")
             return
 
-        layers = gpkg_layers_for(
-            self.output_checkBox_trees.isChecked(),
-            self.output_checkBox_nodes.isChecked(),
-        )
+        if self._mask_mode():
+            layers = gpkg_layers_for(True, True)
+        else:
+            layers = gpkg_layers_for(
+                self.output_checkBox_trees.isChecked(),
+                self.output_checkBox_nodes.isChecked(),
+            )
         if layers:
             self.load_gpkg_layers(gpkg, layers)
 
