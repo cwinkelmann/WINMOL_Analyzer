@@ -101,24 +101,40 @@ def write_mask(mask, grid, path):
     return path
 
 
+def _require_projected(grid, path):
+    # Lengths, diameters and volumes are measured in grid units; in
+    # degrees they would be silently wrong.
+    if grid["crs"] is None or not grid["crs"].is_projected:
+        raise ValueError(
+            f"{path}: the mask grid must be in a projected CRS (metres), "
+            f"got {grid['crs']}; reproject it, or pass a projected "
+            "--reference raster"
+        )
+    return grid
+
+
 def load_mask(path, layer=None, reference=None, pixel_size=None, crs=None):
     """(mask, grid) from a raster, or from polygons rasterised onto the
     given grid."""
     if path.lower().endswith(RASTER_SUFFIXES):
         with rasterio.open(path) as src:
             mask = (src.read(1) > 0).astype(np.uint8)
-            return mask, {
-                "transform": src.transform,
-                "width": src.width,
-                "height": src.height,
-                "crs": src.crs,
-            }
+            return mask, _require_projected(
+                {
+                    "transform": src.transform,
+                    "width": src.width,
+                    "height": src.height,
+                    "crs": src.crs,
+                },
+                path,
+            )
     polygons = load_vector(path, layer)
     if reference:
         grid = grid_from_reference(reference)
     else:
         polygons = polygons.to_crs(crs) if crs else polygons
         grid = grid_from_bounds(polygons.total_bounds, pixel_size, polygons.crs)
+    _require_projected(grid, reference or path)
     return rasterize_polygons(polygons, grid), grid
 
 
