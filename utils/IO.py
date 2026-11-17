@@ -439,6 +439,9 @@ def stems_to_gdf(stems, profile):
             "l_json": _jsonify_list(getattr(s, "segment_length_list", [])),
             "v_json": _jsonify_list(getattr(s, "segment_volume_list", [])),
         })
+        # Stems from manual centre lines keep the ID they were drawn with.
+        if hasattr(s, "source_id"):
+            rows[-1]["source_id"] = str(s.source_id)
 
     return gpd.GeoDataFrame(rows, geometry=geoms, crs=crs)
 
@@ -874,8 +877,15 @@ def _write_layers_to_temp_gpkg(  # noqa: C901
     return tmp_path
 
 
+def _gpkg_final_path(path_prefix):
+    # Not Path.with_suffix: it would truncate a dotted basename
+    # (plot.v2 -> plot.gpkg) to a path no caller announces.
+    prefix = str(path_prefix)
+    return prefix if prefix.lower().endswith(".gpkg") else prefix + ".gpkg"
+
+
 def write_stems_to_gpkg(stems, profile, path_prefix):
-    final_path = str(Path(path_prefix).with_suffix(".gpkg"))
+    final_path = _gpkg_final_path(path_prefix)
     crs = _crs_from_profile(profile)
     gdf_stems = stems_to_gdf(stems, profile)
 
@@ -888,7 +898,7 @@ def write_stems_to_gpkg(stems, profile, path_prefix):
 
 
 def write_all_layers_to_gpkg(stems, profile, path_prefix):
-    final_path = str(Path(path_prefix).with_suffix(".gpkg"))
+    final_path = _gpkg_final_path(path_prefix)
     crs = _crs_from_profile(profile)
 
     gdf_stems = stems_to_gdf(stems, profile)

@@ -6,6 +6,9 @@ jobs:
   tests:
     name: Tests — ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    # macOS arm64 hosted runners are capacity-constrained; jobs can sit
+    # unacquired and get cancelled, so macOS must not block the workflow.
+    continue-on-error: ${{ matrix.os == 'macos-latest' }}
     strategy:
       fail-fast: false
       matrix:

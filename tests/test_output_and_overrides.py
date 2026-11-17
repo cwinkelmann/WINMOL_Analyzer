@@ -12,7 +12,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from plugin_utils.config_overrides import (  # noqa: E402
-    ENV_VAR, batch_override_env, merge,
+    ENV_VAR, VECTOR_KEYS, gui_override_env, merge, numeric_overrides,
 )
 from plugin_utils.output_selection import (  # noqa: E402
     NODES_LAYER, STEMS_LAYER, VECTORS_LAYER,
@@ -82,22 +82,42 @@ def test_merge_discards_existing_non_dict_json():
     assert json.loads(result) == {"a": 1}
 
 
-def test_batch_override_env_auto_means_no_override():
-    assert batch_override_env(0) == {}
-    assert batch_override_env(None) == {}
-    assert batch_override_env("not-a-number") == {}
+def test_gui_override_env_auto_batch_means_no_batch_key():
+    assert gui_override_env({}, batch=0) == {}
+    assert gui_override_env({}, batch=None) == {}
+    assert gui_override_env({}, batch="not-a-number") == {}
 
 
-def test_batch_override_env_pins_a_positive_batch_size():
-    env = batch_override_env(8)
+def test_gui_override_env_carries_vector_params_and_batch():
+    env = gui_override_env({"min_length": 1.5}, batch=8)
     assert list(env.keys()) == [ENV_VAR]
-    assert json.loads(env[ENV_VAR]) == {"prediction_batch_override": 8}
-
-
-def test_batch_override_env_preserves_existing_keys():
-    existing = json.dumps({"max_cpu_workers": 5})
-    env = batch_override_env(8, existing=existing)
     assert json.loads(env[ENV_VAR]) == {
+        "min_length": 1.5,
+        "prediction_batch_override": 8,
+    }
+
+
+def test_gui_override_env_dialog_keys_win_other_keys_survive():
+    existing = json.dumps({"min_length": 9.0, "max_cpu_workers": 5})
+    env = gui_override_env({"min_length": 1.0}, batch=8, existing=existing)
+    assert json.loads(env[ENV_VAR]) == {
+        "min_length": 1.0,
         "max_cpu_workers": 5,
         "prediction_batch_override": 8,
     }
+
+
+def test_numeric_overrides_reads_back_tolerantly():
+    # Seeds the dialog's spin boxes; must never raise on shell input.
+    assert numeric_overrides(None, VECTOR_KEYS) == {}
+    assert numeric_overrides("not json", VECTOR_KEYS) == {}
+    assert numeric_overrides('["not", "an", "object"]', VECTOR_KEYS) == {}
+    raw = json.dumps(
+        {
+            "min_length": 1.0,
+            "max_distance": "x",
+            "tolerance_angle": True,
+            "diameter_method": "edt",
+        }
+    )
+    assert numeric_overrides(raw, VECTOR_KEYS) == {"min_length": 1.0}
