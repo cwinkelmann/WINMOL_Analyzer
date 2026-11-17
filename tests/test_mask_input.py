@@ -141,6 +141,29 @@ def test_dotted_output_prefix_is_kept(tmp_path):
     assert (tmp_path / "plot.v2_summary.json").exists()
 
 
+def test_probability_raster_is_binarised_at_the_stem_threshold(tmp_path):
+    # A model's stem map is a float probability raster whose background
+    # is tiny positives, never exact zero; "> 0" would make the whole
+    # scene foreground.
+    data = np.full((20, 20), 1.5e-28, dtype="float32")
+    data[5:9, :] = 1.0
+    path = tmp_path / "stem_map.tif"
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        width=20,
+        height=20,
+        count=1,
+        dtype="float32",
+        crs=CRS,
+        transform=from_origin(X0, Y0, 0.05, 0.05),
+    ) as dst:
+        dst.write(data, 1)
+    mask, _ = ML.load_mask(str(path))
+    assert mask.sum() == 4 * 20
+
+
 # --- mask-only route (no centre lines) -------------------------------------
 
 

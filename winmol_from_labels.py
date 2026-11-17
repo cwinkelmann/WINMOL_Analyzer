@@ -14,7 +14,8 @@ gives reference values for those metrics.
     python winmol_from_labels.py --mask stems.gpkg --lines lines.gpkg \
         --out plot/trees
 
-The mask is a GeoTIFF (anything above 0 is stem) or polygons. Polygons are
+The mask is a GeoTIFF (values at or above the stem-map threshold,
+config stem_binary_threshold, count as stem) or polygons. Polygons are
 rasterised on the grid of --reference, usually the stem map being compared
 against, or at --pixel-size, which defaults to the Analyzer's stem-map
 scale. Writes <out>.gpkg with the usual stems, vectors and nodes layers and
@@ -113,7 +114,11 @@ def main(argv=None):
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     pixel_size = args.pixel_size or config.tile_size / config.img_width
     mask, grid = ML.load_mask(
-        args.mask, args.mask_layer, args.reference, pixel_size
+        args.mask,
+        args.mask_layer,
+        args.reference,
+        pixel_size,
+        threshold=config.stem_binary_threshold,
     )
     path = (
         run_lines(args, config, mask, grid)

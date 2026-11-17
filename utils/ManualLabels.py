@@ -114,9 +114,17 @@ def _require_projected(grid, path):
     return grid
 
 
-def load_mask(path, layer=None, reference=None, pixel_size=None, crs=None):
+def load_mask(
+    path, layer=None, reference=None, pixel_size=None, crs=None, threshold=0.5
+):
     """(mask, grid) from a raster, or from polygons rasterised onto the
-    given grid."""
+    given grid.
+
+    Raster values at or above `threshold` count as stem — the pipeline's
+    own stem-map binarisation. A model's stem map is a probability
+    raster whose background is tiny positives, never exact zero, so a
+    non-zero test would make the whole scene foreground.
+    """
     if path.lower().endswith(RASTER_SUFFIXES):
         if reference:
             raise ValueError(
@@ -125,7 +133,7 @@ def load_mask(path, layer=None, reference=None, pixel_size=None, crs=None):
                 "reference grid first if they must match"
             )
         with rasterio.open(path) as src:
-            mask = (src.read(1) > 0).astype(np.uint8)
+            mask = (src.read(1) >= threshold).astype(np.uint8)
             return mask, _require_projected(
                 {
                     "transform": src.transform,

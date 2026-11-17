@@ -345,8 +345,8 @@ def main(argv: List[str]) -> int:
     )
     mask.add_argument(
         "--mask",
-        help="stem mask: GeoTIFF (>0 = stem) or polygon file; "
-        "skips prediction",
+        help="stem mask: GeoTIFF (values >= 0.5 = stem) or polygon "
+        "file; skips prediction",
     )
     mask.add_argument(
         "--mask-layer", help="layer of a multi-layer polygon file"
